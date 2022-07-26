@@ -2,4 +2,6 @@
 members = [
     "mvsqlite",
     "mvstore",
+    "mvstore-stress",
+    "mvclient",
 ]

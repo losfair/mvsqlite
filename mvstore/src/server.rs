@@ -41,21 +41,28 @@ pub struct StatResponse<'a> {
 pub struct ReadRequest<'a> {
     pub page_index: u32,
     pub version: &'a str,
+
+    #[serde(default)]
+    #[serde(with = "serde_bytes")]
+    pub hash: Option<&'a [u8]>,
 }
 
 #[derive(Serialize)]
 pub struct ReadResponse<'a> {
     pub version: &'a str,
+    #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
 }
 
 #[derive(Deserialize)]
 pub struct WriteRequest<'a> {
+    #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
 }
 
 #[derive(Serialize)]
 pub struct WriteResponse<'a> {
+    #[serde(with = "serde_bytes")]
     pub hash: &'a [u8],
 }
 
@@ -63,11 +70,13 @@ pub struct WriteResponse<'a> {
 pub struct CommitInit<'a> {
     pub version: &'a str,
     pub metadata: Option<&'a str>,
+    pub num_pages: u32,
 }
 
 #[derive(Deserialize)]
 pub struct CommitRequest<'a> {
     pub page_index: u32,
+    #[serde(with = "serde_bytes")]
     pub hash: &'a [u8],
 }
 
@@ -343,14 +352,36 @@ impl Server {
                                 break;
                             }
                         };
-                        let page = match me
-                            .read_page(&txn, ns_id, read_req.page_index, read_req.version)
-                            .await
-                        {
-                            Ok(x) => x,
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, page_index = read_req.page_index, version = read_req.version, "error reading page");
-                                break;
+                        let page = if let Some(hash) = read_req.hash {
+                            let hash = match <[u8; 32]>::try_from(hash) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    tracing::warn!(ns = ns_id_hex, error = %e, "hash is not 32 bytes");
+                                    break;
+                                }
+                            };
+                            let content_key = self.construct_content_key(ns_id, hash);
+                            match txn.get(&content_key, true).await {
+                                Ok(Some(x)) => Some(Page {
+                                    version: read_req.version.to_string(),
+                                    data: x,
+                                }),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to get content by hash");
+                                    break;
+                                }
+                            }
+                        } else {
+                            match me
+                                .read_page(&txn, ns_id, read_req.page_index, read_req.version)
+                                .await
+                            {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    tracing::warn!(ns = ns_id_hex, error = %e, page_index = read_req.page_index, version = read_req.version, "error reading page");
+                                    break;
+                                }
                             }
                         };
                         let payload = match &page {
@@ -370,7 +401,10 @@ impl Server {
                                 break;
                             }
                         };
-                        if let Err(e) = res_sender.send_data(Bytes::from(payload)).await {
+                        if let Err(e) = res_sender
+                            .send_data(Bytes::from(prepend_length(&payload)))
+                            .await
+                        {
                             tracing::warn!(ns = ns_id_hex, error = %e, "error sending response");
                             break;
                         }
@@ -414,7 +448,10 @@ impl Server {
                                     break;
                                 }
                             };
-                            if let Err(e) = res_sender.send_data(Bytes::from(payload)).await {
+                            if let Err(e) = res_sender
+                                .send_data(Bytes::from(prepend_length(&payload)))
+                                .await
+                            {
                                 tracing::warn!(ns = ns_id_hex, error = %e, "error sending completion");
                             }
                             break;
@@ -439,7 +476,10 @@ impl Server {
                                 break;
                             }
                         };
-                        if let Err(e) = res_sender.send_data(Bytes::from(payload)).await {
+                        if let Err(e) = res_sender
+                            .send_data(Bytes::from(prepend_length(&payload)))
+                            .await
+                        {
                             tracing::warn!(ns = ns_id_hex, error = %e, "error sending response");
                             break;
                         }
@@ -492,10 +532,10 @@ impl Server {
                     let metadata_key = self.construct_nsmd_key(ns_id);
                     txn.set(&metadata_key, md.as_bytes());
                 }
-                loop {
+                for _ in 0..commit_init.num_pages {
                     let message = match reader.next().await {
                         Some(x) => x.with_context(|| "error reading commit request")?,
-                        None => break,
+                        None => anyhow::bail!("early end of commit stream"),
                     };
                     let commit_req: CommitRequest = rmp_serde::from_slice(&message)
                         .with_context(|| "error deserializing commit request")?;
@@ -686,5 +726,12 @@ fn generate_suffix_versionstamp_atomic_op(template: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(template.len() + 4);
     out.extend_from_slice(template);
     out.extend_from_slice(&(template.len() as u32 - 10).to_le_bytes());
+    out
+}
+
+fn prepend_length(data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() + 4);
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&data);
     out
 }
