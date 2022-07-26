@@ -17,7 +17,7 @@ use tokio_util::{
 };
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
-const COMMIT_MESSAGE_SIZE: usize = 12 * 1024 * 1024; // 12 MiB
+const COMMIT_MESSAGE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 pub struct Server {
     db: Database,
@@ -510,71 +510,70 @@ impl Server {
                 // Ensure that we finish the commit as quickly as possible - there's the five-second limit here.
                 txn.reset();
 
-                // Check version
-                let last_write_version_key = self.construct_last_write_version_key(ns_id);
-                let last_write_version = txn.get(&last_write_version_key, false).await?;
-                match &last_write_version {
-                    Some(x) if x.len() != 10 => {
-                        anyhow::bail!("invalid last write version");
-                    }
-                    Some(x) => {
-                        let actual_last_write_version = <[u8; 10]>::try_from(&x[..]).unwrap();
-
-                        if client_assumed_version < actual_last_write_version {
-                            return Ok(Response::builder().status(410).body(Body::empty())?);
+                loop {
+                    // Check version
+                    let last_write_version_key = self.construct_last_write_version_key(ns_id);
+                    let last_write_version = txn.get(&last_write_version_key, false).await?;
+                    match &last_write_version {
+                        Some(x) if x.len() != 10 => {
+                            anyhow::bail!("invalid last write version");
                         }
-                    }
-                    None => {}
-                }
+                        Some(x) => {
+                            let actual_last_write_version = <[u8; 10]>::try_from(&x[..]).unwrap();
 
-                // Write metadata
-                if let Some(md) = commit_init.metadata {
-                    let metadata_key = self.construct_nsmd_key(ns_id);
-                    txn.set(&metadata_key, md.as_bytes());
-                }
-                for _ in 0..commit_init.num_pages {
-                    let message = match reader.next().await {
-                        Some(x) => x.with_context(|| "error reading commit request")?,
-                        None => anyhow::bail!("early end of commit stream"),
-                    };
-                    let commit_req: CommitRequest = rmp_serde::from_slice(&message)
-                        .with_context(|| "error deserializing commit request")?;
-                    if commit_req.hash.len() != 32 {
-                        return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("invalid hash"))?);
+                            if client_assumed_version < actual_last_write_version {
+                                return Ok(Response::builder().status(409).body(Body::empty())?);
+                            }
+                        }
+                        None => {}
                     }
 
-                    let page_key_template =
-                        self.construct_page_key(ns_id, commit_req.page_index, [0u8; 10]);
-                    let page_key_atomic_op =
-                        generate_suffix_versionstamp_atomic_op(&page_key_template);
+                    // Write metadata
+                    if let Some(md) = commit_init.metadata {
+                        let metadata_key = self.construct_nsmd_key(ns_id);
+                        txn.set(&metadata_key, md.as_bytes());
+                    }
+                    for _ in 0..commit_init.num_pages {
+                        let message = match reader.next().await {
+                            Some(x) => x.with_context(|| "error reading commit request")?,
+                            None => anyhow::bail!("early end of commit stream"),
+                        };
+                        let commit_req: CommitRequest = rmp_serde::from_slice(&message)
+                            .with_context(|| "error deserializing commit request")?;
+                        if commit_req.hash.len() != 32 {
+                            return Ok(Response::builder()
+                                .status(400)
+                                .body(Body::from("invalid hash"))?);
+                        }
+
+                        let page_key_template =
+                            self.construct_page_key(ns_id, commit_req.page_index, [0u8; 10]);
+                        let page_key_atomic_op =
+                            generate_suffix_versionstamp_atomic_op(&page_key_template);
+                        txn.atomic_op(
+                            &page_key_atomic_op,
+                            commit_req.hash,
+                            MutationType::SetVersionstampedKey,
+                        );
+                    }
+                    let last_write_version_atomic_op_value = [0u8; 14];
                     txn.atomic_op(
-                        &page_key_atomic_op,
-                        commit_req.hash,
-                        MutationType::SetVersionstampedKey,
+                        &last_write_version_key,
+                        &last_write_version_atomic_op_value,
+                        MutationType::SetVersionstampedValue,
                     );
-                }
-                let last_write_version_atomic_op_value = [0u8; 14];
-                txn.atomic_op(
-                    &last_write_version_key,
-                    &last_write_version_atomic_op_value,
-                    MutationType::SetVersionstampedValue,
-                );
-                let versionstamp_fut = txn.get_versionstamp();
-                match txn.commit().await {
-                    Ok(_) => {
-                        let versionstamp = versionstamp_fut.await?;
-                        let versionstamp = hex::encode(&versionstamp);
-                        res = Response::builder()
-                            .header("x-committed-version", versionstamp)
-                            .body(Body::empty())?;
-                    }
-                    Err(e) => {
-                        if e.is_retryable() {
-                            res = Response::builder().status(409).body(Body::empty())?;
-                        } else {
-                            anyhow::bail!("commit failed: {}", e.message());
+                    let versionstamp_fut = txn.get_versionstamp();
+                    match txn.commit().await {
+                        Ok(_) => {
+                            let versionstamp = versionstamp_fut.await?;
+                            let versionstamp = hex::encode(&versionstamp);
+                            res = Response::builder()
+                                .header("x-committed-version", versionstamp)
+                                .body(Body::empty())?;
+                            break;
+                        }
+                        Err(e) => {
+                            txn = e.on_error().await.with_context(|| "commit failed")?;
                         }
                     }
                 }
