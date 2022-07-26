@@ -34,7 +34,7 @@ struct Opt {
     admin_api: SocketAddr,
 
     /// Output log in JSON format.
-    #[structopt(long, env = "MVSTORE_JSON")]
+    #[structopt(long)]
     json: bool,
 
     /// Path to FoundationDB cluster file.
