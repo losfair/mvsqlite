@@ -148,9 +148,7 @@ impl Server {
                     );
                     match txn.commit().await {
                         Ok(_) => {
-                            res = Response::builder()
-                                .status(200)
-                                .body(Body::from("ok"))?;
+                            res = Response::builder().status(200).body(Body::from("ok"))?;
                             break;
                         }
                         Err(e) => {
@@ -162,7 +160,7 @@ impl Server {
 
             "/api/delete_namespace" => {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
-                let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
+                let body: AdminDeleteNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.construct_nskey_key(&body.key);
 
                 let mut txn = self.db.create_trx()?;
@@ -189,9 +187,7 @@ impl Server {
                     txn.clear(&nsmd_key);
                     match txn.commit().await {
                         Ok(_) => {
-                            res = Response::builder()
-                                .status(200)
-                                .body(Body::from("ok"))?;
+                            res = Response::builder().status(200).body(Body::from("ok"))?;
                             break;
                         }
                         Err(e) => {
@@ -224,12 +220,19 @@ impl Server {
         self: Arc<Self>,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
-        let ns_key = req
+        let ns_key = match req
             .headers()
             .get("x-namespace-key")
-            .with_context(|| "missing x-namespace-key")?
-            .to_str()
-            .with_context(|| "invalid x-namespace-key")?;
+            .and_then(|x| x.to_str().ok())
+        {
+            Some(x) => x,
+            None => {
+                return Ok(Response::builder()
+                    .status(400)
+                    .body(Body::from("missing or invalid x-namespace-key"))
+                    .unwrap())
+            }
+        };
         let txn = self.db.create_trx()?;
         let ns_id = match txn.get(&self.construct_nskey_key(ns_key), true).await? {
             Some(x) => <[u8; 10]>::try_from(&x[..]).with_context(|| "invalid namespace id")?,
