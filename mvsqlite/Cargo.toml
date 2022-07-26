@@ -1,0 +1,18 @@
+[package]
+name = "mvsqlite"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libsqlite3-sys = "0.25.1"
+rusqlite = "0.28.0"
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+time = "0.3"
+rand = "0.8.5"
+stackful = "0.1.5"
+async-trait = "0.1.56"
