@@ -17,7 +17,7 @@ use tokio_util::{
 };
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
-const COMMIT_MESSAGE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
 
 pub struct Server {
     db: Database,
@@ -161,7 +161,14 @@ impl Server {
                             break;
                         }
                         Err(e) => {
-                            txn = e.on_error().await?;
+                            txn = match e.on_error().await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
                         }
                     }
                 }
@@ -200,7 +207,14 @@ impl Server {
                             break;
                         }
                         Err(e) => {
-                            txn = e.on_error().await?;
+                            txn = match e.on_error().await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
                         }
                     }
                 }
@@ -573,7 +587,14 @@ impl Server {
                             break;
                         }
                         Err(e) => {
-                            txn = e.on_error().await.with_context(|| "commit failed")?;
+                            txn = match e.on_error().await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
                         }
                     }
                 }
