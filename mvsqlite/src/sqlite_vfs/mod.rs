@@ -1,7 +1,7 @@
 #![allow(clippy::question_mark)]
 //! Create a custom SQLite virtual file system by implementing the [Vfs] trait and registering it
 //! using [register].
-//! 
+//!
 //! https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
 
 use std::borrow::Cow;

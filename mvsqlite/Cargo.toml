@@ -3,11 +3,10 @@ name = "mvsqlite"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["staticlib"]
 
 [dependencies]
-libsqlite3-sys = "0.25.1"
-rusqlite = "0.28.0"
 anyhow = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
@@ -16,3 +15,13 @@ time = "0.3"
 rand = "0.8.5"
 stackful = "0.1.5"
 async-trait = "0.1.56"
+mvclient = { path = "../mvclient" }
+tracing = "0.1"
+ctor = "0.1.22"
+tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "json"] }
+libc = "0.2"
+
+[features]
+default = ["loadext", "syscall"]
+loadext = []
+syscall = []
