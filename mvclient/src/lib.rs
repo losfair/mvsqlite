@@ -1,8 +1,12 @@
+mod backoff;
+
 use anyhow::{Context, Result};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use backoff::RandomizedExponentialBackoff;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use bytes::Bytes;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
-    RequestBuilder, Url,
+    RequestBuilder, StatusCode, Url,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -71,6 +75,10 @@ pub struct CommitRequest<'a> {
     pub hash: &'a [u8],
 }
 
+pub struct CommitResult {
+    pub version: String,
+}
+
 impl MultiVersionClient {
     pub fn new(config: MultiVersionClientConfig) -> Result<Arc<Self>> {
         let mut headers = HeaderMap::new();
@@ -86,10 +94,17 @@ impl MultiVersionClient {
         let mut url = self.config.data_plane.clone();
         url.set_path("/stat");
 
-        let stat_res: StatResponse = request_and_check(self.client.get(url))
-            .await?
-            .json()
-            .await?;
+        let mut boff = RandomizedExponentialBackoff::default();
+        let stat_res: StatResponse = loop {
+            let resp = request_and_check(self.client.get(url.clone())).await?;
+            match resp {
+                Some((_, body)) => break serde_json::from_slice(&body)?,
+                None => {
+                    boff.wait().await;
+                    continue;
+                }
+            }
+        };
 
         tracing::debug!(
             version = stat_res.version,
@@ -138,23 +153,37 @@ impl Transaction {
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
             raw_request.extend_from_slice(&serialized);
         }
-        let response = request_and_check(self.c.client.post(url).body(raw_request)).await?;
-        let raw_response = response.bytes().await?;
-        let mut raw_response = &raw_response[..];
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(page_id_list.len());
-        while !raw_response.is_empty() {
-            let len = raw_response.read_u32::<BigEndian>()? as usize;
-            let serialized = &raw_response[..len];
-            raw_response = &raw_response[len..];
+        let raw_request = Bytes::from(raw_request);
+        let mut boff = RandomizedExponentialBackoff::default();
+        loop {
+            let response =
+                request_and_check(self.c.client.post(url.clone()).body(raw_request.clone()))
+                    .await?;
+            let (_, raw_response) = match response {
+                Some(x) => x,
+                None => {
+                    boff.wait().await;
+                    continue;
+                }
+            };
+            let mut raw_response = &raw_response[..];
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(page_id_list.len());
+            while !raw_response.is_empty() {
+                let len = raw_response.read_u32::<BigEndian>()? as usize;
+                let serialized = &raw_response[..len];
+                raw_response = &raw_response[len..];
 
-            let data: ReadResponse = rmp_serde::from_slice(serialized)?;
-            out.push(data.data.to_vec());
-        }
+                let data: ReadResponse = rmp_serde::from_slice(serialized)?;
+                out.push(data.data.to_vec());
+            }
 
-        if out.len() != page_id_list.len() {
-            return Err(anyhow::anyhow!("response length mismatch"));
+            if out.len() != page_id_list.len() {
+                tracing::error!("response length mismatch, retrying");
+                boff.wait().await;
+                continue;
+            }
+            return Ok(out);
         }
-        Ok(out)
     }
 
     pub async fn write_many(&mut self, pages: &[(u32, &[u8])]) -> Result<Vec<[u8; 32]>> {
@@ -167,37 +196,56 @@ impl Transaction {
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
             raw_request.extend_from_slice(&serialized);
         }
+
+        // Finalization frame
         raw_request.write_u32::<BigEndian>(0)?;
 
-        let response = request_and_check(self.c.client.post(url).body(raw_request)).await?;
-        let raw_response = response.bytes().await?;
-        let mut raw_response = &raw_response[..];
-        let mut out: Vec<[u8; 32]> = Vec::with_capacity(pages.len());
-        while !raw_response.is_empty() {
-            let len = raw_response.read_u32::<BigEndian>()? as usize;
-            let serialized = &raw_response[..len];
-            raw_response = &raw_response[len..];
-            let data: WriteResponse = rmp_serde::from_slice(serialized)?;
+        let raw_request = Bytes::from(raw_request);
+        let mut boff = RandomizedExponentialBackoff::default();
+        loop {
+            let response =
+                request_and_check(self.c.client.post(url.clone()).body(raw_request.clone()))
+                    .await?;
+            let (_, raw_response) = match response {
+                Some(x) => x,
+                None => {
+                    boff.wait().await;
+                    continue;
+                }
+            };
+            let mut raw_response = &raw_response[..];
+            let mut out: Vec<[u8; 32]> = Vec::with_capacity(pages.len());
+            while !raw_response.is_empty() {
+                let len = raw_response.read_u32::<BigEndian>()? as usize;
+                let serialized = &raw_response[..len];
+                raw_response = &raw_response[len..];
+                let data: WriteResponse = rmp_serde::from_slice(serialized)?;
 
-            if data.hash.is_empty() {
-                if out.len() != pages.len() {
-                    anyhow::bail!("got unexpected completion");
+                if data.hash.is_empty() {
+                    if out.len() != pages.len() {
+                        anyhow::bail!("got unexpected completion");
+                    }
+                    for ((page_index, _), out) in pages.iter().zip(out.iter()) {
+                        self.page_buffer.insert(*page_index, *out);
+                    }
+                    return Ok(out);
                 }
-                for ((page_index, _), out) in pages.iter().zip(out.iter()) {
-                    self.page_buffer.insert(*page_index, *out);
-                }
-                return Ok(out);
+                let hash = <[u8; 32]>::try_from(&data.hash[..])?;
+                out.push(hash);
             }
-            let hash = <[u8; 32]>::try_from(&data.hash[..])?;
-            out.push(hash);
+            tracing::error!("incomplete write, retrying");
+            boff.wait().await;
         }
-        anyhow::bail!("incomplete write");
     }
 
-    pub async fn commit(self) -> Result<()> {
+    pub async fn commit(self) -> Result<Option<CommitResult>> {
+        // XXX: Check metadata update when it get implemented.
         if self.page_buffer.is_empty() {
-            return Ok(());
+            return Ok(Some(CommitResult {
+                version: self.version,
+            }));
         }
+
         let mut url = self.c.config.data_plane.clone();
         url.set_path("/batch/commit");
         let mut raw_request: Vec<u8> = Vec::new();
@@ -221,24 +269,76 @@ impl Transaction {
             raw_request.extend_from_slice(&serialized);
         }
 
-        let response = request_and_check(self.c.client.post(url).body(raw_request)).await?;
-        let committed_version = response
-            .headers()
-            .get("x-committed-version")
-            .with_context(|| format!("missing committed version header"))?
-            .to_str()?;
-        tracing::debug!(version = committed_version, "committed transaction");
-        Ok(())
+        if raw_request.len() > 8 * 1024 * 1024 {
+            anyhow::bail!("transaction too large");
+        }
+
+        let raw_request = Bytes::from(raw_request);
+        let mut boff = RandomizedExponentialBackoff::default();
+
+        loop {
+            let response = request_and_check_returning_status(
+                self.c.client.post(url.clone()).body(raw_request.clone()),
+            )
+            .await;
+            let (headers, _) = match response {
+                Ok(Some(x)) => x,
+                Ok(None) => {
+                    boff.wait().await;
+                    continue;
+                }
+                Err(status) => {
+                    if status.as_u16() == 409 {
+                        return Ok(None);
+                    }
+                    anyhow::bail!("commit failed: {}", status);
+                }
+            };
+            let committed_version = headers
+                .get("x-committed-version")
+                .with_context(|| format!("missing committed version header"))?
+                .to_str()?;
+            tracing::debug!(version = committed_version, "committed transaction");
+            return Ok(Some(CommitResult {
+                version: committed_version.into(),
+            }));
+        }
     }
 }
 
-async fn request_and_check(r: RequestBuilder) -> Result<reqwest::Response> {
-    let res = r.send().await?;
+async fn request_and_check(r: RequestBuilder) -> Result<Option<(HeaderMap, Bytes)>> {
+    request_and_check_returning_status(r)
+        .await
+        .map_err(|e| anyhow::anyhow!("status {}", e))
+}
+
+async fn request_and_check_returning_status(
+    r: RequestBuilder,
+) -> Result<Option<(HeaderMap, Bytes)>, StatusCode> {
+    let res = match r.send().await {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!(error = %e, "network error");
+            return Ok(None);
+        }
+    };
     if res.status().is_success() {
-        Ok(res)
+        let headers = res.headers().clone();
+        let body = match res.bytes().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to read response body");
+                return Ok(None);
+            }
+        };
+        Ok(Some((headers, body)))
+    } else if res.status().is_server_error() {
+        tracing::error!(status = %res.status(), "server error");
+        Ok(None)
     } else {
         let status = res.status();
-        let text = res.text().await?;
-        Err(anyhow::anyhow!("remote error: {}: {}", status, text))
+        let text = res.text().await.unwrap_or_default();
+        tracing::warn!(status = %status, text = %text, "client error");
+        Err(status)
     }
 }
