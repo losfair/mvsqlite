@@ -1,36 +1,22 @@
-use std::{
-    collections::HashMap,
-    io::ErrorKind,
-    sync::{Arc, Mutex, Weak},
-};
+use std::{io::ErrorKind, sync::Arc};
 
 use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
     io_engine::IoEngine,
-    sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, Vfs, WalDisabled},
+    sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
 };
 
-const PAGE_SIZE: usize = 4096;
-static FIRST_PAGE_TEMPLATE: &'static [u8; 4096] = include_bytes!("../template.db");
+const PAGE_SIZE: usize = 2048;
+static FIRST_PAGE_TEMPLATE: &'static [u8; 2048] = include_bytes!("../template.db");
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
     pub io: Arc<IoEngine>,
-    pub shared: Arc<Mutex<SharedState>>,
-}
-
-#[derive(Default)]
-pub struct SharedState {
-    connections: HashMap<String, Arc<Mutex<ConnState>>>,
-}
-
-struct ConnState {
-    txn_invalidated: bool,
 }
 
 impl Vfs for MultiVersionVfs {
-    type Handle = ConnWrapper;
+    type Handle = Connection;
 
     fn open(
         &self,
@@ -38,44 +24,8 @@ impl Vfs for MultiVersionVfs {
         opts: crate::sqlite_vfs::OpenOptions,
     ) -> Result<Self::Handle, std::io::Error> {
         tracing::debug!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
-        let mut shared = self.shared.lock().unwrap();
         if !matches!(opts.kind, OpenKind::MainDb) {
-            match opts.access {
-                OpenAccess::Read | OpenAccess::Write => {
-                    return Err(ErrorKind::NotFound.into());
-                }
-                OpenAccess::Create | OpenAccess::CreateNew => {}
-            }
-
-            if matches!(opts.kind, OpenKind::MainJournal) {
-                let db = db
-                    .strip_suffix("-journal")
-                    .expect("journal file does not have the expected suffix");
-                let main = shared
-                    .connections
-                    .get(db)
-                    .expect("main db not found for requested journal");
-                let blackhole = BlackholeJournal {
-                    state: Arc::downgrade(main),
-                    size: 0,
-                    lock: LockKind::None,
-                    written: false,
-                };
-                return Ok(ConnWrapper {
-                    inner: Box::new(blackhole),
-                });
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Only main database is supported",
-            ));
-        }
-
-        if shared.connections.contains_key(db) {
-            panic!(
-                "cannot open more than one connections to the same database: {}",
-                db
-            );
+            return Err(ErrorKind::NotFound.into());
         }
 
         let db_str_segs = db.split("@").collect::<Vec<_>>();
@@ -99,23 +49,15 @@ impl Vfs for MultiVersionVfs {
             ns_key: ns_key.to_string(),
         })
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let state = Arc::new(Mutex::new(ConnState {
-            txn_invalidated: false,
-        }));
-        shared.connections.insert(db.to_string(), state.clone());
+
         let conn = Connection {
             client,
-            db: db.to_string(),
             io: self.io.clone(),
-            shared: self.shared.clone(),
             fixed_version,
             txn: None,
             lock: LockKind::None,
-            state,
         };
-        Ok(ConnWrapper {
-            inner: Box::new(conn),
-        })
+        Ok(conn)
     }
 
     fn delete(&self, _db: &str) -> Result<(), std::io::Error> {
@@ -124,13 +66,7 @@ impl Vfs for MultiVersionVfs {
 
     fn exists(&self, db: &str) -> Result<bool, std::io::Error> {
         tracing::debug!(db = db, "exists db");
-        Ok(
-            if db.ends_with("-journal") || db.ends_with("-wal") || db.ends_with("-shm") {
-                false
-            } else {
-                true
-            },
-        )
+        Ok(false)
     }
 
     fn temporary_name(&self) -> String {
@@ -148,27 +84,17 @@ impl Vfs for MultiVersionVfs {
 
 pub struct Connection {
     client: Arc<MultiVersionClient>,
-    db: String,
     io: Arc<IoEngine>,
-    shared: Arc<Mutex<SharedState>>,
     fixed_version: Option<String>,
     txn: Option<Transaction>,
     lock: LockKind,
-    state: Arc<Mutex<ConnState>>,
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        let removed = self.shared.lock().unwrap().connections.remove(&self.db);
-        assert!(removed.is_some());
-    }
 }
 
 impl Connection {
     fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % PAGE_SIZE == 0);
         assert!(buf.len() % PAGE_SIZE == 0);
-        let txn = self.txn.as_ref().unwrap();
+        let txn = self.txn.as_mut().unwrap();
         let num_pages = buf.len() / PAGE_SIZE;
         let page_offset = offset as usize / PAGE_SIZE;
 
@@ -185,7 +111,7 @@ impl Connection {
             })
             .collect::<Vec<_>>();
 
-        let pages = self.io.run(async move {
+        let pages = self.io.run(async {
             txn.read_many(&page_id_list)
                 .await
                 .expect("unrecoverable read failure")
@@ -244,17 +170,24 @@ impl DatabaseHandle for Connection {
         assert!(offset as usize % PAGE_SIZE == 0);
         assert!(buf.len() % PAGE_SIZE == 0);
 
-        if self.state.lock().unwrap().txn_invalidated {
-            tracing::error!("write_all_at: txn invalidated");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Transaction has been invalidated",
-            ));
-        }
-
         let num_pages = buf.len() / PAGE_SIZE;
         let page_offset = offset as usize / PAGE_SIZE;
-        let txn = self.txn.as_mut().expect("Cannot write to a database without a transaction");
+        let txn = self
+            .txn
+            .as_mut()
+            .expect("Cannot write to a database without a transaction");
+
+        if offset == 0 {
+            // validate first page
+            let page_size = u16::from_be_bytes(<[u8; 2]>::try_from(&buf[16..18]).unwrap());
+            if page_size as usize != PAGE_SIZE {
+                panic!("attempting to change page size");
+            }
+
+            if buf[18] == 2 || buf[19] == 2 {
+                panic!("attempting to enable wal mode");
+            }
+        }
 
         tracing::debug!(
             num_pages = num_pages,
@@ -316,29 +249,24 @@ impl DatabaseHandle for Connection {
         self.lock = lock;
 
         if prev_lock == LockKind::Exclusive {
-            // Optimistic commit
-            // Rolled back?
-            if !self.state.lock().unwrap().txn_invalidated {
-                // Write
-                let txn = self
-                    .txn
-                    .take()
-                    .expect("did not find transaction for commit");
-                let result = self.io.run(async { txn.commit().await });
+            // Write
+            let txn = self
+                .txn
+                .take()
+                .expect("did not find transaction for commit");
+            let result = self.io.run(async { txn.commit().await });
 
-                // At this point we don't have a reliable way to propagate the error. So, we have
-                // to abort the process.
-                let result = result.expect("transaction commit failed");
-                let result = result.expect("transaction conflict");
-                tracing::info!(version = result.version, "transaction committed");
-                self.txn = Some(self.client.create_transaction_at_version(&result.version));
-            }
+            // At this point we don't have a reliable way to propagate the error. So, we have
+            // to abort the process.
+            let result = result.expect("transaction commit failed");
+            let result = result.expect("transaction conflict");
+            tracing::info!(version = result.version, "transaction committed");
+            self.txn = Some(self.client.create_transaction_at_version(&result.version));
         }
 
         if lock == LockKind::None {
             // All locks dropped
             self.txn.take().expect("unlocked without locking");
-            self.state.lock().unwrap().txn_invalidated = false;
         }
 
         Ok(true)
@@ -354,117 +282,5 @@ impl DatabaseHandle for Connection {
 
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
-    }
-}
-
-struct BlackholeJournal {
-    state: Weak<Mutex<ConnState>>,
-    size: u64,
-    lock: LockKind,
-    written: bool,
-}
-
-impl DatabaseHandle for BlackholeJournal {
-    type WalIndex = WalDisabled;
-
-    fn size(&self) -> Result<u64, std::io::Error> {
-        Ok(self.size)
-    }
-
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        buf.iter_mut().for_each(|b| *b = 0);
-        if buf.len() > 8 && self.written {
-            self.state
-                .upgrade()
-                .expect("failed to get conn state for journal")
-                .lock()
-                .unwrap()
-                .txn_invalidated = true;
-        }
-
-        if buf.len() as u64 + offset > self.size {
-            return Err(std::io::Error::from(ErrorKind::UnexpectedEof));
-        }
-
-        Ok(())
-    }
-
-    fn write_all_at(&mut self, _buf: &[u8], _offset: u64) -> Result<(), std::io::Error> {
-        self.written = true;
-        Ok(())
-    }
-
-    fn sync(&mut self, _data_only: bool) -> Result<(), std::io::Error> {
-        Ok(())
-    }
-
-    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
-        self.size = size;
-        Ok(())
-    }
-
-    fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
-        self.lock = lock;
-        Ok(true)
-    }
-
-    fn reserved(&mut self) -> Result<bool, std::io::Error> {
-        Ok(false)
-    }
-
-    fn current_lock(&self) -> Result<LockKind, std::io::Error> {
-        Ok(self.lock)
-    }
-
-    fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
-        todo!()
-    }
-}
-
-pub struct ConnWrapper {
-    inner: Box<dyn DatabaseHandle<WalIndex = WalDisabled>>,
-}
-
-impl DatabaseHandle for ConnWrapper {
-    type WalIndex = WalDisabled;
-
-    fn size(&self) -> Result<u64, std::io::Error> {
-        self.inner.size()
-    }
-
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        self.inner.read_exact_at(buf, offset)
-    }
-
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
-        self.inner.write_all_at(buf, offset)
-    }
-
-    fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error> {
-        self.inner.sync(data_only)
-    }
-
-    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
-        self.inner.set_len(size)
-    }
-
-    fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
-        self.inner.lock(lock)
-    }
-
-    fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
-        self.inner.unlock(lock)
-    }
-
-    fn reserved(&mut self) -> Result<bool, std::io::Error> {
-        self.inner.reserved()
-    }
-
-    fn current_lock(&self) -> Result<LockKind, std::io::Error> {
-        self.inner.current_lock()
-    }
-
-    fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
-        self.inner.wal_index(readonly)
     }
 }

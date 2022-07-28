@@ -1,8 +1,9 @@
 pub mod io_engine;
 pub mod sqlite_vfs;
 pub mod vfs;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use backtrace::Backtrace;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
 
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
@@ -25,12 +26,17 @@ pub extern "C" fn init_mvsqlite() {
             .init();
     }
 
+    std::panic::set_hook(Box::new(|info| {
+        let bt = Backtrace::new();
+        tracing::error!(backtrace = ?bt, "{}", info);
+        std::process::abort();
+    }));
+
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
     let io_engine = Arc::new(IoEngine::new(false));
     let vfs = MultiVersionVfs {
         data_plane,
         io: io_engine,
-        shared: Arc::new(Mutex::new(Default::default())),
     };
 
     /*let real_sqlite3_open = unsafe {

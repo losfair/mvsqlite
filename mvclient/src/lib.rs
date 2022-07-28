@@ -8,7 +8,14 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     RequestBuilder, StatusCode, Url,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore};
 
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +126,12 @@ impl MultiVersionClient {
             c: self.clone(),
             version: version.into(),
             page_buffer: HashMap::new(),
+            async_ctx: Arc::new(TxnAsyncCtx {
+                background_sem: Arc::new(Semaphore::new(32)),
+                background_completion: Arc::new(tokio::sync::RwLock::new(())),
+                has_error: AtomicBool::new(false),
+            }),
+            seen_hashes: HashSet::new(),
         };
 
         txn
@@ -129,6 +142,14 @@ pub struct Transaction {
     c: Arc<MultiVersionClient>,
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
+    async_ctx: Arc<TxnAsyncCtx>,
+    seen_hashes: HashSet<[u8; 32]>,
+}
+
+struct TxnAsyncCtx {
+    background_sem: Arc<Semaphore>,
+    background_completion: Arc<tokio::sync::RwLock<()>>,
+    has_error: AtomicBool,
 }
 
 impl Transaction {
@@ -136,7 +157,18 @@ impl Transaction {
         self.version.as_str()
     }
 
-    pub async fn read_many(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+    fn check_async_error(&self) -> Result<()> {
+        if self.async_ctx.has_error.load(Ordering::Relaxed) {
+            Err(anyhow::anyhow!("async error"))
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn read_many(&mut self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+        // wait for async completion
+        self.async_ctx.background_completion.write().await;
+        self.check_async_error()?;
+
         let mut raw_request: Vec<u8> = Vec::new();
 
         let mut url = self.c.config.data_plane.clone();
@@ -175,6 +207,8 @@ impl Transaction {
 
                 let data: ReadResponse = rmp_serde::from_slice(serialized)?;
                 out.push(data.data.to_vec());
+                self.seen_hashes
+                    .insert(*blake3::hash(&data.data).as_bytes());
             }
 
             if out.len() != page_id_list.len() {
@@ -186,11 +220,80 @@ impl Transaction {
         }
     }
 
-    pub async fn write_many(&mut self, pages: &[(u32, &[u8])]) -> Result<Vec<[u8; 32]>> {
-        let mut raw_request: Vec<u8> = Vec::new();
-        let mut url = self.c.config.data_plane.clone();
+    async fn bg_write_task(
+        c: Arc<MultiVersionClient>,
+        _completion_guard: OwnedRwLockReadGuard<()>,
+        _sem_permit: OwnedSemaphorePermit,
+        async_ctx: Arc<TxnAsyncCtx>,
+        raw_request: Bytes,
+        num_pages: usize,
+    ) {
+        if async_ctx.has_error.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut url = c.config.data_plane.clone();
         url.set_path("/batch/write");
-        for &(_, data) in pages {
+
+        let mut boff = RandomizedExponentialBackoff::default();
+        loop {
+            let response =
+                match request_and_check(c.client.post(url.clone()).body(raw_request.clone())).await
+                {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!(error = %e, "background page write failed");
+                        async_ctx.has_error.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
+            let (_, raw_response) = match response {
+                Some(x) => x,
+                None => {
+                    boff.wait().await;
+                    continue;
+                }
+            };
+            let mut raw_response = &raw_response[..];
+            let mut counter: usize = 0;
+            while !raw_response.is_empty() {
+                let len = raw_response.read_u32::<BigEndian>().unwrap_or(0) as usize;
+                let serialized = &raw_response[..len];
+                raw_response = &raw_response[len..];
+                let data: WriteResponse = match rmp_serde::from_slice(serialized) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!(error = %e, "background page write could not decode server response");
+                        async_ctx.has_error.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
+                if data.hash.is_empty() {
+                    assert_eq!(counter, num_pages);
+                    return;
+                }
+                counter += 1;
+            }
+            tracing::error!("incomplete write, retrying");
+            boff.wait().await;
+        }
+    }
+
+    pub async fn write_many(&mut self, raw_pages: &[(u32, &[u8])]) -> Result<()> {
+        let all_pages = raw_pages
+            .iter()
+            .map(|&(page_index, data)| {
+                let hash = blake3::hash(data);
+                (page_index, data, hash)
+            })
+            .collect::<Vec<_>>();
+        let pages_to_push = all_pages
+            .iter()
+            .filter(|(_, _, hash)| !self.seen_hashes.contains(hash.as_bytes()))
+            .collect::<Vec<_>>();
+        let mut raw_request: Vec<u8> = Vec::new();
+        for &(_, data, _) in &pages_to_push {
             let req = WriteRequest { data };
             let serialized = rmp_serde::to_vec_named(&req)?;
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
@@ -201,41 +304,33 @@ impl Transaction {
         raw_request.write_u32::<BigEndian>(0)?;
 
         let raw_request = Bytes::from(raw_request);
-        let mut boff = RandomizedExponentialBackoff::default();
-        loop {
-            let response =
-                request_and_check(self.c.client.post(url.clone()).body(raw_request.clone()))
-                    .await?;
-            let (_, raw_response) = match response {
-                Some(x) => x,
-                None => {
-                    boff.wait().await;
-                    continue;
-                }
-            };
-            let mut raw_response = &raw_response[..];
-            let mut out: Vec<[u8; 32]> = Vec::with_capacity(pages.len());
-            while !raw_response.is_empty() {
-                let len = raw_response.read_u32::<BigEndian>()? as usize;
-                let serialized = &raw_response[..len];
-                raw_response = &raw_response[len..];
-                let data: WriteResponse = rmp_serde::from_slice(serialized)?;
-
-                if data.hash.is_empty() {
-                    if out.len() != pages.len() {
-                        anyhow::bail!("got unexpected completion");
-                    }
-                    for ((page_index, _), out) in pages.iter().zip(out.iter()) {
-                        self.page_buffer.insert(*page_index, *out);
-                    }
-                    return Ok(out);
-                }
-                let hash = <[u8; 32]>::try_from(&data.hash[..])?;
-                out.push(hash);
-            }
-            tracing::error!("incomplete write, retrying");
-            boff.wait().await;
+        for (page_index, _, hash) in &all_pages {
+            self.page_buffer.insert(*page_index, *hash.as_bytes());
+            self.seen_hashes.insert(*hash.as_bytes());
         }
+        let completion_guard = self
+            .async_ctx
+            .background_completion
+            .clone()
+            .read_owned()
+            .await;
+        let sem_permit = self
+            .async_ctx
+            .background_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let async_ctx = self.async_ctx.clone();
+        tokio::spawn(Self::bg_write_task(
+            self.c.clone(),
+            completion_guard,
+            sem_permit,
+            async_ctx,
+            raw_request,
+            pages_to_push.len(),
+        ));
+        Ok(())
     }
 
     pub async fn commit(self) -> Result<Option<CommitResult>> {
@@ -245,6 +340,10 @@ impl Transaction {
                 version: self.version,
             }));
         }
+
+        // wait for async completion
+        self.async_ctx.background_completion.write().await;
+        self.check_async_error()?;
 
         let mut url = self.c.config.data_plane.clone();
         url.set_path("/batch/commit");

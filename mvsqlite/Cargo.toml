@@ -20,6 +20,7 @@ tracing = "0.1"
 ctor = "0.1.22"
 tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "json"] }
 libc = "0.2"
+backtrace = "0.3.66"
 
 [features]
 default = ["loadext", "syscall"]

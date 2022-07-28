@@ -8,8 +8,9 @@ use foundationdb::{
 };
 use futures::StreamExt;
 use hyper::{body::HttpBody, Body, Request, Response};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 use tokio::io::AsyncRead;
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
@@ -18,11 +19,14 @@ use tokio_util::{
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
 const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
+const MAX_PAGE_SIZE: usize = 8192;
 
 pub struct Server {
     db: Database,
     raw_data_prefix: Vec<u8>,
     metadata_prefix: String,
+
+    nskey_cache: Cache<String, [u8; 10]>,
 }
 
 pub struct ServerConfig {
@@ -51,7 +55,7 @@ pub struct ReadRequest<'a> {
 pub struct ReadResponse<'a> {
     pub version: &'a str,
     #[serde(with = "serde_bytes")]
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +100,41 @@ pub struct Page {
     pub data: FdbSlice,
 }
 
+impl Page {
+    fn decompress(&self) -> Result<Vec<u8>> {
+        if self.data.len() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let compress_type = self.data[0];
+        match compress_type {
+            0 => {
+                // not compressed
+                Ok(self.data[1..].to_vec())
+            }
+            1 => {
+                // zstd
+                let data = zstd::bulk::decompress(&self.data[1..], MAX_PAGE_SIZE)
+                    .with_context(|| "zstd decompress failed")?;
+                Ok(data)
+            }
+            _ => {
+                anyhow::bail!("unsupported compression type: {}", compress_type);
+            }
+        }
+    }
+
+    fn compress_zstd(data: &[u8]) -> Vec<u8> {
+        let max_compressed_size = zstd::zstd_safe::compress_bound(data.len());
+        let mut buf = vec![0u8; max_compressed_size + 1];
+        buf[0] = 1;
+        let compressed_size = zstd::bulk::compress_to_buffer(data, &mut buf[1..], 0)
+            .expect("compress_to_buffer failed");
+        buf.truncate(compressed_size + 1);
+        buf
+    }
+}
+
 impl Server {
     pub fn open(config: ServerConfig) -> Result<Arc<Self>> {
         let db = Database::new(Some(config.cluster.as_str()))
@@ -105,6 +144,11 @@ impl Server {
             db,
             raw_data_prefix,
             metadata_prefix: config.metadata_prefix,
+            nskey_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(120))
+                .time_to_idle(Duration::from_secs(5))
+                .max_capacity(10000)
+                .build(),
         }))
     }
 
@@ -239,6 +283,38 @@ impl Server {
         }
     }
 
+    async fn lookup_nskey(&self, nskey: &str) -> Result<Option<[u8; 10]>> {
+        enum GetError {
+            NotFound,
+            Other(anyhow::Error),
+        }
+        let res = self
+            .nskey_cache
+            .try_get_with(nskey.to_string(), async {
+                let txn = self.db.create_trx();
+                match txn {
+                    Ok(txn) => match txn.get(&self.construct_nskey_key(nskey), true).await {
+                        Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
+                            .with_context(|| "invalid namespace id")
+                            .map_err(GetError::Other),
+                        Ok(None) => Err(GetError::NotFound),
+                        Err(e) => Err(GetError::Other(
+                            anyhow::Error::from(e).context("transaction failed"),
+                        )),
+                    },
+                    Err(e) => Err(GetError::Other(
+                        anyhow::Error::from(e).context("transaction creation failed"),
+                    )),
+                }
+            })
+            .await;
+        match res.as_ref().map_err(|e| &**e) {
+            Ok(x) => Ok(Some(*x)),
+            Err(GetError::NotFound) => Ok(None),
+            Err(GetError::Other(x)) => Err(anyhow::anyhow!("nskey lookup failed: {}", x)),
+        }
+    }
+
     async fn do_serve_data_plane_stage1(
         self: Arc<Self>,
         req: Request<Body>,
@@ -256,16 +332,16 @@ impl Server {
                     .unwrap())
             }
         };
-        let txn = self.db.create_trx()?;
-        let ns_id = match txn.get(&self.construct_nskey_key(ns_key), true).await? {
-            Some(x) => <[u8; 10]>::try_from(&x[..]).with_context(|| "invalid namespace id")?,
+        let ns_id = self.lookup_nskey(ns_key).await?;
+        let ns_id = match ns_id {
+            Some(x) => x,
             None => {
                 return Ok(Response::builder()
                     .status(404)
                     .body(Body::from("namespace not found"))?)
             }
         };
-        match self.do_serve_data_plane_stage2(txn, ns_id, req).await {
+        match self.do_serve_data_plane_stage2(ns_id, req).await {
             Ok(res) => Ok(res),
             Err(e) => {
                 let ns_id_hex = hex::encode(&ns_id);
@@ -277,10 +353,10 @@ impl Server {
 
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
-        mut txn: Transaction,
         ns_id: [u8; 10],
         mut req: Request<Body>,
     ) -> Result<Response<Body>> {
+        let mut txn = self.db.create_trx()?;
         let ns_id_hex = hex::encode(&ns_id);
         let uri = req.uri();
         let res: Response<Body>;
@@ -334,9 +410,10 @@ impl Server {
                     .await?;
                 match page {
                     Some(page) => {
+                        let decompressed = page.decompress()?;
                         res = Response::builder()
                             .header("x-page-version", page.version)
-                            .body(Body::from(page.data.to_vec()))?;
+                            .body(Body::from(decompressed))?;
                     }
                     None => {
                         res = Response::builder().body(Body::empty())?;
@@ -401,11 +478,17 @@ impl Server {
                         let payload = match &page {
                             Some(x) => ReadResponse {
                                 version: x.version.as_str(),
-                                data: &x.data[..],
+                                data: match x.decompress() {
+                                    Ok(x) => x,
+                                    Err(e) => {
+                                        tracing::warn!(ns = ns_id_hex, error = %e, "error decompressing page");
+                                        break;
+                                    }
+                                },
                             },
                             None => ReadResponse {
                                 version: "",
-                                data: &[],
+                                data: Vec::new(),
                             },
                         };
                         let payload = match rmp_serde::to_vec_named(&payload) {
@@ -478,9 +561,18 @@ impl Server {
                                 break;
                             }
                         };
+                        if write_req.data.len() > MAX_PAGE_SIZE {
+                            tracing::warn!(
+                                ns = ns_id_hex,
+                                len = write_req.data.len(),
+                                limit = MAX_PAGE_SIZE,
+                                "page is too large"
+                            );
+                            break;
+                        }
                         let hash = blake3::hash(write_req.data);
                         let content_key = me.construct_content_key(ns_id, *hash.as_bytes());
-                        txn.set(&content_key, write_req.data);
+                        txn.set(&content_key, &Page::compress_zstd(write_req.data));
                         let payload = match rmp_serde::to_vec_named(&WriteResponse {
                             hash: hash.as_bytes(),
                         }) {

@@ -61,7 +61,7 @@ impl Tester {
                         .map(|_| {
                             let mut rng = rand::thread_rng();
                             let index = rng.gen_range::<u32, _>(0..self.num_pages);
-                            let mut data = vec![0u8; 4096];
+                            let mut data = vec![0u8; 2048];
                             rng.fill_bytes(&mut data);
                             (index, data)
                         })

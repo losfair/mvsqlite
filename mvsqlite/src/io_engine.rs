@@ -11,7 +11,8 @@ impl IoEngine {
                 None
             } else {
                 Some(
-                    tokio::runtime::Builder::new_current_thread()
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
                         .enable_all()
                         .build()
                         .unwrap(),
