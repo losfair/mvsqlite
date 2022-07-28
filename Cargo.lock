@@ -1063,6 +1063,7 @@ dependencies = [
  "ctor",
  "libc",
  "log",
+ "moka",
  "mvclient",
  "rand",
  "stackful",
@@ -1078,6 +1079,7 @@ name = "mvstore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-recursion",
  "blake3",
  "bytes",
  "foundationdb",

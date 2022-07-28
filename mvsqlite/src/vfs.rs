@@ -1,4 +1,8 @@
-use std::{io::ErrorKind, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::ErrorKind,
+    sync::Arc,
+};
 
 use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 
@@ -7,8 +11,9 @@ use crate::{
     sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
 };
 
-const PAGE_SIZE: usize = 2048;
-static FIRST_PAGE_TEMPLATE: &'static [u8; 2048] = include_bytes!("../template.db");
+const PAGE_SIZE: usize = 8192;
+const TRANSITION_HISTORY_SIZE: usize = 10;
+static FIRST_PAGE_TEMPLATE: &'static [u8; 8192] = include_bytes!("../template.db");
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
@@ -56,6 +61,8 @@ impl Vfs for MultiVersionVfs {
             fixed_version,
             txn: None,
             lock: LockKind::None,
+            history: TransitionHistory::default(),
+            txn_buffered_page: HashMap::new(),
         };
         Ok(conn)
     }
@@ -88,15 +95,78 @@ pub struct Connection {
     fixed_version: Option<String>,
     txn: Option<Transaction>,
     lock: LockKind,
+    history: TransitionHistory,
+
+    /// Clear this when writing or dropping txn!
+    txn_buffered_page: HashMap<u32, Vec<u8>>,
+}
+
+#[derive(Default)]
+struct TransitionHistory {
+    history: HashMap<u32, [u32; TRANSITION_HISTORY_SIZE]>,
+    prev_index: u32,
+}
+
+impl TransitionHistory {
+    fn predict(&self, current_index: u32) -> Vec<u32> {
+        let mut count: HashMap<u32, u32> = HashMap::with_capacity(TRANSITION_HISTORY_SIZE);
+        let destinations = self
+            .history
+            .get(&current_index)
+            .copied()
+            .unwrap_or_default();
+        for &destination in destinations.iter() {
+            *count.entry(destination).or_insert(0) += 1;
+        }
+
+        let mut items = count
+            .iter()
+            .filter_map(|(&destination, &count)| {
+                let probability = (count as f64) / (TRANSITION_HISTORY_SIZE as f64);
+                if probability >= 0.2 && destination != 0 {
+                    Some((destination, count))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|x| -(x.1 as i64));
+        items.iter().map(|x| x.0).collect()
+    }
+
+    fn record(&mut self, current_index: u32) {
+        let entry = self.history.entry(self.prev_index).or_default();
+        entry.rotate_right(1);
+        entry[0] = current_index;
+        self.prev_index = current_index;
+    }
+
+    fn record_and_predict(&mut self, current_index: u32, depth: usize) -> HashSet<u32> {
+        self.record(current_index);
+
+        let mut predictions: HashSet<u32> = HashSet::with_capacity(depth * 2);
+        let mut last = current_index;
+        for _ in 0..depth {
+            let local_pred = self.predict(last);
+            if local_pred.is_empty() || predictions.contains(&local_pred[0]) {
+                break;
+            } else {
+                last = local_pred[0];
+                predictions.extend(local_pred);
+            }
+        }
+        predictions
+    }
 }
 
 impl Connection {
     fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % PAGE_SIZE == 0);
-        assert!(buf.len() % PAGE_SIZE == 0);
+        assert!(buf.len() == PAGE_SIZE);
+
         let txn = self.txn.as_mut().unwrap();
         let num_pages = buf.len() / PAGE_SIZE;
-        let page_offset = offset as usize / PAGE_SIZE;
+        let page_offset = u32::try_from(offset as usize / PAGE_SIZE).unwrap();
 
         tracing::debug!(
             num_pages = num_pages,
@@ -104,33 +174,46 @@ impl Connection {
             txn_version = txn.version(),
             "read_exact_at"
         );
-        let page_id_list = (0..num_pages)
-            .map(|i| {
-                let page_id = (page_offset + i) as u32;
-                page_id
-            })
-            .collect::<Vec<_>>();
 
-        let pages = self.io.run(async {
-            txn.read_many(&page_id_list)
-                .await
-                .expect("unrecoverable read failure")
-        });
+        let page: Vec<u8>;
 
-        for (i, page) in pages.iter().enumerate() {
-            let page_buf = &mut buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE];
-
-            if page.is_empty() {
-                if offset == 0 && i == 0 {
-                    page_buf.copy_from_slice(FIRST_PAGE_TEMPLATE);
-                } else {
-                    page_buf.iter_mut().for_each(|b| *b = 0);
+        match self.txn_buffered_page.get(&page_offset) {
+            Some(buffered_page) => {
+                self.history.record(page_offset);
+                tracing::debug!(index = page_offset, "prefetch hit");
+                page = buffered_page.clone();
+            }
+            None => {
+                let predicted_next = self.history.record_and_predict(page_offset, 3);
+                tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
+                let mut read_vec: Vec<u32> = Vec::with_capacity(1 + predicted_next.len());
+                read_vec.push(page_offset);
+                for &predicted_next_page in &predicted_next {
+                    read_vec.push(predicted_next_page);
                 }
-            } else {
-                page_buf.copy_from_slice(&page);
+
+                let pages = self.io.run(async {
+                    txn.read_many(&read_vec)
+                        .await
+                        .expect("unrecoverable read failure")
+                });
+                assert_eq!(pages.len(), 1 + predicted_next.len());
+
+                let mut pages = pages.into_iter();
+                page = pages.next().expect("missing page from read response");
+                self.txn_buffered_page = predicted_next.into_iter().zip(pages).collect();
             }
         }
 
+        if page.is_empty() {
+            if offset == 0 {
+                buf.copy_from_slice(FIRST_PAGE_TEMPLATE);
+            } else {
+                buf.iter_mut().for_each(|b| *b = 0);
+            }
+        } else {
+            buf.copy_from_slice(&page);
+        }
         Ok(())
     }
 }
@@ -169,6 +252,9 @@ impl DatabaseHandle for Connection {
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % PAGE_SIZE == 0);
         assert!(buf.len() % PAGE_SIZE == 0);
+
+        self.txn_buffered_page = HashMap::new();
+        self.history.prev_index = 0;
 
         let num_pages = buf.len() / PAGE_SIZE;
         let page_offset = offset as usize / PAGE_SIZE;
@@ -260,13 +346,15 @@ impl DatabaseHandle for Connection {
             // to abort the process.
             let result = result.expect("transaction commit failed");
             let result = result.expect("transaction conflict");
-            tracing::info!(version = result.version, "transaction committed");
+            tracing::info!(version = result.version, duration = ?result.duration, num_pages = result.num_pages, "transaction committed");
             self.txn = Some(self.client.create_transaction_at_version(&result.version));
         }
 
         if lock == LockKind::None {
             // All locks dropped
             self.txn.take().expect("unlocked without locking");
+            self.txn_buffered_page = HashMap::new();
+            self.history.prev_index = 0;
         }
 
         Ok(true)

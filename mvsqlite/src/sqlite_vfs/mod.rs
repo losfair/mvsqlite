@@ -1490,7 +1490,7 @@ mod io {
     pub unsafe extern "C" fn sector_size<F>(_p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("sector_size");
 
-        2048
+        8192
     }
 
     /// Return the device characteristic flags supported by a file.
