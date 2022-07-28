@@ -92,8 +92,9 @@ Set environment variables, and run the shell:
 
 ```bash
 export RUST_LOG=info MVSQLITE_DATA_PLANE="http://localhost:7000"
+
+# "test" is the key of the namespace we created earlier
 LD_PRELOAD=../mvsqlite-preload/libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite3 test
-./sqlite3 test # "test" is the key of the namespace we created earlier
 ```
 
 You should see the sqlite shell now :) Try creating a table and play with it.
