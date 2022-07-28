@@ -75,6 +75,7 @@ Build the client library:
 
 ```bash
 cargo build --release -p mvsqlite
+make -C ./mvsqlite-preload
 ```
 
 Patch and build the `sqlite3` CLI binary with mvsqlite patch:
@@ -83,18 +84,19 @@ Patch and build the `sqlite3` CLI binary with mvsqlite patch:
 wget https://www.sqlite.org/2022/sqlite-amalgamation-3390200.zip
 unzip sqlite-amalgamation-3390200.zip
 cd sqlite-amalgamation-3390200
-patch < ../misc/sqlite-amalgamation-3390200-shell.patch
-gcc -O2 -o sqlite3 ./*.c -L../target/release -lmvsqlite -lssl -lcrypto -lpthread -ldl -lm
+gcc -O2 -fPIC --shared -o libsqlite3.so ./sqlite3.c -lpthread -ldl -lm
+gcc -O2 -o sqlite3 ./shell.c -L. -lsqlite3
 ```
 
 Set environment variables, and run the shell:
 
 ```bash
 export RUST_LOG=info MVSQLITE_DATA_PLANE="http://localhost:7000"
+LD_PRELOAD=../mvsqlite-preload/libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite3 test
 ./sqlite3 test # "test" is the key of the namespace we created earlier
 ```
 
-You should see the sqlite shell now :)
+You should see the sqlite shell now :) Try creating a table and play with it.
 
 ## Limits
 
