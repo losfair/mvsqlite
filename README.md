@@ -4,12 +4,21 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 **This is alpha software and has not received enough testing. On-disk format may change in future versions. Please do not use it in production.**
 
+- [mvsqlite](#mvsqlite)
+  - [Features](#features)
+    - [Upcoming features](#upcoming-features)
+  - [Demo](#demo)
+  - [Try it](#try-it)
+  - [Limits](#limits)
+    - [Read latency](#read-latency)
+    - [Not yet implemented: garbage collection](#not-yet-implemented-garbage-collection)
+
 ## Features
 
 - **Full feature-set from SQLite**: mvsqlite integrates with SQLite using a custom [VFS](https://www.sqlite.org/vfs.html) layer.
 - **Time travel**: Checkout the snapshot of your database at any point of time in the past.
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be 50x larger than FDB's native one.
-- **Drop-in replacement**: On the client side it's just a VFS plugin. In a future version we will provide a patched `libsqlite3.so` that you can pull it into your existing applications and have things work out-of-the-box.
+- **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
 
 ### Upcoming features
 
@@ -86,3 +95,15 @@ export RUST_LOG=info MVSQLITE_DATA_PLANE="http://localhost:7000"
 ```
 
 You should see the sqlite shell now :)
+
+## Limits
+
+### Read latency
+
+SQLite does synchronous "disk" I/O. While we can (and do) concurrently execute write operations, reads from FoundationDB block the SQLite thread.
+
+This is probably fine if you don't expect to get very I/O intensive on a single database, but you may want to enable `coroutine` in the `IoEngine` config so that network I/O won't block the thread if you have an event loop outside.
+
+### Not yet implemented: garbage collection
+
+Currently history versions will be kept in the database forever. There is no garbage collection yet. In a future version this will be fixed.
