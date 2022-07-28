@@ -78,7 +78,7 @@ cargo build --release -p mvsqlite
 make -C ./mvsqlite-preload
 ```
 
-Patch and build the `sqlite3` CLI binary with mvsqlite patch:
+Build `libsqlite3` and the `sqlite3` CLI: (note that a custom build is only needed here because the `sqlite3` binary shipped on most systems are statically linked to `libsqlite3` and `LD_PRELOAD` don't work)
 
 ```bash
 wget https://www.sqlite.org/2022/sqlite-amalgamation-3390200.zip
