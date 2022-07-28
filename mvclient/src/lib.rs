@@ -12,8 +12,9 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore};
 
@@ -60,6 +61,8 @@ pub struct ReadResponse<'a> {
 pub struct WriteRequest<'a> {
     #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
+
+    pub delta_base: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +87,8 @@ pub struct CommitRequest<'a> {
 
 pub struct CommitResult {
     pub version: String,
+    pub duration: Duration,
+    pub num_pages: u64,
 }
 
 impl MultiVersionClient {
@@ -131,7 +136,8 @@ impl MultiVersionClient {
                 background_completion: Arc::new(tokio::sync::RwLock::new(())),
                 has_error: AtomicBool::new(false),
             }),
-            seen_hashes: HashSet::new(),
+            seen_hashes: Mutex::new(HashSet::new()),
+            start_time: Instant::now(),
         };
 
         txn
@@ -143,7 +149,8 @@ pub struct Transaction {
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
     async_ctx: Arc<TxnAsyncCtx>,
-    seen_hashes: HashSet<[u8; 32]>,
+    seen_hashes: Mutex<HashSet<[u8; 32]>>,
+    start_time: Instant,
 }
 
 struct TxnAsyncCtx {
@@ -164,7 +171,7 @@ impl Transaction {
             Ok(())
         }
     }
-    pub async fn read_many(&mut self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+    pub async fn read_many(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
@@ -208,6 +215,8 @@ impl Transaction {
                 let data: ReadResponse = rmp_serde::from_slice(serialized)?;
                 out.push(data.data.to_vec());
                 self.seen_hashes
+                    .lock()
+                    .unwrap()
                     .insert(*blake3::hash(&data.data).as_bytes());
             }
 
@@ -290,11 +299,11 @@ impl Transaction {
             .collect::<Vec<_>>();
         let pages_to_push = all_pages
             .iter()
-            .filter(|(_, _, hash)| !self.seen_hashes.contains(hash.as_bytes()))
+            .filter(|(_, _, hash)| !self.seen_hashes.lock().unwrap().contains(hash.as_bytes()))
             .collect::<Vec<_>>();
         let mut raw_request: Vec<u8> = Vec::new();
-        for &(_, data, _) in &pages_to_push {
-            let req = WriteRequest { data };
+        for &(page_index, data, _) in &pages_to_push {
+            let req = WriteRequest { data, delta_base: Some(*page_index) };
             let serialized = rmp_serde::to_vec_named(&req)?;
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
             raw_request.extend_from_slice(&serialized);
@@ -306,7 +315,7 @@ impl Transaction {
         let raw_request = Bytes::from(raw_request);
         for (page_index, _, hash) in &all_pages {
             self.page_buffer.insert(*page_index, *hash.as_bytes());
-            self.seen_hashes.insert(*hash.as_bytes());
+            self.seen_hashes.lock().unwrap().insert(*hash.as_bytes());
         }
         let completion_guard = self
             .async_ctx
@@ -338,6 +347,8 @@ impl Transaction {
         if self.page_buffer.is_empty() {
             return Ok(Some(CommitResult {
                 version: self.version,
+                duration: self.start_time.elapsed(),
+                num_pages: 0,
             }));
         }
 
@@ -400,6 +411,8 @@ impl Transaction {
             tracing::debug!(version = committed_version, "committed transaction");
             return Ok(Some(CommitResult {
                 version: committed_version.into(),
+                duration: self.start_time.elapsed(),
+                num_pages: self.page_buffer.len() as u64,
             }));
         }
     }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::FdbSlice,
@@ -62,6 +63,8 @@ pub struct ReadResponse<'a> {
 pub struct WriteRequest<'a> {
     #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
+
+    pub delta_base: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -100,34 +103,21 @@ pub struct Page {
     pub data: FdbSlice,
 }
 
+#[derive(Default)]
+pub struct DecodedPage {
+    pub data: Vec<u8>,
+    pub delta_depth: u32,
+}
+
+const PAGE_ENCODING_NONE: u8 = 0;
+const PAGE_ENCODING_ZSTD: u8 = 1;
+const PAGE_ENCODING_DELTA: u8 = 2;
+
 impl Page {
-    fn decompress(&self) -> Result<Vec<u8>> {
-        if self.data.len() == 0 {
-            return Ok(Vec::new());
-        }
-
-        let compress_type = self.data[0];
-        match compress_type {
-            0 => {
-                // not compressed
-                Ok(self.data[1..].to_vec())
-            }
-            1 => {
-                // zstd
-                let data = zstd::bulk::decompress(&self.data[1..], MAX_PAGE_SIZE)
-                    .with_context(|| "zstd decompress failed")?;
-                Ok(data)
-            }
-            _ => {
-                anyhow::bail!("unsupported compression type: {}", compress_type);
-            }
-        }
-    }
-
     fn compress_zstd(data: &[u8]) -> Vec<u8> {
         let max_compressed_size = zstd::zstd_safe::compress_bound(data.len());
         let mut buf = vec![0u8; max_compressed_size + 1];
-        buf[0] = 1;
+        buf[0] = PAGE_ENCODING_ZSTD;
         let compressed_size = zstd::bulk::compress_to_buffer(data, &mut buf[1..], 0)
             .expect("compress_to_buffer failed");
         buf.truncate(compressed_size + 1);
@@ -351,6 +341,17 @@ impl Server {
         }
     }
 
+    async fn get_read_version_as_versionstamp(&self, txn: &Transaction) -> Result<[u8; 10]> {
+        let read_version = txn.get_read_version().await? as u64;
+        let mut buf = [0u8; 10];
+        buf[0..8].copy_from_slice(&read_version.to_be_bytes());
+
+        // Now we can observe all changes with `committed_version == read_version`.
+        buf[8] = 255;
+        buf[9] = 255;
+        Ok(buf)
+    }
+
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
         ns_id: [u8; 10],
@@ -362,14 +363,7 @@ impl Server {
         let res: Response<Body>;
         match uri.path() {
             "/stat" => {
-                let read_version = txn.get_read_version().await? as u64;
-                let mut buf = [0u8; 10];
-                buf[0..8].copy_from_slice(&read_version.to_be_bytes());
-
-                // Now we can observe all changes with `committed_version == read_version`.
-                buf[8] = 255;
-                buf[9] = 255;
-
+                let buf = self.get_read_version_as_versionstamp(&txn).await?;
                 let nsmd = txn.get(&self.construct_nsmd_key(ns_id), true).await?;
                 let nsmd = nsmd
                     .as_ref()
@@ -410,10 +404,10 @@ impl Server {
                     .await?;
                 match page {
                     Some(page) => {
-                        let decompressed = page.decompress()?;
+                        let decoded = self.decode_page(&txn, ns_id, &page.data).await?;
                         res = Response::builder()
                             .header("x-page-version", page.version)
-                            .body(Body::from(decompressed))?;
+                            .body(Body::from(decoded.data))?;
                     }
                     None => {
                         res = Response::builder().body(Body::empty())?;
@@ -478,10 +472,10 @@ impl Server {
                         let payload = match &page {
                             Some(x) => ReadResponse {
                                 version: x.version.as_str(),
-                                data: match x.decompress() {
-                                    Ok(x) => x,
+                                data: match self.decode_page(&txn, ns_id, &x.data).await {
+                                    Ok(x) => x.data,
                                     Err(e) => {
-                                        tracing::warn!(ns = ns_id_hex, error = %e, "error decompressing page");
+                                        tracing::warn!(ns = ns_id_hex, error = %e, "error decoding page");
                                         break;
                                     }
                                 },
@@ -572,7 +566,36 @@ impl Server {
                         }
                         let hash = blake3::hash(write_req.data);
                         let content_key = me.construct_content_key(ns_id, *hash.as_bytes());
-                        txn.set(&content_key, &Page::compress_zstd(write_req.data));
+
+                        // Attempt delta-encoding
+                        let mut delta_ok = false;
+                        if let Some(delta_base_index) = write_req.delta_base {
+                            match me
+                                .delta_encode(&txn, ns_id, delta_base_index, &write_req.data)
+                                .await
+                            {
+                                Ok(x) => {
+                                    if let Some(x) = x {
+                                        txn.set(&content_key, &x);
+                                        delta_ok = true;
+                                        tracing::debug!(ns = ns_id_hex, "delta encoded");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        ns = ns_id_hex,
+                                        error = %e,
+                                        "delta encoding failed"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !delta_ok {
+                            txn.set(&content_key, &Page::compress_zstd(write_req.data));
+                        }
+
                         let payload = match rmp_serde::to_vec_named(&WriteResponse {
                             hash: hash.as_bytes(),
                         }) {
@@ -715,13 +738,13 @@ impl Server {
         }
     }
 
-    async fn read_page(
+    async fn read_page_hash(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
         page_index: u32,
         block_version_hex: &str,
-    ) -> Result<Option<Page>> {
+    ) -> Result<Option<(String, [u8; 32])>> {
         let mut block_version = [0u8; 10];
         hex::decode_to_slice(block_version_hex, &mut block_version)
             .with_context(|| "invalid block_version")?;
@@ -745,20 +768,36 @@ impl Server {
         } else {
             let page = page_vec.into_iter().next().unwrap();
             let key = page.key();
-            let hash = page.value();
             let version = hex::encode(&key[key.len() - 10..]);
-
+            let hash = page.value();
             let hash = <[u8; 32]>::try_from(hash).with_context(|| "invalid content hash")?;
-            let content_key = self.construct_content_key(ns_id, hash);
-            let content = txn
-                .get(&content_key, true)
-                .await?
-                .with_context(|| "cannot find content for the provided hash")?;
-            Ok(Some(Page {
-                version,
-                data: content,
-            }))
+            Ok(Some((version, hash)))
         }
+    }
+
+    async fn read_page(
+        &self,
+        txn: &Transaction,
+        ns_id: [u8; 10],
+        page_index: u32,
+        block_version_hex: &str,
+    ) -> Result<Option<Page>> {
+        let (version, hash) = match self
+            .read_page_hash(txn, ns_id, page_index, block_version_hex)
+            .await?
+        {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let content_key = self.construct_content_key(ns_id, hash);
+        let content = txn
+            .get(&content_key, true)
+            .await?
+            .with_context(|| "cannot find content for the provided hash")?;
+        Ok(Some(Page {
+            version,
+            data: content,
+        }))
     }
 
     fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
@@ -816,6 +855,132 @@ impl Server {
         buf.push(b'c');
         buf.extend_from_slice(&hash);
         buf
+    }
+
+    async fn delta_encode(
+        &self,
+        txn: &Transaction,
+        ns_id: [u8; 10],
+        base_page_index: u32,
+        this_page: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
+        let delta_base_hash = self
+            .read_page_hash(&txn, ns_id, base_page_index, &version_hex)
+            .await?;
+
+        let (_, delta_base_hash) = match delta_base_hash {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+
+        let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
+        let base_page = match txn.get(&base_page_key, true).await? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let base_page = self.decode_page(txn, ns_id, &base_page).await?;
+        if base_page.delta_depth >= 4 {
+            return Ok(None);
+        }
+
+        if base_page.data.len() != this_page.len() || this_page.is_empty() {
+            return Ok(None);
+        }
+
+        let num_diff_bytes = base_page
+            .data
+            .iter()
+            .zip(this_page.iter())
+            .filter(|(b, t)| b != t)
+            .count();
+        if num_diff_bytes >= this_page.len() / 5 {
+            return Ok(None);
+        }
+
+        let xor_image = base_page
+            .data
+            .iter()
+            .zip(this_page.iter())
+            .map(|(b, t)| b ^ t)
+            .collect::<Vec<_>>();
+        let compressed = zstd::bulk::compress(&xor_image, 0)?;
+        if compressed.len() >= this_page.len() / 3 {
+            return Ok(None);
+        }
+
+        let mut output: Vec<u8> = Vec::with_capacity(1 + 32 + compressed.len());
+        output.push(PAGE_ENCODING_DELTA);
+        output.extend_from_slice(&delta_base_hash);
+        output.extend_from_slice(&compressed);
+
+        tracing::debug!(
+            ns = hex::encode(&ns_id),
+            base = hex::encode(&delta_base_hash),
+            depth = base_page.delta_depth + 1,
+            "delta encoded"
+        );
+        Ok(Some(output))
+    }
+
+    #[async_recursion]
+    async fn decode_page(
+        &self,
+        txn: &Transaction,
+        ns_id: [u8; 10],
+        data: &[u8],
+    ) -> Result<DecodedPage> {
+        if data.len() == 0 {
+            return Ok(DecodedPage::default());
+        }
+
+        let encode_type = data[0];
+        match encode_type {
+            PAGE_ENCODING_NONE => {
+                // not compressed
+                Ok(DecodedPage {
+                    data: data[1..].to_vec(),
+                    delta_depth: 0,
+                })
+            }
+            PAGE_ENCODING_ZSTD => {
+                // zstd
+                let data = zstd::bulk::decompress(&data[1..], MAX_PAGE_SIZE)
+                    .with_context(|| "zstd decompress failed")?;
+                Ok(DecodedPage {
+                    data,
+                    delta_depth: 0,
+                })
+            }
+            PAGE_ENCODING_DELTA => {
+                if data.len() < 33 {
+                    anyhow::bail!("invalid delta encoding");
+                }
+                let base_page_hash = <[u8; 32]>::try_from(&data[1..33]).unwrap();
+                let base_page_key = self.construct_content_key(ns_id, base_page_hash);
+                let base_page = match txn.get(&base_page_key, true).await? {
+                    Some(x) => x,
+                    None => anyhow::bail!("base page not found"),
+                };
+                let base_page = self.decode_page(txn, ns_id, &base_page).await?;
+                let mut delta_data = zstd::bulk::decompress(&data[33..], MAX_PAGE_SIZE)?;
+                if delta_data.len() != base_page.data.len() {
+                    anyhow::bail!("delta and base have different sizes");
+                }
+
+                for (i, b) in delta_data.iter_mut().enumerate() {
+                    *b ^= base_page.data[i];
+                }
+
+                Ok(DecodedPage {
+                    data: delta_data,
+                    delta_depth: base_page.delta_depth + 1,
+                })
+            }
+            _ => {
+                anyhow::bail!("unsupported page encoding: {}", encode_type);
+            }
+        }
     }
 }
 
