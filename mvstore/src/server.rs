@@ -567,32 +567,50 @@ impl Server {
                         let hash = blake3::hash(write_req.data);
                         let content_key = me.construct_content_key(ns_id, *hash.as_bytes());
 
-                        // Attempt delta-encoding
-                        let mut delta_ok = false;
-                        if let Some(delta_base_index) = write_req.delta_base {
-                            match me
-                                .delta_encode(&txn, ns_id, delta_base_index, &write_req.data)
-                                .await
-                            {
-                                Ok(x) => {
-                                    if let Some(x) = x {
-                                        txn.set(&content_key, &x);
-                                        delta_ok = true;
-                                        tracing::debug!(ns = ns_id_hex, "delta encoded");
-                                    }
+                        let mut early_completion = false;
+
+                        // This is not only an optimization. Without doing this check it is possible to form
+                        // loops in delta page construction.
+                        match txn.get(&content_key, true).await {
+                            Ok(x) => {
+                                if x.is_some() {
+                                    early_completion = true;
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        ns = ns_id_hex,
-                                        error = %e,
-                                        "delta encoding failed"
-                                    );
-                                    break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(ns = ns_id_hex, error = %e, "error getting content");
+                                break;
+                            }
+                        }
+
+                        // Attempt delta-encoding
+                        if !early_completion {
+                            if let Some(delta_base_index) = write_req.delta_base {
+                                match me
+                                    .delta_encode(&txn, ns_id, delta_base_index, &write_req.data)
+                                    .await
+                                {
+                                    Ok(x) => {
+                                        if let Some(x) = x {
+                                            txn.set(&content_key, &x);
+                                            early_completion = true;
+                                            tracing::debug!(ns = ns_id_hex, "delta encoded");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            ns = ns_id_hex,
+                                            error = %e,
+                                            "delta encoding failed"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
 
-                        if !delta_ok {
+                        // Finally...
+                        if !early_completion {
                             txn.set(&content_key, &Page::compress_zstd(write_req.data));
                         }
 
