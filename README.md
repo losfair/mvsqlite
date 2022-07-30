@@ -7,6 +7,7 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 - [mvsqlite](#mvsqlite)
   - [Features](#features)
     - [Upcoming features](#upcoming-features)
+  - [Comparison with dqlite and rqlite](#comparison-with-dqlite-and-rqlite)
   - [Demo](#demo)
   - [Try it](#try-it)
   - [Limits](#limits)
@@ -24,6 +25,21 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - **Branching**: Create a writable snapshot from a past version of your database.
 - **Zero-overhead cross-database transactions**: While each SQLite database remains single-writer, you can horizontally scale your application with cross-database serializable transactions without additional overhead.
+
+## Comparison with dqlite and rqlite
+
+[dqlite](https://github.com/canonical/dqlite) and [rqlite](https://github.com/rqlite/rqlite) are two other distributed databases built on SQLite. Some of the key differences between mvsqlite and those two systems:
+
+- **(+)**: mvsqlite is a drop-in replacement. To run existing applications with mvsqlite, setting `LD_PRELOAD` is enough.
+- **(+)**: mvsqlite runs on a production-grade distributed key-value store, FoundationDB, instead of implementing its own consensus subsystem.
+- **(+)**: mvsqlite has advanced multi-version features like snapshot reads without time limit, and reading the DB snapshot from a past point in time.
+- **(+)**: mvsqlite supports multi-database transactions. So you can scale your writes horizontally, with the right data model.
+- **(-)**: Reads in mvsqlite are sensitive to network latency. The client is stateless, and data needs to be fetched from FDB on demand.
+  - Maybe this will be improved in a future version with a better prefetch strategy.
+- **(-)**: mvsqlite is a little more complex to deploy than the alternative.
+  - Three moving parts: FoundationDB, `mvstore`, and `libmvsqlite_preload.so`, instead of a single library.
+- **(-)**: mvsqlite is new. Really new. And has not received as much testing as the alternatives.
+  - But you can rely on FDB's continuous backup to ensure your data integrity in case an unknown bug in mvsqlite corrupted your database.
 
 ## Demo
 
@@ -105,7 +121,7 @@ You should see the sqlite shell now :) Try creating a table and play with it.
 
 SQLite does synchronous "disk" I/O. While we can (and do) concurrently execute write operations, reads from FoundationDB block the SQLite thread.
 
-This is probably fine if you don't expect to get very I/O intensive on a single database, but you may want to enable `coroutine` in the `IoEngine` config so that network I/O won't block the thread if you have an event loop outside.
+This is probably fine if you don't expect to get very I/O intensive on a single database, but you may want to enable `coroutine` in the `IoEngine` config if you have an event loop outside, so that network I/O won't block the thread.
 
 ### Not yet implemented: garbage collection
 
