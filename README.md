@@ -10,6 +10,8 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
   - [Comparison with dqlite and rqlite](#comparison-with-dqlite-and-rqlite)
   - [Demo](#demo)
   - [Try it](#try-it)
+  - [API behavior differences from SQLite](#api-behavior-differences-from-sqlite)
+    - [The "database is locked" error](#the-database-is-locked-error)
   - [Limits](#limits)
     - [Read latency](#read-latency)
     - [Not yet implemented: garbage collection](#not-yet-implemented-garbage-collection)
@@ -114,6 +116,14 @@ LD_PRELOAD=../mvsqlite-preload/libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite
 ```
 
 You should see the sqlite shell now :) Try creating a table and play with it.
+
+## API behavior differences from SQLite
+
+### The "database is locked" error
+
+To keep compatibility with applications targeting upstream SQLite, mvsqlite enables pessimistic locking by default - when a transaction is promoted to EXCLUSIVE, it acquires a one-minute lock lease from mvstore to prevent another EXCLUSIVE transaction from starting. At this point, we have the chance to fail gracefully and return a "database is locked" error if multiple clients want to acquire lock on the same DB. This is a best-effort mechanism to prevent conflict on commit (which causes the process to abort).
+
+But some apps may not like this behavior. After a "DB locked" error, they will retry the `COMMIT` statement only, instead of rolling back the whole transaction. This works with upstream SQLite due to its file locking mechanisms, but on mvsqlite retrying `COMMIT` on a DB-locked error is useless, because there is no way to correctly write to a database that has diverged from its snapshot in the current transaction.
 
 ## Limits
 
