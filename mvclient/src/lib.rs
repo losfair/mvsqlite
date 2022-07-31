@@ -103,6 +103,12 @@ impl MultiVersionClient {
     }
 
     pub async fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
+        self.create_transaction_with_metadata().await.map(|x| x.0)
+    }
+
+    pub async fn create_transaction_with_metadata(
+        self: &Arc<Self>,
+    ) -> Result<(Transaction, String)> {
         let mut url = self.config.data_plane.clone();
         url.set_path("/stat");
 
@@ -123,7 +129,10 @@ impl MultiVersionClient {
             metadata = stat_res.metadata,
             "created transaction"
         );
-        Ok(self.create_transaction_at_version(&stat_res.version))
+        Ok((
+            self.create_transaction_at_version(&stat_res.version),
+            stat_res.metadata,
+        ))
     }
 
     pub fn create_transaction_at_version(self: &Arc<Self>, version: &str) -> Transaction {
@@ -303,7 +312,10 @@ impl Transaction {
             .collect::<Vec<_>>();
         let mut raw_request: Vec<u8> = Vec::new();
         for &(page_index, data, _) in &pages_to_push {
-            let req = WriteRequest { data, delta_base: Some(*page_index) };
+            let req = WriteRequest {
+                data,
+                delta_base: Some(*page_index),
+            };
             let serialized = rmp_serde::to_vec_named(&req)?;
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
             raw_request.extend_from_slice(&serialized);
@@ -342,9 +354,8 @@ impl Transaction {
         Ok(())
     }
 
-    pub async fn commit(self) -> Result<Option<CommitResult>> {
-        // XXX: Check metadata update when it get implemented.
-        if self.page_buffer.is_empty() {
+    pub async fn commit(self, metadata: Option<&str>) -> Result<Option<CommitResult>> {
+        if self.page_buffer.is_empty() && metadata.is_none() {
             return Ok(Some(CommitResult {
                 version: self.version,
                 duration: self.start_time.elapsed(),
@@ -362,7 +373,7 @@ impl Transaction {
 
         let init = CommitInit {
             version: self.version.as_str(),
-            metadata: None,
+            metadata,
             num_pages: self.page_buffer.len() as u32,
         };
 

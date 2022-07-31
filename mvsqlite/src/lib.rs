@@ -1,16 +1,17 @@
 pub mod io_engine;
+pub mod sqlite;
 pub mod sqlite_vfs;
 pub mod vfs;
 use std::sync::Arc;
 
 use backtrace::Backtrace;
+use sqlite::SqlitePtr;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
+use vfs::take_conn_buffer;
 
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
 
-//type Sqlite3OpenFn = unsafe extern "C" fn(filename: *const c_char, pp_db: *mut *mut c_void) -> i32;
-
-//static mut REAL_SQLITE3_OPEN: Option<Sqlite3OpenFn> = None;
+pub static VFS_NAME: &'static str = "mv-vfs";
 
 #[no_mangle]
 pub extern "C" fn init_mvsqlite() {
@@ -39,16 +40,19 @@ pub extern "C" fn init_mvsqlite() {
         io: io_engine,
     };
 
-    /*let real_sqlite3_open = unsafe {
-        REAL_SQLITE3_OPEN = std::mem::transmute::<_, Option<Sqlite3OpenFn>>(libc::dlsym(
-            libc::RTLD_NEXT,
-            b"sqlite3_open\0".as_ptr() as *const c_char,
-        ));
-        REAL_SQLITE3_OPEN.expect("real sqlite3_open not found") as usize
-    };*/
-    sqlite_vfs::register("mv-vfs", vfs, true).expect("Failed to register VFS");
-    tracing::info!(
-        //real_sqlite3_open = format!("{:p}", real_sqlite3_open as *const c_void),
-        "mvsqlite initialized"
-    );
+    sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");
+    tracing::info!("mvsqlite initialized");
+}
+
+#[no_mangle]
+pub extern "C" fn init_mvsqlite_connection(db: SqlitePtr) {
+    let mut conn = take_conn_buffer();
+
+    // SAFETY:
+    // - Lifetimes - `conn` lives as long as `db`.
+    // - Alias rules - this is safe as long as we don't re-enter SQLite from VFS/Hook callbacks.
+    unsafe {
+        let conn = conn.as_mut();
+        conn.init(db);
+    }
 }

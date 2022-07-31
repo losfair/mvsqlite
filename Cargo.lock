@@ -1066,6 +1066,8 @@ dependencies = [
  "moka",
  "mvclient",
  "rand",
+ "serde",
+ "serde_json",
  "stackful",
  "thiserror",
  "time",

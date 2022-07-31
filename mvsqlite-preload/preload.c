@@ -8,6 +8,7 @@
 #include <assert.h>
 
 extern void init_mvsqlite(void);
+extern void init_mvsqlite_connection(sqlite3 *db);
 
 typedef int (*sqlite3_initialize_fn)(void);
 typedef int (*sqlite3_open_v2_fn)(
@@ -40,6 +41,7 @@ int sqlite3_open_v2(
     pthread_once(&vfs_init, init_mvsqlite);
     ret = real_sqlite3_open_v2(filename, ppDb, flags, zVfs);
     if(ret == SQLITE_OK) {
+        init_mvsqlite_connection(*ppDb);
         ret = sqlite3_exec(*ppDb, "PRAGMA journal_mode = memory", NULL, NULL, NULL);
         assert(ret == SQLITE_OK);
 
