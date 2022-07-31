@@ -1,13 +1,19 @@
+use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     io::ErrorKind,
+    ptr::NonNull,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use libc::c_void;
 use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
     io_engine::IoEngine,
+    sqlite::{sqlite3_commit_hook, sqlite3_rollback_hook, SqlitePtr},
     sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
 };
 
@@ -15,13 +21,28 @@ const PAGE_SIZE: usize = 8192;
 const TRANSITION_HISTORY_SIZE: usize = 10;
 static FIRST_PAGE_TEMPLATE: &'static [u8; 8192] = include_bytes!("../template.db");
 
+thread_local! {
+    static CONN_BUFFER: Cell<Option<NonNull<Connection>>> = Cell::new(None);
+}
+
 pub struct MultiVersionVfs {
     pub data_plane: String,
     pub io: Arc<IoEngine>,
 }
 
+pub(crate) fn take_conn_buffer() -> NonNull<Connection> {
+    CONN_BUFFER
+        .with(|b| b.take())
+        .expect("CONN_BUFFER is not set")
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct NsMetadata {
+    pub lock: Option<u64>,
+}
+
 impl Vfs for MultiVersionVfs {
-    type Handle = Connection;
+    type Handle = Box<Connection>;
 
     fn open(
         &self,
@@ -63,11 +84,26 @@ impl Vfs for MultiVersionVfs {
             lock: LockKind::None,
             history: TransitionHistory::default(),
             txn_buffered_page: HashMap::new(),
+            txn_metadata: None,
+            did_init: false,
+            mvcc_aware: false,
         };
+        let mut conn = Box::new(conn);
+
+        CONN_BUFFER.with(|b| {
+            let orig = b.take();
+            if orig.is_some() {
+                panic!("CONN_BUFFER is already set");
+            }
+            let conn_ptr = NonNull::from(&mut *conn);
+            b.set(Some(conn_ptr));
+        });
+
         Ok(conn)
     }
 
-    fn delete(&self, _db: &str) -> Result<(), std::io::Error> {
+    fn delete(&self, db: &str) -> Result<(), std::io::Error> {
+        tracing::debug!(db = db, "delete db");
         Ok(())
     }
 
@@ -84,8 +120,11 @@ impl Vfs for MultiVersionVfs {
         rand::Rng::fill(&mut rand::thread_rng(), buffer);
     }
 
-    fn sleep(&self, _duration: std::time::Duration) -> std::time::Duration {
-        panic!("sleep inside vfs is not allowed");
+    fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
+        self.io.run(async {
+            tokio::time::sleep(duration).await;
+        });
+        duration
     }
 }
 
@@ -99,6 +138,10 @@ pub struct Connection {
 
     /// Clear this when writing or dropping txn!
     txn_buffered_page: HashMap<u32, Vec<u8>>,
+    txn_metadata: Option<NsMetadata>,
+
+    did_init: bool,
+    mvcc_aware: bool,
 }
 
 #[derive(Default)]
@@ -218,7 +261,7 @@ impl Connection {
     }
 }
 
-impl DatabaseHandle for Connection {
+impl DatabaseHandle for Box<Connection> {
     type WalIndex = WalDisabled;
 
     fn size(&self) -> Result<u64, std::io::Error> {
@@ -309,19 +352,82 @@ impl DatabaseHandle for Connection {
     fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         tracing::trace!(lock = ?lock, "lock");
         assert!(lock != LockKind::None);
+        assert!(self.did_init, "lock before init");
+        if self.lock == lock {
+            return Ok(true);
+        }
 
-        self.lock = lock;
         if self.txn.is_none() {
-            let txn = if let Some(version) = &self.fixed_version {
-                Ok(self.client.create_transaction_at_version(version))
+            let txn_info = if let Some(version) = &self.fixed_version {
+                Ok((self.client.create_transaction_at_version(version), None))
             } else {
                 let client = self.client.clone();
                 self.io
-                    .run(async move { client.create_transaction().await })
+                    .run(async move { client.create_transaction_with_metadata().await })
+                    .map(|(txn, md)| (txn, Some(md)))
             };
-            let txn = txn.expect("unrecoverable transaction initialization failure");
+            let (txn, md) = txn_info.expect("unrecoverable transaction initialization failure");
+            let md: Option<NsMetadata> = md.map(|x| serde_json::from_str(&x).unwrap_or_default());
             self.txn = Some(txn);
+            self.txn_metadata = md;
         }
+
+        if lock == LockKind::Exclusive {
+            let md = match self.txn_metadata.as_mut() {
+                Some(x) => x,
+                None => {
+                    tracing::error!(
+                        "cannot promote the lock on a fixed-version transaction to exclusive"
+                    );
+                    return Ok(false);
+                }
+            };
+
+            if !self.mvcc_aware {
+                // Acquire a one-minute lock.
+                // TODO: Lock renew
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if let Some(lock) = md.lock {
+                    if now < lock {
+                        tracing::error!("failed to acquire lock: hold by another connection");
+                        return Ok(false);
+                    }
+                }
+
+                let mut new_md = md.clone();
+                new_md.lock = Some(now + 60);
+                let metadata =
+                    serde_json::to_string(&new_md).expect("failed to serialize metadata");
+                let txn = self.txn.as_ref().unwrap();
+                let lock_res = self.io.run(async {
+                    let lock_txn = self.client.create_transaction_at_version(txn.version());
+                    lock_txn
+                        .commit(Some(metadata.as_str()))
+                        .await
+                        .expect("lock txn commit failed")
+                });
+                match lock_res {
+                    Some(info) => {
+                        self.txn = Some(self.client.create_transaction_at_version(&info.version));
+                        self.lock = lock;
+                        *md = new_md;
+                        return Ok(true);
+                    }
+                    None => {
+                        tracing::error!("failed to acquire lock: conflict");
+                        return Ok(false);
+                    }
+                }
+            } else {
+                self.lock = lock;
+            }
+        } else {
+            self.lock = lock;
+        }
+
         Ok(true)
     }
 
@@ -336,11 +442,23 @@ impl DatabaseHandle for Connection {
 
         if prev_lock == LockKind::Exclusive {
             // Write
+            let md = if !self.mvcc_aware {
+                if let Some(md) = self.txn_metadata.as_mut() {
+                    md.lock = None;
+                    Some(serde_json::to_string(md).expect("failed to serialize metadata"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let txn = self
                 .txn
                 .take()
                 .expect("did not find transaction for commit");
-            let result = self.io.run(async { txn.commit().await });
+            let result = self
+                .io
+                .run(async { txn.commit(md.as_ref().map(|x| x.as_str())).await });
 
             // At this point we don't have a reliable way to propagate the error. So, we have
             // to abort the process.
@@ -354,6 +472,7 @@ impl DatabaseHandle for Connection {
             // All locks dropped
             self.txn.take().expect("unlocked without locking");
             self.txn_buffered_page = HashMap::new();
+            self.txn_metadata = None;
             self.history.prev_index = 0;
         }
 
@@ -371,4 +490,45 @@ impl DatabaseHandle for Connection {
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
     }
+}
+
+impl Connection {
+    pub(crate) unsafe fn init(&mut self, db: SqlitePtr) {
+        if self.did_init {
+            panic!("attempt to bind connection to db twice");
+        }
+        self.did_init = true;
+
+        let me_ptr = self as *mut Connection;
+        let prev_commit_hook_data = sqlite3_commit_hook(db, commit_hook, me_ptr as *mut c_void);
+        let prev_rollback_hook_data =
+            sqlite3_rollback_hook(db, rollback_hook, me_ptr as *mut c_void);
+
+        if !prev_commit_hook_data.is_null() {
+            panic!("attempt to set commit hook twice");
+        }
+
+        if !prev_rollback_hook_data.is_null() {
+            panic!("attempt to set rollback hook twice");
+        }
+    }
+
+    fn on_commit(&mut self) -> i32 {
+        tracing::trace!(lock = ?self.lock, "on_commit");
+        0
+    }
+
+    fn on_rollback(&mut self) {
+        tracing::trace!(lock = ?self.lock, "on_rollback");
+    }
+}
+
+unsafe extern "C" fn commit_hook(data: *mut c_void) -> i32 {
+    let conn = &mut *(data as *mut Connection);
+    conn.on_commit()
+}
+
+unsafe extern "C" fn rollback_hook(data: *mut c_void) {
+    let conn = &mut *(data as *mut Connection);
+    conn.on_rollback()
 }
