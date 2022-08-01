@@ -29,6 +29,8 @@ fn main() -> Result<()> {
         tracing::error!("fdb_buggify is enabled");
         network_builder = network_builder
             .set_option(NetworkOption::ClientBuggifyEnable)
+            .unwrap()
+            .set_option(NetworkOption::ClientBuggifySectionActivatedProbability(100))
             .unwrap();
     }
     let network = unsafe { network_builder.boot() }.expect("fdb network initialization failed");

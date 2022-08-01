@@ -2,6 +2,7 @@ mod inmem;
 mod tester;
 
 use anyhow::Result;
+use backtrace::Backtrace;
 use mvclient::{MultiVersionClient, MultiVersionClientConfig};
 use structopt::StructOpt;
 use tester::Tester;
@@ -50,6 +51,12 @@ async fn main() -> Result<()> {
             .pretty()
             .init();
     }
+
+    std::panic::set_hook(Box::new(|info| {
+        let bt = Backtrace::new();
+        tracing::error!(backtrace = ?bt, "{}", info);
+        std::process::abort();
+    }));
 
     let client = MultiVersionClient::new(MultiVersionClientConfig {
         data_plane: opt.data_plane.parse()?,
