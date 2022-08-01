@@ -51,16 +51,6 @@ Use the format `namespace@version` for the database name passed to SQLite:
 
 ![time travel](https://img.planet.ink/zhy/2022-07-27-154fef13e84d-207ea4945637b054b98be711396adc94.png)
 
-**Optimistic MVCC transactions**
-
-SQLite is a single-writer database - this isn't going to change easily, due to its fundamental design choices.
-
-But a group of N sqlite databases is an N-writer database. And mvsqlite provides the necessary mechanisms to do serializable cross-database transactions without additional overhead.
-
-The logic for cross-database transactions isn't there yet, so here's a demo that shows how MVCC works (and how it can break things) in mvsqlite when there are more than one concurrent writers to the same database.
-
-![mvcc](https://img.planet.ink/zhy/2022-07-27-154f742d16d0-5bb18e5c83df84a29f898f02067fbdb2.png)
-
 ## Try it
 
 Install FoundationDB:
