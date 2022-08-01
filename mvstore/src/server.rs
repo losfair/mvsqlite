@@ -21,6 +21,7 @@ use tokio_util::{
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
 const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
 const MAX_PAGE_SIZE: usize = 8192;
+const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 
 pub struct Server {
     db: Database,
@@ -79,6 +80,9 @@ pub struct CommitInit<'a> {
     pub version: &'a str,
     pub metadata: Option<&'a str>,
     pub num_pages: u32,
+
+    #[serde(with = "serde_bytes")]
+    pub idempotency_key: &'a [u8],
 }
 
 #[derive(Deserialize)]
@@ -703,6 +707,8 @@ impl Server {
                     .with_context(|| "error deserializing commit init")?;
 
                 let client_assumed_version = decode_version(&commit_init.version)?;
+                let idempotency_key = <[u8; 16]>::try_from(commit_init.idempotency_key)
+                    .with_context(|| "invalid idempotency key")?;
 
                 // Ensure that we finish the commit as quickly as possible - there's the five-second limit here.
                 let mut txn = self.db.create_trx()?;
@@ -711,11 +717,22 @@ impl Server {
                     let last_write_version_key = self.construct_last_write_version_key(ns_id);
                     let last_write_version = txn.get(&last_write_version_key, false).await?;
                     match &last_write_version {
-                        Some(x) if x.len() != 10 => {
+                        Some(x) if x.len() != 16 + 10 => {
                             anyhow::bail!("invalid last write version");
                         }
                         Some(x) => {
-                            let actual_last_write_version = <[u8; 10]>::try_from(&x[..]).unwrap();
+                            let actual_idempotency_key = <[u8; 16]>::try_from(&x[0..16]).unwrap();
+                            let actual_last_write_version =
+                                <[u8; 10]>::try_from(&x[16..26]).unwrap();
+
+                            if actual_idempotency_key == idempotency_key {
+                                return Ok(Response::builder()
+                                    .header(
+                                        COMMITTED_VERSION_HDR_NAME,
+                                        hex::encode(&actual_last_write_version),
+                                    )
+                                    .body(Body::empty())?);
+                            }
 
                             if client_assumed_version < actual_last_write_version {
                                 return Ok(Response::builder().status(409).body(Body::empty())?);
@@ -752,7 +769,10 @@ impl Server {
                             MutationType::SetVersionstampedKey,
                         );
                     }
-                    let last_write_version_atomic_op_value = [0u8; 14];
+                    let mut last_write_version_atomic_op_value = [0u8; 16 + 10 + 4];
+                    last_write_version_atomic_op_value[0..16].copy_from_slice(&idempotency_key);
+                    last_write_version_atomic_op_value[26..30]
+                        .copy_from_slice(&16u32.to_le_bytes()[..]);
                     txn.atomic_op(
                         &last_write_version_key,
                         &last_write_version_atomic_op_value,
@@ -764,7 +784,7 @@ impl Server {
                             let versionstamp = versionstamp_fut.await?;
                             let versionstamp = hex::encode(&versionstamp);
                             res = Response::builder()
-                                .header("x-committed-version", versionstamp)
+                                .header(COMMITTED_VERSION_HDR_NAME, versionstamp)
                                 .body(Body::empty())?;
                             break;
                         }

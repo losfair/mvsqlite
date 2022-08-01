@@ -1110,6 +1110,7 @@ name = "mvstore-stress"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "backtrace",
  "blake3",
  "bytes",
  "futures",

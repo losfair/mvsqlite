@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use backoff::RandomizedExponentialBackoff;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
+use rand::RngCore;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     RequestBuilder, StatusCode, Url,
@@ -76,6 +77,9 @@ pub struct CommitInit<'a> {
     pub version: &'a str,
     pub metadata: Option<&'a str>,
     pub num_pages: u32,
+
+    #[serde(with = "serde_bytes")]
+    pub idempotency_key: &'a [u8],
 }
 
 #[derive(Serialize)]
@@ -367,6 +371,9 @@ impl Transaction {
             }));
         }
 
+        let mut idempotency_key: [u8; 16] = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut idempotency_key);
+
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
@@ -379,6 +386,7 @@ impl Transaction {
             version: self.version.as_str(),
             metadata,
             num_pages: self.page_buffer.len() as u32,
+            idempotency_key: &idempotency_key[..],
         };
 
         {
