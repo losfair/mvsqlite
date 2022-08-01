@@ -40,6 +40,7 @@ impl Tester {
         let mut txn_id = mem.start_transaction(txn.version());
         drop(mem);
 
+        let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.num_pages as usize];
         for it in 0..iterations {
             let mode = rand::thread_rng().gen_range(0..10);
             tracing::info!(task = task_id, iteration = it, mode = mode, "iteration");
@@ -52,6 +53,7 @@ impl Tester {
                     let pages = txn.read_many(&reads).await?;
                     let mem = self.mem.read().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
+                        tracing::info!(task = task_id, iteration = it, index = index, "read");
                         mem.verify_page(txn_id, index, page);
                     }
                 }
@@ -61,8 +63,28 @@ impl Tester {
                         .map(|_| {
                             let mut rng = rand::thread_rng();
                             let index = rng.gen_range::<u32, _>(0..self.num_pages);
-                            let mut data = vec![0u8; 2048];
-                            rng.fill_bytes(&mut data);
+
+                            // Test delta encoding
+                            let data = {
+                                let last_write = &last_writes[index as usize];
+                                if last_write.is_some() && rng.gen_bool(0.2) {
+                                    let mut data = last_write.as_ref().unwrap().clone();
+                                    let start = rng.gen_range(0..data.len());
+                                    let end = rng.gen_range(start..data.len());
+                                    rng.fill_bytes(&mut data[start..end]);
+                                    data
+                                } else {
+                                    let mut data = vec![0u8; 2048];
+                                    rng.fill_bytes(&mut data);
+                                    data
+                                }
+                            };
+                            if rng.gen_bool(0.5) {
+                                last_writes[index as usize] = Some(data.clone());
+                            }
+
+                            tracing::info!(task = task_id, iteration = it, index = index, "write");
+
                             (index, data)
                         })
                         .collect::<Vec<_>>();
@@ -78,7 +100,7 @@ impl Tester {
                 }
                 8 => {
                     let mut mem = self.mem.write().await;
-                    match txn.commit().await? {
+                    match txn.commit(None).await? {
                         Some(info) => {
                             mem.commit_transaction(txn_id, &info.version);
                         }
