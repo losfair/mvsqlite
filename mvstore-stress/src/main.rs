@@ -57,5 +57,6 @@ async fn main() -> Result<()> {
     })?;
     let t = Tester::new(client.clone(), opt.pages);
     t.run(opt.concurrency as _, opt.iterations as _).await;
+    println!("Test succeeded.");
     Ok(())
 }

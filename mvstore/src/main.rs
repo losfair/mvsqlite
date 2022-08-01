@@ -3,20 +3,42 @@ mod server;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use foundationdb::{api::FdbApiBuilder, options::NetworkOption};
 use hyper::service::{make_service_fn, service_fn};
 use server::{Server, ServerConfig};
 use structopt::StructOpt;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
 
 fn main() -> Result<()> {
-    let network = unsafe { foundationdb::boot() };
+    let opt = Opt::from_args();
+    if opt.json {
+        SubscriberBuilder::default()
+            .with_env_filter(EnvFilter::from_default_env())
+            .json()
+            .init();
+    } else {
+        SubscriberBuilder::default()
+            .with_env_filter(EnvFilter::from_default_env())
+            .pretty()
+            .init();
+    }
+    let mut network_builder = FdbApiBuilder::default()
+        .build()
+        .expect("fdb api initialization failed");
+    if opt.fdb_buggify {
+        tracing::error!("fdb_buggify is enabled");
+        network_builder = network_builder
+            .set_option(NetworkOption::ClientBuggifyEnable)
+            .unwrap();
+    }
+    let network = unsafe { network_builder.boot() }.expect("fdb network initialization failed");
 
     // Have fun with the FDB API
     let res = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { async_main().await });
+        .block_on(async { async_main(opt).await });
 
     drop(network); // required for safety
     res
@@ -37,6 +59,10 @@ struct Opt {
     #[structopt(long)]
     json: bool,
 
+    /// Enable FDB buggify. DO NOT USE IN PRODUCTION!
+    #[structopt(long)]
+    fdb_buggify: bool,
+
     /// Path to FoundationDB cluster file.
     #[structopt(
         long,
@@ -54,20 +80,7 @@ struct Opt {
     metadata_prefix: String,
 }
 
-async fn async_main() -> Result<()> {
-    let opt = Opt::from_args();
-
-    if opt.json {
-        SubscriberBuilder::default()
-            .with_env_filter(EnvFilter::from_default_env())
-            .json()
-            .init();
-    } else {
-        SubscriberBuilder::default()
-            .with_env_filter(EnvFilter::from_default_env())
-            .pretty()
-            .init();
-    }
+async fn async_main(opt: Opt) -> Result<()> {
     let server = Server::open(ServerConfig {
         cluster: opt.cluster.clone(),
         raw_data_prefix: opt.raw_data_prefix.clone(),
