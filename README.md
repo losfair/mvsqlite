@@ -121,9 +121,9 @@ You should see the sqlite shell now :) Try creating a table and play with it.
 
 ### The "database is locked" error
 
-To keep compatibility with applications targeting upstream SQLite, mvsqlite enables pessimistic locking by default - when a transaction is promoted to EXCLUSIVE, it acquires a one-minute lock lease from mvstore to prevent another EXCLUSIVE transaction from starting. At this point, we have the chance to fail gracefully and return a "database is locked" error if multiple clients want to acquire lock on the same DB. This is a best-effort mechanism to prevent conflict on commit (which causes the process to abort).
+To keep compatibility with applications targeting upstream SQLite, mvsqlite enables pessimistic locking by default - when a transaction takes a RESERVED or higher lock on a database, it acquires a one-minute lock lease from mvstore to prevent another transaction from writing to the database. At this point, we have the chance to fail gracefully and return a "database is locked" error if multiple clients want to acquire lock on the same DB. This is a best-effort mechanism to prevent conflict on commit (which causes the process to abort).
 
-But some apps may not like this behavior. After a "DB locked" error, they will retry the `COMMIT` statement only, instead of rolling back the whole transaction. This works with upstream SQLite due to its file locking mechanisms, but on mvsqlite retrying `COMMIT` on a DB-locked error is useless, because there is no way to correctly write to a database that has diverged from its snapshot in the current transaction.
+Apps should always set `busy_timeout = 0` when running with mvsqlite, because on a "database is locked" error it is not possible to retry later and succeed with the same transaction.
 
 ## Limits
 

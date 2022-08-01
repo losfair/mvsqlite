@@ -366,13 +366,24 @@ impl DatabaseHandle for Box<Connection> {
                     .run(async move { client.create_transaction_with_metadata().await })
                     .map(|(txn, md)| (txn, Some(md)))
             };
-            let (txn, md) = txn_info.expect("unrecoverable transaction initialization failure");
+            let (txn, md) = match txn_info {
+                Ok(x) => x,
+                Err(e) => {
+                    panic!(
+                        "unrecoverable transaction initialization failure on nskey {}: {}",
+                        self.client.config().ns_key,
+                        e
+                    );
+                }
+            };
             let md: Option<NsMetadata> = md.map(|x| serde_json::from_str(&x).unwrap_or_default());
             self.txn = Some(txn);
             self.txn_metadata = md;
         }
 
-        if lock == LockKind::Exclusive {
+        let reserved_level = lock_level(LockKind::Reserved);
+
+        if lock_level(self.lock) < reserved_level && lock_level(lock) >= reserved_level {
             let md = match self.txn_metadata.as_mut() {
                 Some(x) => x,
                 None => {
@@ -440,7 +451,9 @@ impl DatabaseHandle for Box<Connection> {
         let prev_lock = self.lock;
         self.lock = lock;
 
-        if prev_lock == LockKind::Exclusive {
+        let reserved_level = lock_level(LockKind::Reserved);
+
+        if lock_level(prev_lock) >= reserved_level && lock_level(lock) < reserved_level {
             // Write
             let md = if !self.mvcc_aware {
                 if let Some(md) = self.txn_metadata.as_mut() {
@@ -531,4 +544,14 @@ unsafe extern "C" fn commit_hook(data: *mut c_void) -> i32 {
 unsafe extern "C" fn rollback_hook(data: *mut c_void) {
     let conn = &mut *(data as *mut Connection);
     conn.on_rollback()
+}
+
+fn lock_level(kind: LockKind) -> u32 {
+    match kind {
+        LockKind::None => 0,
+        LockKind::Shared => 1,
+        LockKind::Reserved => 2,
+        LockKind::Pending => 3,
+        LockKind::Exclusive => 4,
+    }
 }

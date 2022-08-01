@@ -102,6 +102,10 @@ impl MultiVersionClient {
         Ok(Arc::new(Self { client, config }))
     }
 
+    pub fn config(&self) -> &MultiVersionClientConfig {
+        &self.config
+    }
+
     pub async fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
         self.create_transaction_with_metadata().await.map(|x| x.0)
     }
