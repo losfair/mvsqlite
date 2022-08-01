@@ -10,8 +10,9 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
   - [Comparison with dqlite and rqlite](#comparison-with-dqlite-and-rqlite)
   - [Demo](#demo)
   - [Try it](#try-it)
-  - [API behavior differences from SQLite](#api-behavior-differences-from-sqlite)
+  - [Caveats](#caveats)
     - [The "database is locked" error](#the-database-is-locked-error)
+    - [No ABA-style idempotency](#no-aba-style-idempotency)
   - [Limits](#limits)
     - [Read latency](#read-latency)
     - [Not yet implemented: garbage collection](#not-yet-implemented-garbage-collection)
@@ -107,13 +108,25 @@ LD_PRELOAD=../mvsqlite-preload/libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite
 
 You should see the sqlite shell now :) Try creating a table and play with it.
 
-## API behavior differences from SQLite
+## Caveats
+
+This section documents various behaviors of mvsqlite that are a little different from SQLite. These differences **do not cause correctness issues**, but may confuse some applications a bit.
 
 ### The "database is locked" error
 
 To keep compatibility with applications targeting upstream SQLite, mvsqlite enables pessimistic locking by default - when a transaction takes a RESERVED or higher lock on a database, it acquires a one-minute lock lease from mvstore to prevent another transaction from writing to the database. At this point, we have the chance to fail gracefully and return a "database is locked" error if multiple clients want to acquire lock on the same DB. This is a best-effort mechanism to prevent conflict on commit (which causes the process to abort).
 
-Apps should always set `busy_timeout = 0` when running with mvsqlite, because on a "database is locked" error it is not possible to retry later and succeed with the same transaction.
+Apps should always set `busy_timeout = 0` (which is the default) when running with mvsqlite, because on a "database is locked" error it is not possible to retry later and succeed with the same transaction.
+
+### No ABA-style idempotency
+
+In case of network errors and crashes, mvsqlite implements AA-style idempotency. *Continuously* retrying the same commit will keep returning the same successful result. But in case the global commit order is A-B-A, the second attempt of the A commit will conflict and fail.
+
+This means that, in a very rare circumstance as described below:
+
+> mvstore crashed during commit, just between FDB commit success and returning the result to the client. Then, another client acquired the database lock, wrote to the database, and committed successfully. Now, the first client retries the commit.
+
+The first client will get a commit conflict and abort. This is the expected behavior, since unbounded idempotency requires too much overhead.
 
 ## Limits
 
