@@ -464,14 +464,24 @@ impl Server {
                                 break;
                             }
                         };
-                        let txn = match self.create_versioned_read_txn(read_req.version).await {
-                            Ok(x) => x,
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
-                                break;
-                            }
-                        };
+                        let txn: Transaction;
                         let page = if let Some(hash) = read_req.hash {
+                            // This path enables read-your-writes in the same transaction. We cannot use the read-version cache,
+                            // because the snapshotted version may not contain newly written pages.
+                            //
+                            // This is a rare case anyway, because the client has its own read cache.
+                            tracing::debug!(
+                                ns = ns_id_hex,
+                                hash = hex::encode(hash),
+                                "entering read-your-writes logic"
+                            );
+                            txn = match self.db.create_trx() {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to create transaction");
+                                    break;
+                                }
+                            };
                             let hash = match <[u8; 32]>::try_from(hash) {
                                 Ok(x) => x,
                                 Err(e) => {
@@ -492,6 +502,13 @@ impl Server {
                                 }
                             }
                         } else {
+                            txn = match self.create_versioned_read_txn(read_req.version).await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
+                                    break;
+                                }
+                            };
                             match me
                                 .read_page(&txn, ns_id, read_req.page_index, read_req.version)
                                 .await
