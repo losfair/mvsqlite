@@ -28,6 +28,7 @@ pub struct Server {
     metadata_prefix: String,
 
     nskey_cache: Cache<String, [u8; 10]>,
+    read_version_cache: Cache<[u8; 10], i64>,
 }
 
 pub struct ServerConfig {
@@ -138,6 +139,13 @@ impl Server {
                 .time_to_live(Duration::from_secs(120))
                 .time_to_idle(Duration::from_secs(5))
                 .max_capacity(10000)
+                .build(),
+            // FDB read versions are valid for 5 seconds.
+            // We conservatively cache them for only 2 seconds here. If for some reason
+            // these versions still lived too long, FDB will error and the client will retry.
+            read_version_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(2))
+                .max_capacity(1000)
                 .build(),
         }))
     }
@@ -352,17 +360,35 @@ impl Server {
         Ok(buf)
     }
 
+    async fn create_versioned_read_txn(&self, version: &str) -> Result<Transaction> {
+        let version = decode_version(version)?;
+        let txn = self.db.create_trx()?;
+        let mut grv_called = false;
+        let fdb_rv = self
+            .read_version_cache
+            .try_get_with(version, async {
+                grv_called = true;
+                txn.get_read_version().await
+            })
+            .await
+            .with_context(|| "cannot get read version")?;
+        if !grv_called {
+            txn.set_read_version(fdb_rv);
+        }
+        Ok(txn)
+    }
+
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
         ns_id: [u8; 10],
         mut req: Request<Body>,
     ) -> Result<Response<Body>> {
-        let mut txn = self.db.create_trx()?;
         let ns_id_hex = hex::encode(&ns_id);
         let uri = req.uri();
         let res: Response<Body>;
         match uri.path() {
             "/stat" => {
+                let txn = self.db.create_trx()?;
                 let buf = self.get_read_version_as_versionstamp(&txn).await?;
                 let nsmd = txn.get(&self.construct_nsmd_key(ns_id), true).await?;
                 let nsmd = nsmd
@@ -396,11 +422,12 @@ impl Server {
                     .with_context(|| "missing page_index")?
                     .parse::<u32>()
                     .with_context(|| "invalid page_index")?;
-                let block_version_hex = query
-                    .get("block_version")
-                    .with_context(|| "missing block_version")?;
+                let page_version_hex = query
+                    .get("page_version")
+                    .with_context(|| "missing page_version")?;
+                let txn = self.create_versioned_read_txn(page_version_hex).await?;
                 let page = self
-                    .read_page(&txn, ns_id, page_index, &block_version_hex)
+                    .read_page(&txn, ns_id, page_index, &page_version_hex)
                     .await?;
                 match page {
                     Some(page) => {
@@ -434,6 +461,13 @@ impl Server {
                             Ok(x) => x,
                             Err(e) => {
                                 tracing::warn!(ns = ns_id_hex, error = %e, "invalid message");
+                                break;
+                            }
+                        };
+                        let txn = match self.create_versioned_read_txn(read_req.version).await {
+                            Ok(x) => x,
+                            Err(e) => {
+                                tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
                                 break;
                             }
                         };
@@ -508,6 +542,7 @@ impl Server {
                 let (mut res_sender, res_body) = Body::channel();
                 res = Response::builder().body(res_body)?;
                 let me = self.clone();
+                let txn = self.db.create_trx()?;
                 tokio::spawn(async move {
                     loop {
                         let message = match body.next().await {
@@ -650,13 +685,10 @@ impl Server {
                 let commit_init: CommitInit = rmp_serde::from_slice(&commit_init)
                     .with_context(|| "error deserializing commit init")?;
 
-                let mut client_assumed_version = [0u8; 10];
-                hex::decode_to_slice(&commit_init.version, &mut client_assumed_version)
-                    .with_context(|| "cannot decode commit init version")?;
+                let client_assumed_version = decode_version(&commit_init.version)?;
 
                 // Ensure that we finish the commit as quickly as possible - there's the five-second limit here.
-                txn.reset();
-
+                let mut txn = self.db.create_trx()?;
                 loop {
                     // Check version
                     let last_write_version_key = self.construct_last_write_version_key(ns_id);
@@ -761,12 +793,10 @@ impl Server {
         txn: &Transaction,
         ns_id: [u8; 10],
         page_index: u32,
-        block_version_hex: &str,
+        page_version_hex: &str,
     ) -> Result<Option<(String, [u8; 32])>> {
-        let mut block_version = [0u8; 10];
-        hex::decode_to_slice(block_version_hex, &mut block_version)
-            .with_context(|| "invalid block_version")?;
-        let scan_end = self.construct_page_key(ns_id, page_index, block_version);
+        let page_version = decode_version(&page_version_hex)?;
+        let scan_end = self.construct_page_key(ns_id, page_index, page_version);
         let scan_start = self.construct_page_key(ns_id, page_index, [0u8; 10]);
         let page_vec = txn
             .get_range(
@@ -1029,4 +1059,10 @@ fn prepend_length(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(&data);
     out
+}
+
+fn decode_version(version: &str) -> Result<[u8; 10]> {
+    let mut bytes = [0u8; 10];
+    hex::decode_to_slice(version, &mut bytes).with_context(|| "cannot decode version")?;
+    Ok(bytes)
 }
