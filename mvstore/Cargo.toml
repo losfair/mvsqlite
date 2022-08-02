@@ -2,8 +2,20 @@
 name = "mvstore"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
+description = "Multi-version page store for mvsqlite"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.deb]
+assets = [
+  ["../target/release/mvstore", "usr/bin/", "755"],
+]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "debian/systemd/"
+enable = true
 
 [dependencies]
 anyhow = "1"

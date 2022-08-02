@@ -45,6 +45,30 @@ jobs:
         with:
           name: build
           path: ./build
+  build-deb:
+    name: Build DEB
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          cargo install cargo-deb
+      - name: Build mvstore
+        run: cd mvstore && cargo deb && cd .. && mkdir deb && cp ./target/debian/*.deb ./deb/
+      - name: Push
+        uses: actions/upload-artifact@v3
+        with:
+          name: deb
+          path: ./deb
   stress:
     name: mvstore stress test
     runs-on: ubuntu-20.04
@@ -113,6 +137,7 @@ jobs:
     - build
     - stress
     - stress-buggify
+    - build-deb
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-20.04
     steps:
@@ -120,8 +145,13 @@ jobs:
       with:
         name: build
         path: ./build
+    - uses: actions/download-artifact@v2
+      with:
+        name: deb
+        path: ./deb
     - uses: softprops/action-gh-release@v1
       with:
         files: |
           build/mvstore
           build/libmvsqlite_preload.so
+          deb/*.deb

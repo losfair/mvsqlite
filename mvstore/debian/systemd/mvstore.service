@@ -1,0 +1,13 @@
+[Unit]
+Description=Multi-version page store for mvsqlite
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/mvstore \
+  --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 \
+  --metadata-prefix mvstore --raw-data-prefix m
+DynamicUser=yes
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
