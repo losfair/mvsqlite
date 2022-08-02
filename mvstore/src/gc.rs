@@ -39,8 +39,8 @@ impl Server {
         let mut total_count = 0u64;
 
         loop {
-            let mut txn = lock.create_txn_and_check_sync(&self.db).await?;
             let scan_result = loop {
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
                 let range = match txn
                     .get_range(
                         &RangeOption {
@@ -56,13 +56,12 @@ impl Server {
                 {
                     Ok(x) => x,
                     Err(e) => {
-                        txn = txn.on_error(e).await?;
+                        txn.on_error(e).await?;
                         continue;
                     }
                 };
                 break range;
             };
-            drop(txn);
 
             // In the one-page case, we are sure we don't want to gc that
             if scan_result.len() <= 1 {
@@ -96,15 +95,15 @@ impl Server {
 
             if !deletion_set.is_empty() {
                 if !dry_run {
-                    let mut txn = lock.create_txn_and_check_sync(&self.db).await?;
                     loop {
+                        let txn = lock.create_txn_and_check_sync(&self.db).await?;
                         for item in &deletion_set {
                             txn.clear(item);
                         }
                         match txn.commit().await {
                             Ok(_) => break,
                             Err(e) => {
-                                txn = e.on_error().await?;
+                                e.on_error().await?;
                             }
                         }
                     }

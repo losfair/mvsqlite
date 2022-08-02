@@ -92,6 +92,8 @@ async fn async_main(opt: Opt) -> Result<()> {
     })
     .with_context(|| "failed to initialize server")?;
 
+    server.clone().spawn_background_tasks();
+
     let data_plane_server = {
         let server = server.clone();
         hyper::Server::bind(&opt.data_plane).serve(make_service_fn(move |_conn| {

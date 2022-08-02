@@ -10,12 +10,19 @@ use futures::StreamExt;
 use hyper::{body::HttpBody, Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::{io::AsyncRead, sync::oneshot};
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
     io::StreamReader,
 };
+
+use crate::lock::DistributedLock;
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
 const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
@@ -362,6 +369,71 @@ impl Server {
             Err(e) => {
                 tracing::warn!(error = %e, "stage 1 failure");
                 Ok(Response::builder().status(500).body(Body::empty()).unwrap())
+            }
+        }
+    }
+
+    pub fn spawn_background_tasks(self: Arc<Self>) {
+        tokio::spawn(self.clone().globaltask_timekeeper());
+    }
+
+    async fn globaltask_timekeeper(self: Arc<Self>) {
+        let mut lock = DistributedLock::new(
+            self.construct_globaltask_key("timekeeper"),
+            "timekeeper".into(),
+        );
+        'outer: loop {
+            loop {
+                let me = self.clone();
+                match lock
+                    .lock(
+                        move || me.db.create_trx().with_context(|| "failed to create txn"),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "timekeeper lock error");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            tracing::info!("timekeeper started");
+
+            loop {
+                loop {
+                    let txn = match lock.create_txn_and_check_sync(&self.db).await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            tracing::error!(error = %e, "timekeeper create_txn_and_check_sync error");
+                            lock.unlock().await;
+                            continue 'outer;
+                        }
+                    };
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let key = self.construct_time2version_key(now);
+                    let value = [0u8; 14];
+                    txn.atomic_op(&key, &value, MutationType::SetVersionstampedValue);
+                    match txn.commit().await {
+                        Ok(_) => break,
+                        Err(e) => match e.on_error().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(error = %e, "timekeeper commit error");
+                                lock.unlock().await;
+                                continue 'outer;
+                            }
+                        },
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
@@ -984,6 +1056,16 @@ impl Server {
         key.push(0x32);
         key.extend_from_slice(&ns_id);
         key.extend_from_slice(&pack(&(task,)));
+        key
+    }
+
+    pub fn construct_globaltask_key(&self, task: &str) -> Vec<u8> {
+        let key = pack(&(self.metadata_prefix.as_str(), "globaltask", task));
+        key
+    }
+
+    pub fn construct_time2version_key(&self, time_secs: u64) -> Vec<u8> {
+        let key = pack(&(self.metadata_prefix.as_str(), "time2version", time_secs));
         key
     }
 
