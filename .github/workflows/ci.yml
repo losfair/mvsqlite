@@ -155,3 +155,4 @@ jobs:
           build/mvstore
           build/libmvsqlite_preload.so
           deb/*.deb
+        prerelease: true
