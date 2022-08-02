@@ -11,7 +11,7 @@ use hyper::{body::HttpBody, Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, sync::oneshot};
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
     io::StreamReader,
@@ -23,7 +23,7 @@ const MAX_PAGE_SIZE: usize = 8192;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 
 pub struct Server {
-    db: Database,
+    pub db: Database,
     raw_data_prefix: Vec<u8>,
     metadata_prefix: String,
 
@@ -100,6 +100,14 @@ pub struct AdminCreateNamespaceRequest {
 #[derive(Deserialize)]
 pub struct AdminDeleteNamespaceRequest {
     pub key: String,
+}
+
+#[derive(Deserialize)]
+pub struct AdminTruncateNamespaceRequest {
+    pub key: String,
+    pub before_version: String,
+    #[serde(default)]
+    pub apply: bool,
 }
 
 pub struct Page {
@@ -263,6 +271,81 @@ impl Server {
                     }
                 }
             }
+
+            "/api/truncate_namespace" => {
+                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
+                let nskey_key = self.construct_nskey_key(&body.key);
+
+                let txn = self.db.create_trx()?;
+                let ns_id = match txn.get(&nskey_key, false).await? {
+                    Some(v) => v,
+                    None => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("this key does not exist"))?);
+                    }
+                };
+                drop(txn);
+
+                let ns_id =
+                    <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+                let before_version = decode_version(&body.before_version)?;
+                let (mut res_sender, res_body) = Body::channel();
+                let (progress_ch_tx, mut progress_ch_rx) =
+                    tokio::sync::mpsc::channel::<Option<u64>>(1000);
+                let (stop_tx, stop_rx) = oneshot::channel::<()>();
+                let apply = body.apply;
+                tokio::spawn(async move {
+                    let work = async move {
+                        if let Err(e) = self
+                            .truncate_versions(!body.apply, ns_id, before_version, |progress| {
+                                let _ = progress_ch_tx.try_send(progress);
+                            })
+                            .await
+                        {
+                            tracing::error!(ns = hex::encode(&ns_id), before_version = hex::encode(&before_version), apply = apply, error = %e, "truncate_namespace failed");
+                        }
+                    };
+                    tokio::select! {
+                        _ = work => {
+
+                        }
+                        _ = stop_rx => {
+                            tracing::error!(ns = hex::encode(&ns_id), before_version = hex::encode(&before_version), apply = apply, "truncate_namespace interrupted");
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let _stop_tx = stop_tx;
+                    loop {
+                        let mut exit = false;
+                        let text = match progress_ch_rx.recv().await {
+                            Some(progress) => match progress {
+                                Some(x) => {
+                                    format!("{}\n", x)
+                                }
+                                None => {
+                                    exit = true;
+                                    "DONE\n".to_string()
+                                }
+                            },
+                            None => {
+                                exit = true;
+                                "ERROR\n".to_string()
+                            }
+                        };
+                        if res_sender.send_data(Bytes::from(text)).await.is_err() {
+                            break;
+                        }
+                        if exit {
+                            break;
+                        }
+                    }
+                });
+                res = Response::builder().status(200).body(res_body)?;
+            }
+
             _ => {
                 res = Response::builder().status(404).body(Body::empty())?;
             }
@@ -869,10 +952,10 @@ impl Server {
         txn: &Transaction,
         ns_id: [u8; 10],
         page_index: u32,
-        block_version_hex: &str,
+        page_version_hex: &str,
     ) -> Result<Option<Page>> {
         let (version, hash) = match self
-            .read_page_hash(txn, ns_id, page_index, block_version_hex)
+            .read_page_hash(txn, ns_id, page_index, page_version_hex)
             .await?
         {
             Some(x) => x,
@@ -889,18 +972,26 @@ impl Server {
         }))
     }
 
-    fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nsmd"));
         key.push(0x32);
         key.extend_from_slice(&ns_id);
         key
     }
 
-    fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
+    pub fn construct_nstask_key(&self, ns_id: [u8; 10], task: &str) -> Vec<u8> {
+        let mut key = pack(&(self.metadata_prefix.as_str(), "nstask"));
+        key.push(0x32);
+        key.extend_from_slice(&ns_id);
+        key.extend_from_slice(&pack(&(task,)));
+        key
+    }
+
+    pub fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
         pack(&(self.metadata_prefix.as_str(), "nskey", ns_key))
     }
 
-    fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1);
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
@@ -908,31 +999,31 @@ impl Server {
         buf
     }
 
-    fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len());
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf
     }
 
-    fn construct_page_key(
+    pub fn construct_page_key(
         &self,
         ns_id: [u8; 10],
         page_index: u32,
-        block_version: [u8; 10],
+        page_version: [u8; 10],
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(
             self.raw_data_prefix.len()
                 + ns_id.len()
                 + 1
                 + std::mem::size_of::<u32>()
-                + block_version.len(),
+                + page_version.len(),
         );
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf.push(b'p');
         buf.extend_from_slice(&page_index.to_be_bytes());
-        buf.extend_from_slice(&block_version);
+        buf.extend_from_slice(&page_version);
         buf
     }
 

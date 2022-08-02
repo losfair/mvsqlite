@@ -1,4 +1,6 @@
 mod server;
+mod lock;
+mod gc;
 
 use std::net::SocketAddr;
 
