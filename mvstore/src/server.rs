@@ -645,8 +645,15 @@ impl Server {
                                     .await
                                 {
                                     Ok(x) => {
-                                        if let Some(x) = x {
+                                        if let Some((x, delta_base_hash)) = x {
+                                            let delta_referrer_key = self
+                                                .construct_delta_referrer_key(
+                                                    ns_id,
+                                                    *hash.as_bytes(),
+                                                    delta_base_hash,
+                                                );
                                             txn.set(&content_key, &x);
+                                            txn.set(&delta_referrer_key, b"");
                                             early_completion = true;
                                         }
                                     }
@@ -939,13 +946,30 @@ impl Server {
         buf
     }
 
+    fn construct_delta_referrer_key(
+        &self,
+        ns_id: [u8; 10],
+        from_hash: [u8; 32],
+        to_hash: [u8; 32],
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::with_capacity(
+            self.raw_data_prefix.len() + ns_id.len() + 1 + to_hash.len() + from_hash.len(),
+        );
+        buf.extend_from_slice(&self.raw_data_prefix);
+        buf.extend_from_slice(&ns_id);
+        buf.push(b'r');
+        buf.extend_from_slice(&to_hash);
+        buf.extend_from_slice(&from_hash);
+        buf
+    }
+
     async fn delta_encode(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
         base_page_index: u32,
         this_page: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
         let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
 
         let (_, delta_base_hash) = match self
@@ -1021,7 +1045,7 @@ impl Server {
             base = hex::encode(&delta_base_hash),
             "delta encoded"
         );
-        Ok(Some(output))
+        Ok(Some((output, delta_base_hash)))
     }
 
     fn decode_page_no_delta(&self, data: &[u8]) -> Result<DecodedPage> {
