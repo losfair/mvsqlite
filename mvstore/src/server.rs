@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::FdbSlice,
@@ -111,7 +110,6 @@ pub struct Page {
 #[derive(Default)]
 pub struct DecodedPage {
     pub data: Vec<u8>,
-    pub delta_depth: u32,
 }
 
 const PAGE_ENCODING_NONE: u8 = 0;
@@ -647,10 +645,16 @@ impl Server {
                                     .await
                                 {
                                     Ok(x) => {
-                                        if let Some(x) = x {
+                                        if let Some((x, delta_base_hash)) = x {
+                                            let delta_referrer_key = self
+                                                .construct_delta_referrer_key(
+                                                    ns_id,
+                                                    *hash.as_bytes(),
+                                                    delta_base_hash,
+                                                );
                                             txn.set(&content_key, &x);
+                                            txn.set(&delta_referrer_key, b"");
                                             early_completion = true;
-                                            tracing::debug!(ns = ns_id_hex, "delta encoded");
                                         }
                                     }
                                     Err(e) => {
@@ -942,33 +946,70 @@ impl Server {
         buf
     }
 
+    fn construct_delta_referrer_key(
+        &self,
+        ns_id: [u8; 10],
+        from_hash: [u8; 32],
+        to_hash: [u8; 32],
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::with_capacity(
+            self.raw_data_prefix.len() + ns_id.len() + 1 + to_hash.len() + from_hash.len(),
+        );
+        buf.extend_from_slice(&self.raw_data_prefix);
+        buf.extend_from_slice(&ns_id);
+        buf.push(b'r');
+        buf.extend_from_slice(&to_hash);
+        buf.extend_from_slice(&from_hash);
+        buf
+    }
+
     async fn delta_encode(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
         base_page_index: u32,
         this_page: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
         let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
-        let delta_base_hash = self
+
+        let (_, delta_base_hash) = match self
             .read_page_hash(&txn, ns_id, base_page_index, &version_hex)
-            .await?;
-
-        let (_, delta_base_hash) = match delta_base_hash {
+            .await?
+        {
             Some(x) => x,
             None => return Ok(None),
         };
-
-        let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-        let base_page = match txn.get(&base_page_key, true).await? {
-            Some(x) => x,
-            None => return Ok(None),
+        let (undecoded_base, delta_base_hash) = {
+            let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
+            let base = match txn.get(&base_page_key, true).await? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            if base.len() == 0 {
+                return Ok(None);
+            }
+            if base[0] == PAGE_ENCODING_DELTA {
+                // Flatten the link
+                if base.len() < 33 {
+                    return Ok(None);
+                }
+                let flattened_base_hash = <[u8; 32]>::try_from(&base[1..33]).unwrap();
+                let flattened_base_key = self.construct_content_key(ns_id, flattened_base_hash);
+                let flattened_base = match txn.get(&flattened_base_key, true).await? {
+                    Some(x) => x,
+                    None => return Ok(None),
+                };
+                tracing::debug!(
+                    from = hex::encode(&delta_base_hash),
+                    to = hex::encode(&flattened_base_hash),
+                    "flattened delta page"
+                );
+                (flattened_base, flattened_base_hash)
+            } else {
+                (base, delta_base_hash)
+            }
         };
-        let base_page = self.decode_page(txn, ns_id, &base_page).await?;
-        if base_page.delta_depth >= 4 {
-            return Ok(None);
-        }
-
+        let base_page = self.decode_page_no_delta(&undecoded_base)?;
         if base_page.data.len() != this_page.len() || this_page.is_empty() {
             return Ok(None);
         }
@@ -1002,13 +1043,37 @@ impl Server {
         tracing::debug!(
             ns = hex::encode(&ns_id),
             base = hex::encode(&delta_base_hash),
-            depth = base_page.delta_depth + 1,
             "delta encoded"
         );
-        Ok(Some(output))
+        Ok(Some((output, delta_base_hash)))
     }
 
-    #[async_recursion]
+    fn decode_page_no_delta(&self, data: &[u8]) -> Result<DecodedPage> {
+        if data.len() == 0 {
+            return Ok(DecodedPage::default());
+        }
+
+        let encode_type = data[0];
+        match encode_type {
+            PAGE_ENCODING_NONE => {
+                // not compressed
+                Ok(DecodedPage {
+                    data: data[1..].to_vec(),
+                })
+            }
+            PAGE_ENCODING_ZSTD => {
+                // zstd
+                let data = zstd::bulk::decompress(&data[1..], MAX_PAGE_SIZE)
+                    .with_context(|| "zstd decompress failed")?;
+                Ok(DecodedPage { data })
+            }
+            _ => Err(anyhow::anyhow!(
+                "decode_page_no_delta: unknown page encoding: {}",
+                encode_type
+            )),
+        }
+    }
+
     async fn decode_page(
         &self,
         txn: &Transaction,
@@ -1021,22 +1086,6 @@ impl Server {
 
         let encode_type = data[0];
         match encode_type {
-            PAGE_ENCODING_NONE => {
-                // not compressed
-                Ok(DecodedPage {
-                    data: data[1..].to_vec(),
-                    delta_depth: 0,
-                })
-            }
-            PAGE_ENCODING_ZSTD => {
-                // zstd
-                let data = zstd::bulk::decompress(&data[1..], MAX_PAGE_SIZE)
-                    .with_context(|| "zstd decompress failed")?;
-                Ok(DecodedPage {
-                    data,
-                    delta_depth: 0,
-                })
-            }
             PAGE_ENCODING_DELTA => {
                 if data.len() < 33 {
                     anyhow::bail!("invalid delta encoding");
@@ -1047,7 +1096,7 @@ impl Server {
                     Some(x) => x,
                     None => anyhow::bail!("base page not found"),
                 };
-                let base_page = self.decode_page(txn, ns_id, &base_page).await?;
+                let base_page = self.decode_page_no_delta(&base_page)?;
                 let mut delta_data = zstd::bulk::decompress(&data[33..], MAX_PAGE_SIZE)?;
                 if delta_data.len() != base_page.data.len() {
                     anyhow::bail!("delta and base have different sizes");
@@ -1057,14 +1106,9 @@ impl Server {
                     *b ^= base_page.data[i];
                 }
 
-                Ok(DecodedPage {
-                    data: delta_data,
-                    delta_depth: base_page.delta_depth + 1,
-                })
+                Ok(DecodedPage { data: delta_data })
             }
-            _ => {
-                anyhow::bail!("unsupported page encoding: {}", encode_type);
-            }
+            _ => self.decode_page_no_delta(data),
         }
     }
 }
