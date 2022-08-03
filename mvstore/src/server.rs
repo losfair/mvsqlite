@@ -889,10 +889,9 @@ impl Server {
                                                 .construct_delta_referrer_key(
                                                     ns_id,
                                                     *hash.as_bytes(),
-                                                    delta_base_hash,
                                                 );
                                             txn.set(&content_key, &x);
-                                            txn.set(&delta_referrer_key, b"");
+                                            txn.set(&delta_referrer_key, &delta_base_hash);
                                             let base_content_index_key = self
                                                 .construct_contentindex_key(ns_id, delta_base_hash);
                                             let now = SystemTime::now()
@@ -1198,15 +1197,13 @@ impl Server {
         &self,
         ns_id: [u8; 10],
         from_hash: [u8; 32],
-        to_hash: [u8; 32],
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(
-            self.raw_data_prefix.len() + ns_id.len() + 1 + to_hash.len() + from_hash.len(),
+            self.raw_data_prefix.len() + ns_id.len() + 1 + from_hash.len()
         );
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf.push(b'r');
-        buf.extend_from_slice(&to_hash);
         buf.extend_from_slice(&from_hash);
         buf
     }

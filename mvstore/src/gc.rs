@@ -202,13 +202,11 @@ impl Server {
         ns_id: [u8; 10],
         mut cb: impl FnMut([u8; 32]),
     ) -> Result<()> {
-        let scan_start = self.construct_delta_referrer_key(ns_id, [0u8; 32], [0u8; 32]);
-        let scan_end = self.construct_delta_referrer_key(ns_id, [0xffu8; 32], [0xffu8; 32]);
+        let scan_start = self.construct_delta_referrer_key(ns_id, [0u8; 32]);
+        let scan_end = self.construct_delta_referrer_key(ns_id, [0xffu8; 32]);
         self.scan_range_simple(lock, scan_start, scan_end, |kv| {
-            let v = kv.value();
-            if v.len() >= 64 {
-                let to_hash = &v[v.len() - 64..v.len() - 32];
-                cb(to_hash.try_into().unwrap());
+            if let Ok(x) = <[u8; 32]>::try_from(kv.value()) {
+                cb(x);
             }
         })
         .await
@@ -359,8 +357,10 @@ impl Server {
                     for hash in &delete_queue {
                         let ci_key = self.construct_contentindex_key(ns_id, *hash);
                         let content_key = self.construct_content_key(ns_id, *hash);
+                        let delta_referrer_key = self.construct_delta_referrer_key(ns_id, *hash);
                         txn.clear(&ci_key);
                         txn.clear(&content_key);
+                        txn.clear(&delta_referrer_key);
                     }
                     txn.clear(&commit_token_key);
 
