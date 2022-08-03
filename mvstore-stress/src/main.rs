@@ -14,6 +14,10 @@ struct Opt {
     /// Data plane URL.
     #[structopt(long)]
     data_plane: String,
+    
+    /// Admin API URL.
+    #[structopt(long)]
+    admin_api: String,
 
     /// Output log in JSON format.
     #[structopt(long)]
@@ -62,7 +66,7 @@ async fn main() -> Result<()> {
         data_plane: opt.data_plane.parse()?,
         ns_key: opt.ns_key.clone(),
     })?;
-    let t = Tester::new(client.clone(), opt.pages);
+    let t = Tester::new(client.clone(), opt.admin_api.clone(), opt.pages);
     t.run(opt.concurrency as _, opt.iterations as _).await;
     println!("Test succeeded.");
     Ok(())

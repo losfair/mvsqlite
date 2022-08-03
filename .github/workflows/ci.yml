@@ -97,7 +97,7 @@ jobs:
           ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
           sleep 1
           curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --iterations 1000 --ns-key stress --pages 1000
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   stress-buggify:
     name: mvstore stress test (buggify)
     runs-on: ubuntu-20.04
@@ -130,7 +130,7 @@ jobs:
           sleep 1
           ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m --fdb-buggify &
           sleep 1
-          RUST_LOG=error ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --iterations 1000 --ns-key stress --pages 1000
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   release:
     name: Release
     needs:
