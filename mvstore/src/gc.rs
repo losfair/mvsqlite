@@ -1,5 +1,5 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicUsize, Ordering, AtomicU64}},
     time::{Duration, SystemTime},
 };
 
@@ -11,6 +11,9 @@ use crate::{
     lock::DistributedLock,
     server::{ContentIndex, Server},
 };
+
+pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(10000);
+pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
 impl Server {
     pub async fn truncate_versions(
@@ -51,7 +54,7 @@ impl Server {
                 let range = match txn
                     .get_range(
                         &RangeOption {
-                            limit: Some(10000),
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
@@ -146,7 +149,7 @@ impl Server {
                 let range = match txn
                     .get_range(
                         &RangeOption {
-                            limit: Some(10000),
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
@@ -286,7 +289,7 @@ impl Server {
                     let range = match txn
                         .get_range(
                             &RangeOption {
-                                limit: Some(10000),
+                                limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                                 reverse: false,
                                 mode: StreamingMode::WantAll,
                                 ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
@@ -334,7 +337,7 @@ impl Server {
                     // This is not necessary for correctness, but removing this may cause transactions to fail.
                     let their_secs = ci.time.as_secs();
                     let our_secs = now.as_secs();
-                    if their_secs > our_secs || our_secs - their_secs < 3600 {
+                    if their_secs > our_secs || our_secs - their_secs < GC_FRESH_PAGE_TTL_SECS.load(Ordering::Relaxed) {
                         continue;
                     }
 

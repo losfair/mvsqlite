@@ -3,7 +3,7 @@ mod gc;
 mod lock;
 mod server;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::atomic::Ordering};
 
 use anyhow::{Context, Result};
 use foundationdb::{api::FdbApiBuilder, options::NetworkOption};
@@ -83,9 +83,27 @@ struct Opt {
     /// Metadata prefix. This value is tuple-encoded as a string.
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
+
+    /// ADVANCED. Configure the GC scan batch size.
+    #[structopt(long, env = "MVSTORE_KNOB_GC_SCAN_BATCH_SIZE")]
+    knob_gc_scan_batch_size: Option<usize>,
+
+    /// ADVANCED. Configure the max time-to-live for unreferenced fresh pages. This will also be the max time an SQLite transaction can be active.
+    #[structopt(long, env = "MVSTORE_KNOB_GC_FRESH_PAGE_TTL_SECS")]
+    knob_gc_fresh_page_ttl_secs: Option<u64>,
 }
 
 async fn async_main(opt: Opt) -> Result<()> {
+    if let Some(x) = opt.knob_gc_scan_batch_size {
+        gc::GC_SCAN_BATCH_SIZE.store(x, Ordering::Relaxed);
+        tracing::info!(value = x, "configured gc scan batch size");
+    }
+
+    if let Some(x) = opt.knob_gc_fresh_page_ttl_secs {
+        gc::GC_FRESH_PAGE_TTL_SECS.store(x, Ordering::Relaxed);
+        tracing::info!(value = x, "configured gc fresh page ttl");
+    }
+
     let server = Server::open(ServerConfig {
         cluster: opt.cluster.clone(),
         raw_data_prefix: opt.raw_data_prefix.clone(),
