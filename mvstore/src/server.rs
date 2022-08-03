@@ -10,11 +10,21 @@ use futures::StreamExt;
 use hyper::{body::HttpBody, Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
-use tokio::io::AsyncRead;
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::{io::AsyncRead, sync::oneshot};
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
     io::StreamReader,
+};
+
+use crate::{
+    commit::{CommitContext, CommitResult},
+    lock::DistributedLock,
 };
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
@@ -23,7 +33,7 @@ const MAX_PAGE_SIZE: usize = 8192;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 
 pub struct Server {
-    db: Database,
+    pub db: Database,
     raw_data_prefix: Vec<u8>,
     metadata_prefix: String,
 
@@ -100,6 +110,21 @@ pub struct AdminCreateNamespaceRequest {
 #[derive(Deserialize)]
 pub struct AdminDeleteNamespaceRequest {
     pub key: String,
+}
+
+#[derive(Deserialize)]
+pub struct AdminTruncateNamespaceRequest {
+    pub key: String,
+    pub before_version: String,
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Deserialize)]
+pub struct AdminDeleteUnreferencedContentInNamespaceRequest {
+    pub key: String,
+    #[serde(default)]
+    pub apply: bool,
 }
 
 pub struct Page {
@@ -263,6 +288,152 @@ impl Server {
                     }
                 }
             }
+
+            "/api/truncate_namespace" => {
+                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
+                let nskey_key = self.construct_nskey_key(&body.key);
+
+                let txn = self.db.create_trx()?;
+                let ns_id = match txn.get(&nskey_key, false).await? {
+                    Some(v) => v,
+                    None => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("this key does not exist"))?);
+                    }
+                };
+                drop(txn);
+
+                let ns_id =
+                    <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+                let before_version = decode_version(&body.before_version)?;
+                let (mut res_sender, res_body) = Body::channel();
+                let (progress_ch_tx, mut progress_ch_rx) =
+                    tokio::sync::mpsc::channel::<Option<u64>>(1000);
+                let (stop_tx, stop_rx) = oneshot::channel::<()>();
+                let apply = body.apply;
+                tokio::spawn(async move {
+                    let work = async move {
+                        if let Err(e) = self
+                            .truncate_versions(!body.apply, ns_id, before_version, |progress| {
+                                let _ = progress_ch_tx.try_send(progress);
+                            })
+                            .await
+                        {
+                            tracing::error!(ns = hex::encode(&ns_id), before_version = hex::encode(&before_version), apply = apply, error = %e, "truncate_namespace failed");
+                        }
+                    };
+                    tokio::select! {
+                        _ = work => {
+
+                        }
+                        _ = stop_rx => {
+                            tracing::error!(ns = hex::encode(&ns_id), before_version = hex::encode(&before_version), apply = apply, "truncate_namespace interrupted");
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let _stop_tx = stop_tx;
+                    loop {
+                        let mut exit = false;
+                        let text = match progress_ch_rx.recv().await {
+                            Some(progress) => match progress {
+                                Some(x) => {
+                                    format!("{}\n", x)
+                                }
+                                None => {
+                                    exit = true;
+                                    "DONE\n".to_string()
+                                }
+                            },
+                            None => {
+                                exit = true;
+                                "ERROR\n".to_string()
+                            }
+                        };
+                        if res_sender.send_data(Bytes::from(text)).await.is_err() {
+                            break;
+                        }
+                        if exit {
+                            break;
+                        }
+                    }
+                });
+                res = Response::builder().status(200).body(res_body)?;
+            }
+
+            "/api/delete_unreferenced_content" => {
+                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body: AdminDeleteUnreferencedContentInNamespaceRequest =
+                    serde_json::from_slice(&body)?;
+                let nskey_key = self.construct_nskey_key(&body.key);
+
+                let txn = self.db.create_trx()?;
+                let ns_id = match txn.get(&nskey_key, false).await? {
+                    Some(v) => v,
+                    None => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("this key does not exist"))?);
+                    }
+                };
+                drop(txn);
+
+                let ns_id =
+                    <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+                let (mut res_sender, res_body) = Body::channel();
+                let (progress_ch_tx, mut progress_ch_rx) =
+                    tokio::sync::mpsc::channel::<String>(1000);
+                let (stop_tx, stop_rx) = oneshot::channel::<()>();
+                let apply = body.apply;
+                tokio::spawn(async move {
+                    let work = async move {
+                        if let Err(e) = self
+                            .delete_unreferenced_content(!body.apply, ns_id, |progress| {
+                                let _ = progress_ch_tx.try_send(progress);
+                            })
+                            .await
+                        {
+                            tracing::error!(ns = hex::encode(&ns_id), apply = apply, error = %e, "delete_unreferenced_content failed");
+                        }
+                    };
+                    tokio::select! {
+                        _ = work => {
+
+                        }
+                        _ = stop_rx => {
+                            tracing::error!(ns = hex::encode(&ns_id), apply = apply, "delete_unreferenced_content interrupted");
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let _stop_tx = stop_tx;
+                    loop {
+                        let mut exit = false;
+                        let text = match progress_ch_rx.recv().await {
+                            Some(progress) => {
+                                if progress == "DONE\n" {
+                                    exit = true;
+                                }
+                                progress
+                            }
+                            None => {
+                                exit = true;
+                                "ERROR\n".to_string()
+                            }
+                        };
+                        if res_sender.send_data(Bytes::from(text)).await.is_err() {
+                            break;
+                        }
+                        if exit {
+                            break;
+                        }
+                    }
+                });
+                res = Response::builder().status(200).body(res_body)?;
+            }
+
             _ => {
                 res = Response::builder().status(404).body(Body::empty())?;
             }
@@ -283,6 +454,71 @@ impl Server {
         }
     }
 
+    pub fn spawn_background_tasks(self: Arc<Self>) {
+        tokio::spawn(self.clone().globaltask_timekeeper());
+    }
+
+    async fn globaltask_timekeeper(self: Arc<Self>) {
+        let mut lock = DistributedLock::new(
+            self.construct_globaltask_key("timekeeper"),
+            "timekeeper".into(),
+        );
+        'outer: loop {
+            loop {
+                let me = self.clone();
+                match lock
+                    .lock(
+                        move || me.db.create_trx().with_context(|| "failed to create txn"),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "timekeeper lock error");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            tracing::info!("timekeeper started");
+
+            loop {
+                loop {
+                    let txn = match lock.create_txn_and_check_sync(&self.db).await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            tracing::error!(error = %e, "timekeeper create_txn_and_check_sync error");
+                            lock.unlock().await;
+                            continue 'outer;
+                        }
+                    };
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let key = self.construct_time2version_key(now);
+                    let value = [0u8; 14];
+                    txn.atomic_op(&key, &value, MutationType::SetVersionstampedValue);
+                    match txn.commit().await {
+                        Ok(_) => break,
+                        Err(e) => match e.on_error().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(error = %e, "timekeeper commit error");
+                                lock.unlock().await;
+                                continue 'outer;
+                            }
+                        },
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
     async fn lookup_nskey(&self, nskey: &str) -> Result<Option<[u8; 10]>> {
         enum GetError {
             NotFound,
@@ -293,7 +529,7 @@ impl Server {
             .try_get_with(nskey.to_string(), async {
                 let txn = self.db.create_trx();
                 match txn {
-                    Ok(txn) => match txn.get(&self.construct_nskey_key(nskey), true).await {
+                    Ok(txn) => match txn.get(&self.construct_nskey_key(nskey), false).await {
                         Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
                             .with_context(|| "invalid namespace id")
                             .map_err(GetError::Other),
@@ -392,7 +628,7 @@ impl Server {
             "/stat" => {
                 let txn = self.db.create_trx()?;
                 let buf = self.get_read_version_as_versionstamp(&txn).await?;
-                let nsmd = txn.get(&self.construct_nsmd_key(ns_id), true).await?;
+                let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
                 let nsmd = nsmd
                     .as_ref()
                     .map(|x| std::str::from_utf8(&x[..]).unwrap_or_default())
@@ -492,7 +728,7 @@ impl Server {
                                 }
                             };
                             let content_key = self.construct_content_key(ns_id, hash);
-                            match txn.get(&content_key, true).await {
+                            match txn.get(&content_key, false).await {
                                 Ok(Some(x)) => Some(Page {
                                     version: read_req.version.to_string(),
                                     data: x,
@@ -562,6 +798,9 @@ impl Server {
                 res = Response::builder().body(res_body)?;
                 let me = self.clone();
                 let txn = self.db.create_trx()?;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
                 tokio::spawn(async move {
                     loop {
                         let message = match body.next().await {
@@ -625,7 +864,7 @@ impl Server {
 
                         // This is not only an optimization. Without doing this check it is possible to form
                         // loops in delta page construction.
-                        match txn.get(&content_key, true).await {
+                        match txn.get(&content_key, false).await {
                             Ok(x) => {
                                 if x.is_some() {
                                     early_completion = true;
@@ -650,10 +889,19 @@ impl Server {
                                                 .construct_delta_referrer_key(
                                                     ns_id,
                                                     *hash.as_bytes(),
-                                                    delta_base_hash,
                                                 );
                                             txn.set(&content_key, &x);
-                                            txn.set(&delta_referrer_key, b"");
+                                            txn.set(&delta_referrer_key, &delta_base_hash);
+                                            let base_content_index_key = self
+                                                .construct_contentindex_key(ns_id, delta_base_hash);
+                                            let now = SystemTime::now()
+                                                .duration_since(SystemTime::UNIX_EPOCH)
+                                                .unwrap();
+                                            txn.atomic_op(
+                                                &base_content_index_key,
+                                                &ContentIndex::generate_mutation_payload(now),
+                                                MutationType::SetVersionstampedValue,
+                                            );
                                             early_completion = true;
                                         }
                                     }
@@ -673,6 +921,15 @@ impl Server {
                         if !early_completion {
                             txn.set(&content_key, &Page::compress_zstd(write_req.data));
                         }
+
+                        // Set content index
+                        let content_index_key =
+                            self.construct_contentindex_key(ns_id, *hash.as_bytes());
+                        txn.atomic_op(
+                            &content_index_key,
+                            &ContentIndex::generate_mutation_payload(now),
+                            MutationType::SetVersionstampedValue,
+                        );
 
                         let payload = match rmp_serde::to_vec_named(&WriteResponse {
                             hash: hash.as_bytes(),
@@ -714,94 +971,49 @@ impl Server {
                 let idempotency_key = <[u8; 16]>::try_from(commit_init.idempotency_key)
                     .with_context(|| "invalid idempotency key")?;
 
-                // Ensure that we finish the commit as quickly as possible - there's the five-second limit here.
-                let mut txn = self.db.create_trx()?;
-                loop {
-                    // Check version
-                    let last_write_version_key = self.construct_last_write_version_key(ns_id);
-                    let last_write_version = txn.get(&last_write_version_key, false).await?;
-                    match &last_write_version {
-                        Some(x) if x.len() != 16 + 10 => {
-                            anyhow::bail!("invalid last write version");
-                        }
-                        Some(x) => {
-                            let actual_idempotency_key = <[u8; 16]>::try_from(&x[0..16]).unwrap();
-                            let actual_last_write_version =
-                                <[u8; 10]>::try_from(&x[16..26]).unwrap();
+                // Decode data
+                let mut index_writes: Vec<(u32, [u8; 32])> = Vec::new();
 
-                            if actual_idempotency_key == idempotency_key {
-                                return Ok(Response::builder()
-                                    .header(
-                                        COMMITTED_VERSION_HDR_NAME,
-                                        hex::encode(&actual_last_write_version),
-                                    )
-                                    .body(Body::empty())?);
-                            }
-
-                            if client_assumed_version < actual_last_write_version {
-                                return Ok(Response::builder().status(409).body(Body::empty())?);
-                            }
-                        }
-                        None => {}
+                for _ in 0..commit_init.num_pages {
+                    let message = match reader.next().await {
+                        Some(x) => x.with_context(|| "error reading commit request")?,
+                        None => anyhow::bail!("early end of commit stream"),
+                    };
+                    let commit_req: CommitRequest = rmp_serde::from_slice(&message)
+                        .with_context(|| "error deserializing commit request")?;
+                    if commit_req.hash.len() != 32 {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("invalid hash"))?);
                     }
+                    index_writes.push((
+                        commit_req.page_index,
+                        <[u8; 32]>::try_from(commit_req.hash).unwrap(),
+                    ));
+                }
 
-                    // Write metadata
-                    if let Some(md) = commit_init.metadata {
-                        let metadata_key = self.construct_nsmd_key(ns_id);
-                        txn.set(&metadata_key, md.as_bytes());
+                match self
+                    .commit(CommitContext {
+                        ns_id,
+                        client_assumed_version,
+                        idempotency_key,
+                        metadata: commit_init.metadata,
+                        index_writes: &index_writes,
+                    })
+                    .await?
+                {
+                    CommitResult::BadPageReference => {
+                        res = Response::builder()
+                            .status(400)
+                            .body(Body::from("bad page reference"))?;
                     }
-                    for _ in 0..commit_init.num_pages {
-                        let message = match reader.next().await {
-                            Some(x) => x.with_context(|| "error reading commit request")?,
-                            None => anyhow::bail!("early end of commit stream"),
-                        };
-                        let commit_req: CommitRequest = rmp_serde::from_slice(&message)
-                            .with_context(|| "error deserializing commit request")?;
-                        if commit_req.hash.len() != 32 {
-                            return Ok(Response::builder()
-                                .status(400)
-                                .body(Body::from("invalid hash"))?);
-                        }
-
-                        let page_key_template =
-                            self.construct_page_key(ns_id, commit_req.page_index, [0u8; 10]);
-                        let page_key_atomic_op =
-                            generate_suffix_versionstamp_atomic_op(&page_key_template);
-                        txn.atomic_op(
-                            &page_key_atomic_op,
-                            commit_req.hash,
-                            MutationType::SetVersionstampedKey,
-                        );
+                    CommitResult::Committed { versionstamp } => {
+                        res = Response::builder()
+                            .header(COMMITTED_VERSION_HDR_NAME, hex::encode(&versionstamp))
+                            .body(Body::empty())?;
                     }
-                    let mut last_write_version_atomic_op_value = [0u8; 16 + 10 + 4];
-                    last_write_version_atomic_op_value[0..16].copy_from_slice(&idempotency_key);
-                    last_write_version_atomic_op_value[26..30]
-                        .copy_from_slice(&16u32.to_le_bytes()[..]);
-                    txn.atomic_op(
-                        &last_write_version_key,
-                        &last_write_version_atomic_op_value,
-                        MutationType::SetVersionstampedValue,
-                    );
-                    let versionstamp_fut = txn.get_versionstamp();
-                    match txn.commit().await {
-                        Ok(_) => {
-                            let versionstamp = versionstamp_fut.await?;
-                            let versionstamp = hex::encode(&versionstamp);
-                            res = Response::builder()
-                                .header(COMMITTED_VERSION_HDR_NAME, versionstamp)
-                                .body(Body::empty())?;
-                            break;
-                        }
-                        Err(e) => {
-                            txn = match e.on_error().await {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    return Ok(Response::builder()
-                                        .status(400)
-                                        .body(Body::from(format!("{}", e)))?)
-                                }
-                            };
-                        }
+                    CommitResult::Conflict => {
+                        res = Response::builder().status(409).body(Body::empty())?;
                     }
                 }
             }
@@ -869,10 +1081,10 @@ impl Server {
         txn: &Transaction,
         ns_id: [u8; 10],
         page_index: u32,
-        block_version_hex: &str,
+        page_version_hex: &str,
     ) -> Result<Option<Page>> {
         let (version, hash) = match self
-            .read_page_hash(txn, ns_id, page_index, block_version_hex)
+            .read_page_hash(txn, ns_id, page_index, page_version_hex)
             .await?
         {
             Some(x) => x,
@@ -880,7 +1092,7 @@ impl Server {
         };
         let content_key = self.construct_content_key(ns_id, hash);
         let content = txn
-            .get(&content_key, true)
+            .get(&content_key, false)
             .await?
             .with_context(|| "cannot find content for the provided hash")?;
         Ok(Some(Page {
@@ -889,18 +1101,43 @@ impl Server {
         }))
     }
 
-    fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nsmd"));
         key.push(0x32);
         key.extend_from_slice(&ns_id);
         key
     }
 
-    fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
+    pub fn construct_nstask_key(&self, ns_id: [u8; 10], task: &str) -> Vec<u8> {
+        let mut key = pack(&(self.metadata_prefix.as_str(), "nstask"));
+        key.push(0x32);
+        key.extend_from_slice(&ns_id);
+        key.extend_from_slice(&pack(&(task,)));
+        key
+    }
+
+    pub fn construct_globaltask_key(&self, task: &str) -> Vec<u8> {
+        let key = pack(&(self.metadata_prefix.as_str(), "globaltask", task));
+        key
+    }
+
+    pub fn construct_time2version_key(&self, time_secs: u64) -> Vec<u8> {
+        let key = pack(&(self.metadata_prefix.as_str(), "time2version", time_secs));
+        key
+    }
+
+    pub fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
         pack(&(self.metadata_prefix.as_str(), "nskey", ns_key))
     }
 
-    fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_ns_commit_token_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+        let mut key = pack(&(self.metadata_prefix.as_str(), "ns_commit_token"));
+        key.push(0x32);
+        key.extend_from_slice(&ns_id);
+        key
+    }
+
+    pub fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1);
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
@@ -908,35 +1145,35 @@ impl Server {
         buf
     }
 
-    fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> Vec<u8> {
+    pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len());
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf
     }
 
-    fn construct_page_key(
+    pub fn construct_page_key(
         &self,
         ns_id: [u8; 10],
         page_index: u32,
-        block_version: [u8; 10],
+        page_version: [u8; 10],
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(
             self.raw_data_prefix.len()
                 + ns_id.len()
                 + 1
                 + std::mem::size_of::<u32>()
-                + block_version.len(),
+                + page_version.len(),
         );
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf.push(b'p');
         buf.extend_from_slice(&page_index.to_be_bytes());
-        buf.extend_from_slice(&block_version);
+        buf.extend_from_slice(&page_version);
         buf
     }
 
-    fn construct_content_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
+    pub fn construct_content_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
         let mut buf: Vec<u8> =
             Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + hash.len());
         buf.extend_from_slice(&self.raw_data_prefix);
@@ -946,19 +1183,27 @@ impl Server {
         buf
     }
 
-    fn construct_delta_referrer_key(
+    pub fn construct_contentindex_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
+        let mut buf: Vec<u8> =
+            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + hash.len());
+        buf.extend_from_slice(&self.raw_data_prefix);
+        buf.extend_from_slice(&ns_id);
+        buf.push(b'd');
+        buf.extend_from_slice(&hash);
+        buf
+    }
+
+    pub fn construct_delta_referrer_key(
         &self,
         ns_id: [u8; 10],
         from_hash: [u8; 32],
-        to_hash: [u8; 32],
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(
-            self.raw_data_prefix.len() + ns_id.len() + 1 + to_hash.len() + from_hash.len(),
+            self.raw_data_prefix.len() + ns_id.len() + 1 + from_hash.len()
         );
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf.push(b'r');
-        buf.extend_from_slice(&to_hash);
         buf.extend_from_slice(&from_hash);
         buf
     }
@@ -981,7 +1226,7 @@ impl Server {
         };
         let (undecoded_base, delta_base_hash) = {
             let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-            let base = match txn.get(&base_page_key, true).await? {
+            let base = match txn.get(&base_page_key, false).await? {
                 Some(x) => x,
                 None => return Ok(None),
             };
@@ -995,7 +1240,7 @@ impl Server {
                 }
                 let flattened_base_hash = <[u8; 32]>::try_from(&base[1..33]).unwrap();
                 let flattened_base_key = self.construct_content_key(ns_id, flattened_base_hash);
-                let flattened_base = match txn.get(&flattened_base_key, true).await? {
+                let flattened_base = match txn.get(&flattened_base_key, false).await? {
                     Some(x) => x,
                     None => return Ok(None),
                 };
@@ -1092,7 +1337,7 @@ impl Server {
                 }
                 let base_page_hash = <[u8; 32]>::try_from(&data[1..33]).unwrap();
                 let base_page_key = self.construct_content_key(ns_id, base_page_hash);
-                let base_page = match txn.get(&base_page_key, true).await? {
+                let base_page = match txn.get(&base_page_key, false).await? {
                     Some(x) => x,
                     None => anyhow::bail!("base page not found"),
                 };
@@ -1128,7 +1373,7 @@ fn new_body_reader(
     reader
 }
 
-fn generate_suffix_versionstamp_atomic_op(template: &[u8]) -> Vec<u8> {
+pub fn generate_suffix_versionstamp_atomic_op(template: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(template.len() + 4);
     out.extend_from_slice(template);
     out.extend_from_slice(&(template.len() as u32 - 10).to_le_bytes());
@@ -1146,4 +1391,27 @@ fn decode_version(version: &str) -> Result<[u8; 10]> {
     let mut bytes = [0u8; 10];
     hex::decode_to_slice(version, &mut bytes).with_context(|| "cannot decode version")?;
     Ok(bytes)
+}
+
+pub struct ContentIndex {
+    pub time: Duration,
+    pub versionstamp: [u8; 10],
+}
+
+impl ContentIndex {
+    pub fn generate_mutation_payload(now: Duration) -> [u8; 22] {
+        let mut buf = [0u8; 22];
+        buf[0..8].copy_from_slice(&now.as_secs().to_be_bytes());
+        buf[18..22].copy_from_slice(&8u32.to_le_bytes()[..]);
+        buf
+    }
+
+    pub fn decode(x: &[u8]) -> Result<Self> {
+        if x.len() != 18 {
+            return Err(anyhow::anyhow!("invalid content index"));
+        }
+        let time = Duration::from_secs(u64::from_be_bytes(x[0..8].try_into().unwrap()));
+        let versionstamp = x[8..18].try_into().unwrap();
+        Ok(Self { time, versionstamp })
+    }
 }

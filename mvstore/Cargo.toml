@@ -40,3 +40,4 @@ serde_json = "1"
 serde_bytes = "0.11"
 zstd = "0.11.2"
 moka = { version = "0.9.2", features = ["future"] }
+bloom = "0.3.2"

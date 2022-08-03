@@ -468,7 +468,9 @@ async fn request_and_check_returning_status(
         };
         Ok(Some((headers, body)))
     } else if res.status().is_server_error() {
-        tracing::error!(status = %res.status(), "server error");
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        tracing::error!(status = %status, text = text, "server error");
         Ok(None)
     } else {
         let status = res.status();

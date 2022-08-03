@@ -4,10 +4,10 @@ use rand::{thread_rng, Rng};
 use rpds::RedBlackTreeMapSync;
 
 pub struct Inmem {
-    versions: BTreeMap<String, RedBlackTreeMapSync<u32, [u8; 32]>>,
+    pub versions: BTreeMap<String, RedBlackTreeMapSync<u32, [u8; 32]>>,
     inflight: BTreeMap<u64, RedBlackTreeMapSync<u32, [u8; 32]>>,
     next_inflight_id: u64,
-    version_list: Vec<String>,
+    pub version_list: Vec<String>,
 }
 
 impl Inmem {
@@ -49,11 +49,11 @@ impl Inmem {
         version.insert_mut(index, *hash.as_bytes());
     }
 
-    pub fn verify_page(&self, id: u64, index: u32, data: &[u8]) {
+    pub fn verify_page(&self, id: u64, index: u32, data: &[u8], desc: &str) {
         let version = self.inflight.get(&id).expect("inflight not found");
 
         if data.is_empty() {
-            assert!(version.get(&index).is_none(), "page should not exist");
+            assert!(version.get(&index).is_none(), "page should not exist ({})", desc);
         } else {
             let computed_hash = blake3::hash(data);
             let stored_hash = *version.get(&index).expect("page not found");

@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::RwLock;
 
 use anyhow::Result;
@@ -11,18 +15,25 @@ pub struct Tester {
     mem: RwLock<Inmem>,
     client: Arc<MultiVersionClient>,
     num_pages: u32,
+    admin_api: String,
+    busy_versions: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Tester {
-    pub fn new(client: Arc<MultiVersionClient>, num_pages: u32) -> Arc<Self> {
+    pub fn new(client: Arc<MultiVersionClient>, admin_api: String, num_pages: u32) -> Arc<Self> {
         Arc::new(Self {
             mem: RwLock::new(Inmem::new()),
             client,
             num_pages,
+            admin_api,
+            busy_versions: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub async fn run(self: &Arc<Self>, concurrency: usize, iterations: usize) {
+        let truncate_worker = tokio::spawn(self.clone().truncate_worker());
+        let delete_unreferenced_content_worker =
+            tokio::spawn(self.clone().delete_unreferenced_content_worker());
         let handles = (0..concurrency)
             .map(|i| {
                 let me = self.clone();
@@ -32,18 +43,140 @@ impl Tester {
         for handle in handles {
             handle.await.unwrap().unwrap();
         }
+        truncate_worker.abort();
+        delete_unreferenced_content_worker.abort();
+    }
+
+    async fn truncate_worker(self: Arc<Self>) {
+        let rc = reqwest::Client::new();
+        loop {
+            let sleep_dur_ms = rand::thread_rng().gen_range(1..1000);
+            let sleep_dur = Duration::from_millis(sleep_dur_ms);
+            tokio::time::sleep(sleep_dur).await;
+
+            let mut remove_point: String;
+            {
+                let mut mem = self.mem.write().await;
+                let mut versions = mem.versions.keys().cloned().collect::<Vec<_>>();
+                versions.pop(); // never remove the latest version, if any
+
+                if versions.len() == 0 {
+                    continue;
+                }
+                let split_point = rand::thread_rng().gen_range(0..versions.len());
+                remove_point = versions[split_point].clone();
+
+                if let Some((k, _)) = self.busy_versions.lock().unwrap().iter().next() {
+                    if *k < remove_point {
+                        remove_point = k.clone();
+                    }
+                }
+                let mut removals: HashSet<String> = HashSet::new();
+                for x in &versions {
+                    if *x < remove_point {
+                        mem.versions.remove(x);
+                        removals.insert(x.clone());
+                    }
+                }
+                mem.version_list = mem
+                    .version_list
+                    .iter()
+                    .filter(|x| !removals.contains(*x))
+                    .cloned()
+                    .collect::<Vec<_>>();
+            }
+            let payload = serde_json::json!({
+                "key": &self.client.config().ns_key,
+                "before_version": &remove_point,
+                "apply": true,
+            });
+            tracing::info!(remove_point = remove_point, "triggering truncation");
+            match rc
+                .post(format!("{}/api/truncate_namespace", self.admin_api,))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(res) => match res.bytes().await {
+                    Ok(_) => {
+                        tracing::info!("truncated namespace");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read response for truncate namespace");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to truncate namespace");
+                }
+            }
+        }
+    }
+
+    async fn delete_unreferenced_content_worker(self: Arc<Self>) {
+        let rc = reqwest::Client::new();
+        loop {
+            let sleep_dur_ms = rand::thread_rng().gen_range(1..10000);
+            let sleep_dur = Duration::from_millis(sleep_dur_ms);
+            tokio::time::sleep(sleep_dur).await;
+            let payload = serde_json::json!({
+                "key": &self.client.config().ns_key,
+                "apply": true,
+            });
+            tracing::info!("triggering duc");
+            match rc
+                .post(format!(
+                    "{}/api/delete_unreferenced_content",
+                    self.admin_api,
+                ))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(res) => match res.bytes().await {
+                    Ok(_) => {
+                        tracing::info!("deleted unreferenced content");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read response for duc");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to delete unreferenced content");
+                }
+            }
+        }
+    }
+
+    fn acquire_version(&self, version: &str) {
+        *self
+            .busy_versions
+            .lock()
+            .unwrap()
+            .entry(version.to_string())
+            .or_default() += 1;
+    }
+
+    fn release_version(&self, version: &str) {
+        let mut versions = self.busy_versions.lock().unwrap();
+        let entry = versions.get_mut(version).unwrap();
+        assert!(*entry > 0, "version {} is not acquired", version);
+        *entry -= 1;
+        if *entry == 0 {
+            versions.remove(version);
+        }
     }
 
     async fn task(self: Arc<Self>, task_id: usize, iterations: usize) -> Result<()> {
         let mut mem = self.mem.write().await;
         let mut txn = self.client.create_transaction().await?;
         let mut txn_id = mem.start_transaction(txn.version());
+        self.acquire_version(txn.version());
         drop(mem);
 
         let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.num_pages as usize];
         for it in 0..iterations {
-            let mode = rand::thread_rng().gen_range(0..10);
-            tracing::info!(task = task_id, iteration = it, mode = mode, "iteration");
+            let mode = rand::thread_rng().gen_range(0..11);
+            //tracing::info!(task = task_id, iteration = it, mode = mode, "iteration");
             match mode {
                 0..=5 => {
                     let num_reads = rand::thread_rng().gen_range(1..=10);
@@ -53,8 +186,8 @@ impl Tester {
                     let pages = txn.read_many(&reads).await?;
                     let mem = self.mem.read().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
-                        tracing::info!(task = task_id, iteration = it, index = index, "read");
-                        mem.verify_page(txn_id, index, page);
+                        //tracing::info!(task = task_id, iteration = it, index = index, "read");
+                        mem.verify_page(txn_id, index, page, txn.version());
                     }
                 }
                 6..=7 => {
@@ -83,7 +216,7 @@ impl Tester {
                                 last_writes[index as usize] = Some(data.clone());
                             }
 
-                            tracing::info!(task = task_id, iteration = it, index = index, "write");
+                            //tracing::info!(task = task_id, iteration = it, index = index, "write");
 
                             (index, data)
                         })
@@ -100,20 +233,31 @@ impl Tester {
                 }
                 8 => {
                     let mut mem = self.mem.write().await;
+                    let version = txn.version().to_string();
                     match txn.commit(None).await? {
                         Some(info) => {
                             mem.commit_transaction(txn_id, &info.version);
                         }
                         None => mem.drop_transaction(txn_id),
                     }
+                    self.release_version(&version);
                     drop(mem);
                     tokio::task::yield_now().await;
                     (txn, txn_id) = self.create_transaction_random_base().await?;
+                    //tracing::info!(version = txn.version(), "created txn");
                 }
                 9 => {
-                    self.mem.write().await.drop_transaction(txn_id);
+                    let mut mem = self.mem.write().await;
+                    mem.drop_transaction(txn_id);
+                    self.release_version(txn.version());
+                    drop(mem);
                     tokio::task::yield_now().await;
                     (txn, txn_id) = self.create_transaction_random_base().await?;
+                    //tracing::info!(version = txn.version(), "created txn");
+                }
+                10 => {
+                    let dur_millis = rand::thread_rng().gen_range(1..100);
+                    tokio::time::sleep(Duration::from_millis(dur_millis)).await;
                 }
                 _ => unreachable!(),
             }
@@ -129,12 +273,14 @@ impl Tester {
             if let Some(version) = mem.pick_random_version() {
                 let txn = self.client.create_transaction_at_version(version);
                 let txn_id = mem.start_transaction(txn.version());
+                self.acquire_version(txn.version());
                 return Ok((txn, txn_id));
             }
         }
 
         let txn = self.client.create_transaction().await?;
         let txn_id = mem.start_transaction(txn.version());
+        self.acquire_version(txn.version());
         Ok((txn, txn_id))
     }
 }

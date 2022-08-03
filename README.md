@@ -13,9 +13,8 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
   - [Caveats](#caveats)
     - [The "database is locked" error](#the-database-is-locked-error)
     - [No ABA-style idempotency](#no-aba-style-idempotency)
-  - [Limits](#limits)
+    - [Transaction size and time limit](#transaction-size-and-time-limit)
     - [Read latency](#read-latency)
-    - [Not yet implemented: garbage collection](#not-yet-implemented-garbage-collection)
 
 ## Features
 
@@ -128,14 +127,12 @@ This means that, in a very rare circumstance as described below:
 
 The first client will get a commit conflict and abort. This is the expected behavior, since unbounded idempotency requires too much overhead.
 
-## Limits
+### Transaction size and time limit
+
+Currently the max transaction size in mvsqlite is ~1GB and the time limit is 1 hour.
 
 ### Read latency
 
 SQLite does synchronous "disk" I/O. While we can (and do) concurrently execute write operations, reads from FoundationDB block the SQLite thread.
 
 This is probably fine if you don't expect to get very I/O intensive on a single database, but you may want to enable `coroutine` in the `IoEngine` config if you have an event loop outside, so that network I/O won't block the thread.
-
-### Not yet implemented: garbage collection
-
-Currently history versions will be kept in the database forever. There is no garbage collection yet. In a future version this will be fixed.
