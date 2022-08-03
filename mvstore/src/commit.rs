@@ -24,7 +24,7 @@ impl Server {
     pub async fn commit<'a>(&self, ctx: CommitContext<'a>) -> Result<CommitResult> {
         // Begin the writes.
         // We do three-phase commit for large transactions here.
-        let multi_phase = ctx.index_writes.len() >= 16;
+        let multi_phase = ctx.index_writes.len() >= 1000;
         let commit_token_key = self.construct_ns_commit_token_key(ctx.ns_id);
         let mut commit_token = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut commit_token);

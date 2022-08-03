@@ -120,6 +120,13 @@ pub struct AdminTruncateNamespaceRequest {
     pub apply: bool,
 }
 
+#[derive(Deserialize)]
+pub struct AdminDeleteUnreferencedContentInNamespaceRequest {
+    pub key: String,
+    #[serde(default)]
+    pub apply: bool,
+}
+
 pub struct Page {
     pub version: String,
     pub data: FdbSlice,
@@ -340,6 +347,77 @@ impl Server {
                                     "DONE\n".to_string()
                                 }
                             },
+                            None => {
+                                exit = true;
+                                "ERROR\n".to_string()
+                            }
+                        };
+                        if res_sender.send_data(Bytes::from(text)).await.is_err() {
+                            break;
+                        }
+                        if exit {
+                            break;
+                        }
+                    }
+                });
+                res = Response::builder().status(200).body(res_body)?;
+            }
+
+            "/api/delete_unreferenced_content" => {
+                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body: AdminDeleteUnreferencedContentInNamespaceRequest =
+                    serde_json::from_slice(&body)?;
+                let nskey_key = self.construct_nskey_key(&body.key);
+
+                let txn = self.db.create_trx()?;
+                let ns_id = match txn.get(&nskey_key, false).await? {
+                    Some(v) => v,
+                    None => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("this key does not exist"))?);
+                    }
+                };
+                drop(txn);
+
+                let ns_id =
+                    <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+                let (mut res_sender, res_body) = Body::channel();
+                let (progress_ch_tx, mut progress_ch_rx) =
+                    tokio::sync::mpsc::channel::<String>(1000);
+                let (stop_tx, stop_rx) = oneshot::channel::<()>();
+                let apply = body.apply;
+                tokio::spawn(async move {
+                    let work = async move {
+                        if let Err(e) = self
+                            .delete_unreferenced_content(!body.apply, ns_id, |progress| {
+                                let _ = progress_ch_tx.try_send(progress);
+                            })
+                            .await
+                        {
+                            tracing::error!(ns = hex::encode(&ns_id), apply = apply, error = %e, "delete_unreferenced_content failed");
+                        }
+                    };
+                    tokio::select! {
+                        _ = work => {
+
+                        }
+                        _ = stop_rx => {
+                            tracing::error!(ns = hex::encode(&ns_id), apply = apply, "delete_unreferenced_content interrupted");
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let _stop_tx = stop_tx;
+                    loop {
+                        let mut exit = false;
+                        let text = match progress_ch_rx.recv().await {
+                            Some(progress) => {
+                                if progress == "DONE\n" {
+                                    exit = true;
+                                }
+                                progress
+                            }
                             None => {
                                 exit = true;
                                 "ERROR\n".to_string()
@@ -815,6 +893,16 @@ impl Server {
                                                 );
                                             txn.set(&content_key, &x);
                                             txn.set(&delta_referrer_key, b"");
+                                            let base_content_index_key = self
+                                                .construct_contentindex_key(ns_id, delta_base_hash);
+                                            let now = SystemTime::now()
+                                                .duration_since(SystemTime::UNIX_EPOCH)
+                                                .unwrap();
+                                            txn.atomic_op(
+                                                &base_content_index_key,
+                                                &ContentIndex::generate_mutation_payload(now),
+                                                MutationType::SetVersionstampedValue,
+                                            );
                                             early_completion = true;
                                         }
                                     }
@@ -1086,7 +1174,7 @@ impl Server {
         buf
     }
 
-    fn construct_content_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
+    pub fn construct_content_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
         let mut buf: Vec<u8> =
             Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + hash.len());
         buf.extend_from_slice(&self.raw_data_prefix);
@@ -1106,7 +1194,7 @@ impl Server {
         buf
     }
 
-    fn construct_delta_referrer_key(
+    pub fn construct_delta_referrer_key(
         &self,
         ns_id: [u8; 10],
         from_hash: [u8; 32],
