@@ -1,10 +1,11 @@
 [package]
 name = "mvstore"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
 description = "Multi-version page store for mvsqlite"
+repository = "https://github.com/losfair/mvsqlite"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
