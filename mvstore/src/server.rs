@@ -6,13 +6,14 @@ use foundationdb::{
     tuple::pack,
     Database, RangeOption, Transaction,
 };
-use futures::StreamExt;
+use futures::{stream::FuturesOrdered, Future, StreamExt};
 use hyper::{body::HttpBody, Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -30,6 +31,7 @@ use crate::{
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
 const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
 const MAX_PAGE_SIZE: usize = 8192;
+const MAX_PAGES_PER_BATCH_READ: usize = 100;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 
 pub struct Server {
@@ -64,8 +66,8 @@ pub struct ReadRequest<'a> {
 }
 
 #[derive(Serialize)]
-pub struct ReadResponse<'a> {
-    pub version: &'a str,
+pub struct ReadResponse {
+    pub version: String,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
@@ -686,7 +688,11 @@ impl Server {
                 res = Response::builder().body(res_body)?;
                 let me = self.clone();
                 tokio::spawn(async move {
+                    let mut read_futures: FuturesOrdered<
+                        Pin<Box<dyn Future<Output = Result<ReadResponse, ()>> + Send>>,
+                    > = FuturesOrdered::new();
                     loop {
+                        let ns_id_hex = ns_id_hex.clone();
                         let message = match body.next().await {
                             Some(Ok(x)) => x,
                             Some(Err(e)) => {
@@ -695,84 +701,107 @@ impl Server {
                             }
                             None => break,
                         };
-                        let read_req: ReadRequest = match rmp_serde::from_slice(&message) {
+                        if read_futures.len() >= MAX_PAGES_PER_BATCH_READ {
+                            tracing::warn!(
+                                ns = ns_id_hex,
+                                max = MAX_PAGES_PER_BATCH_READ,
+                                "too many pages in read batch"
+                            );
+                            break;
+                        }
+                        let me = me.clone();
+                        read_futures.push(Box::pin(async move {
+                            loop {
+                                let read_req: ReadRequest = match rmp_serde::from_slice(&message) {
+                                    Ok(x) => x,
+                                    Err(e) => {
+                                        tracing::warn!(ns = %ns_id_hex, error = %e, "invalid message");
+                                        break Err(());
+                                    }
+                                };
+                                let txn: Transaction;
+                                let page = if let Some(hash) = read_req.hash {
+                                    // This path enables read-your-writes in the same transaction. We cannot use the read-version cache,
+                                    // because the snapshotted version may not contain newly written pages.
+                                    //
+                                    // This is a rare case anyway, because the client has its own read cache.
+                                    tracing::debug!(
+                                        ns = ns_id_hex,
+                                        hash = hex::encode(hash),
+                                        "entering read-your-writes logic"
+                                    );
+                                    txn = match me.db.create_trx() {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to create transaction");
+                                            break Err(());
+                                        }
+                                    };
+                                    let hash = match <[u8; 32]>::try_from(hash) {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            tracing::warn!(ns = ns_id_hex, error = %e, "hash is not 32 bytes");
+                                            break Err(());
+                                        }
+                                    };
+                                    let content_key = me.construct_content_key(ns_id, hash);
+                                    match txn.get(&content_key, false).await {
+                                        Ok(Some(x)) => Some(Page {
+                                            version: read_req.version.to_string(),
+                                            data: x,
+                                        }),
+                                        Ok(None) => None,
+                                        Err(e) => {
+                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to get content by hash");
+                                            break Err(());
+                                        }
+                                    }
+                                } else {
+                                    txn = match me.create_versioned_read_txn(read_req.version).await {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
+                                            break Err(());
+                                        }
+                                    };
+                                    match me
+                                        .read_page(&txn, ns_id, read_req.page_index, read_req.version)
+                                        .await
+                                    {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            tracing::warn!(ns = ns_id_hex, error = %e, page_index = read_req.page_index, version = read_req.version, "error reading page");
+                                            break Err(());
+                                        }
+                                    }
+                                };
+                                let payload = match &page {
+                                    Some(x) => ReadResponse {
+                                        version: x.version.clone(),
+                                        data: match me.decode_page(&txn, ns_id, &x.data).await {
+                                            Ok(x) => x.data,
+                                            Err(e) => {
+                                                tracing::warn!(ns = ns_id_hex, error = %e, "error decoding page");
+                                                break Err(());
+                                            }
+                                        },
+                                    },
+                                    None => ReadResponse {
+                                        version: "".into(),
+                                        data: Vec::new(),
+                                    },
+                                };
+                                break Ok(payload);
+                            }
+                        }));
+                    }
+
+                    while let Some(fut_output) = read_futures.next().await {
+                        let payload = match fut_output {
                             Ok(x) => x,
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "invalid message");
+                            Err(()) => {
                                 break;
                             }
-                        };
-                        let txn: Transaction;
-                        let page = if let Some(hash) = read_req.hash {
-                            // This path enables read-your-writes in the same transaction. We cannot use the read-version cache,
-                            // because the snapshotted version may not contain newly written pages.
-                            //
-                            // This is a rare case anyway, because the client has its own read cache.
-                            tracing::debug!(
-                                ns = ns_id_hex,
-                                hash = hex::encode(hash),
-                                "entering read-your-writes logic"
-                            );
-                            txn = match self.db.create_trx() {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to create transaction");
-                                    break;
-                                }
-                            };
-                            let hash = match <[u8; 32]>::try_from(hash) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, "hash is not 32 bytes");
-                                    break;
-                                }
-                            };
-                            let content_key = self.construct_content_key(ns_id, hash);
-                            match txn.get(&content_key, false).await {
-                                Ok(Some(x)) => Some(Page {
-                                    version: read_req.version.to_string(),
-                                    data: x,
-                                }),
-                                Ok(None) => None,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to get content by hash");
-                                    break;
-                                }
-                            }
-                        } else {
-                            txn = match self.create_versioned_read_txn(read_req.version).await {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
-                                    break;
-                                }
-                            };
-                            match me
-                                .read_page(&txn, ns_id, read_req.page_index, read_req.version)
-                                .await
-                            {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, page_index = read_req.page_index, version = read_req.version, "error reading page");
-                                    break;
-                                }
-                            }
-                        };
-                        let payload = match &page {
-                            Some(x) => ReadResponse {
-                                version: x.version.as_str(),
-                                data: match self.decode_page(&txn, ns_id, &x.data).await {
-                                    Ok(x) => x.data,
-                                    Err(e) => {
-                                        tracing::warn!(ns = ns_id_hex, error = %e, "error decoding page");
-                                        break;
-                                    }
-                                },
-                            },
-                            None => ReadResponse {
-                                version: "",
-                                data: Vec::new(),
-                            },
                         };
                         let payload = match rmp_serde::to_vec_named(&payload) {
                             Ok(x) => x,
