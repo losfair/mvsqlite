@@ -800,7 +800,7 @@ mod vfs {
     ) -> i32 {
         log::trace!("current_time_int64");
 
-        const UNIX_EPOCH: i64 = 24405875 * 86400000;
+        const UNIX_EPOCH: i64 = 24405875 * 8640000;
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
