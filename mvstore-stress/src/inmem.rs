@@ -53,7 +53,11 @@ impl Inmem {
         let version = self.inflight.get(&id).expect("inflight not found");
 
         if data.is_empty() {
-            assert!(version.get(&index).is_none(), "page should not exist ({})", desc);
+            assert!(
+                version.get(&index).is_none(),
+                "page should not exist ({})",
+                desc
+            );
         } else {
             let computed_hash = blake3::hash(data);
             let stored_hash = *version.get(&index).expect("page not found");

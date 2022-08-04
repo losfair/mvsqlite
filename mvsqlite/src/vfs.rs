@@ -1,19 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet},
     io::ErrorKind,
-    ptr::NonNull,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use libc::c_void;
 use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
     io_engine::IoEngine,
-    sqlite::{sqlite3_commit_hook, sqlite3_rollback_hook, SqlitePtr},
     sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
 };
 
@@ -21,19 +17,9 @@ const PAGE_SIZE: usize = 8192;
 const TRANSITION_HISTORY_SIZE: usize = 10;
 static FIRST_PAGE_TEMPLATE: &'static [u8; 8192] = include_bytes!("../template.db");
 
-thread_local! {
-    static CONN_BUFFER: Cell<Option<NonNull<Connection>>> = Cell::new(None);
-}
-
 pub struct MultiVersionVfs {
     pub data_plane: String,
     pub io: Arc<IoEngine>,
-}
-
-pub(crate) fn take_conn_buffer() -> NonNull<Connection> {
-    CONN_BUFFER
-        .with(|b| b.take())
-        .expect("CONN_BUFFER is not set")
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -85,19 +71,9 @@ impl Vfs for MultiVersionVfs {
             history: TransitionHistory::default(),
             txn_buffered_page: HashMap::new(),
             txn_metadata: None,
-            did_init: false,
             mvcc_aware: false,
         };
-        let mut conn = Box::new(conn);
-
-        CONN_BUFFER.with(|b| {
-            let orig = b.take();
-            if orig.is_some() {
-                panic!("CONN_BUFFER is already set");
-            }
-            let conn_ptr = NonNull::from(&mut *conn);
-            b.set(Some(conn_ptr));
-        });
+        let conn = Box::new(conn);
 
         Ok(conn)
     }
@@ -140,25 +116,19 @@ pub struct Connection {
     txn_buffered_page: HashMap<u32, Vec<u8>>,
     txn_metadata: Option<NsMetadata>,
 
-    did_init: bool,
     mvcc_aware: bool,
 }
 
 #[derive(Default)]
 struct TransitionHistory {
-    history: HashMap<u32, [u32; TRANSITION_HISTORY_SIZE]>,
+    history: [i64; TRANSITION_HISTORY_SIZE],
     prev_index: u32,
 }
 
 impl TransitionHistory {
     fn predict(&self, current_index: u32) -> Vec<u32> {
-        let mut count: HashMap<u32, u32> = HashMap::with_capacity(TRANSITION_HISTORY_SIZE);
-        let destinations = self
-            .history
-            .get(&current_index)
-            .copied()
-            .unwrap_or_default();
-        for &destination in destinations.iter() {
+        let mut count: HashMap<i64, u32> = HashMap::with_capacity(TRANSITION_HISTORY_SIZE);
+        for &destination in self.history.iter() {
             *count.entry(destination).or_insert(0) += 1;
         }
 
@@ -174,13 +144,16 @@ impl TransitionHistory {
             })
             .collect::<Vec<_>>();
         items.sort_by_key(|x| -(x.1 as i64));
-        items.iter().map(|x| x.0).collect()
+        items
+            .iter()
+            .filter_map(|x| u32::try_from(current_index as i64 + x.0).ok())
+            .collect()
     }
 
     fn record(&mut self, current_index: u32) {
-        let entry = self.history.entry(self.prev_index).or_default();
-        entry.rotate_right(1);
-        entry[0] = current_index;
+        let diff = current_index as i64 - self.prev_index as i64;
+        self.history.rotate_right(1);
+        self.history[0] = diff;
         self.prev_index = current_index;
     }
 
@@ -227,7 +200,7 @@ impl Connection {
                 page = buffered_page.clone();
             }
             None => {
-                let predicted_next = self.history.record_and_predict(page_offset, 3);
+                let predicted_next = self.history.record_and_predict(page_offset, 10);
                 tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
                 let mut read_vec: Vec<u32> = Vec::with_capacity(1 + predicted_next.len());
                 read_vec.push(page_offset);
@@ -352,7 +325,6 @@ impl DatabaseHandle for Box<Connection> {
     fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         tracing::trace!(lock = ?lock, "lock");
         assert!(lock != LockKind::None);
-        assert!(self.did_init, "lock before init");
         if self.lock == lock {
             return Ok(true);
         }
@@ -503,47 +475,6 @@ impl DatabaseHandle for Box<Connection> {
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
     }
-}
-
-impl Connection {
-    pub(crate) unsafe fn init(&mut self, db: SqlitePtr) {
-        if self.did_init {
-            panic!("attempt to bind connection to db twice");
-        }
-        self.did_init = true;
-
-        let me_ptr = self as *mut Connection;
-        let prev_commit_hook_data = sqlite3_commit_hook(db, commit_hook, me_ptr as *mut c_void);
-        let prev_rollback_hook_data =
-            sqlite3_rollback_hook(db, rollback_hook, me_ptr as *mut c_void);
-
-        if !prev_commit_hook_data.is_null() {
-            panic!("attempt to set commit hook twice");
-        }
-
-        if !prev_rollback_hook_data.is_null() {
-            panic!("attempt to set rollback hook twice");
-        }
-    }
-
-    fn on_commit(&mut self) -> i32 {
-        tracing::trace!(lock = ?self.lock, "on_commit");
-        0
-    }
-
-    fn on_rollback(&mut self) {
-        tracing::trace!(lock = ?self.lock, "on_rollback");
-    }
-}
-
-unsafe extern "C" fn commit_hook(data: *mut c_void) -> i32 {
-    let conn = &mut *(data as *mut Connection);
-    conn.on_commit()
-}
-
-unsafe extern "C" fn rollback_hook(data: *mut c_void) {
-    let conn = &mut *(data as *mut Connection);
-    conn.on_rollback()
 }
 
 fn lock_level(kind: LockKind) -> u32 {

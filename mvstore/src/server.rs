@@ -1193,14 +1193,9 @@ impl Server {
         buf
     }
 
-    pub fn construct_delta_referrer_key(
-        &self,
-        ns_id: [u8; 10],
-        from_hash: [u8; 32],
-    ) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            self.raw_data_prefix.len() + ns_id.len() + 1 + from_hash.len()
-        );
+    pub fn construct_delta_referrer_key(&self, ns_id: [u8; 10], from_hash: [u8; 32]) -> Vec<u8> {
+        let mut buf: Vec<u8> =
+            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + from_hash.len());
         buf.extend_from_slice(&self.raw_data_prefix);
         buf.extend_from_slice(&ns_id);
         buf.push(b'r');

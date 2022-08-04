@@ -16,6 +16,7 @@ use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::SystemTime;
 
 mod ffi;
 
@@ -799,8 +800,12 @@ mod vfs {
     ) -> i32 {
         log::trace!("current_time_int64");
 
-        const UNIX_EPOCH: i64 = 24405875 * 8640000;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp() + UNIX_EPOCH;
+        const UNIX_EPOCH: i64 = 24405875 * 86400000;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + UNIX_EPOCH;
         #[cfg(feature = "sqlite_test")]
         let now = if ffi::sqlite3_get_current_time() > 0 {
             ffi::sqlite3_get_current_time() as i64 * 1000 + UNIX_EPOCH

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use backtrace::Backtrace;
 use sqlite::SqlitePtr;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
-use vfs::take_conn_buffer;
 
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
 
@@ -45,14 +44,4 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub extern "C" fn init_mvsqlite_connection(db: SqlitePtr) {
-    let mut conn = take_conn_buffer();
-
-    // SAFETY:
-    // - Lifetimes - `conn` lives as long as `db`.
-    // - Alias rules - this is safe as long as we don't re-enter SQLite from VFS/Hook callbacks.
-    unsafe {
-        let conn = conn.as_mut();
-        conn.init(db);
-    }
-}
+pub extern "C" fn init_mvsqlite_connection(_db: SqlitePtr) {}

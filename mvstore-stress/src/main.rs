@@ -14,7 +14,7 @@ struct Opt {
     /// Data plane URL.
     #[structopt(long)]
     data_plane: String,
-    
+
     /// Admin API URL.
     #[structopt(long)]
     admin_api: String,

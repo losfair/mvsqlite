@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, atomic::{AtomicUsize, Ordering, AtomicU64}},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -337,7 +340,9 @@ impl Server {
                     // This is not necessary for correctness, but removing this may cause transactions to fail.
                     let their_secs = ci.time.as_secs();
                     let our_secs = now.as_secs();
-                    if their_secs > our_secs || our_secs - their_secs < GC_FRESH_PAGE_TTL_SECS.load(Ordering::Relaxed) {
+                    if their_secs > our_secs
+                        || our_secs - their_secs < GC_FRESH_PAGE_TTL_SECS.load(Ordering::Relaxed)
+                    {
                         continue;
                     }
 
