@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "mvclient"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "mvsqlite"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "mvstore"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
