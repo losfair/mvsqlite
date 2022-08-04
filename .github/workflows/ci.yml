@@ -226,7 +226,8 @@ jobs:
           git checkout version-3.31.1 # ubuntu 20.04
           git apply ../res/ci/sqlite.patch
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
-          LD_PRELOAD=./build/libmvsqlite_preload.so RUST_LOG=error ./speedtest1 test
+          ./speedtest1 ./test.db
+          LD_PRELOAD=../build/libmvsqlite_preload.so RUST_LOG=error ./speedtest1 test
   release:
     name: Release
     needs:
