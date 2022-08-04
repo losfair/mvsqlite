@@ -1,0 +1,35 @@
+diff --git a/test/speedtest1.c b/test/speedtest1.c
+index ccb8a44e1..acce6400f 100644
+--- a/test/speedtest1.c
++++ b/test/speedtest1.c
+@@ -917,12 +917,14 @@ void testset_main(void){
+   speedtest1_exec("COMMIT");
+   speedtest1_end_test();
+   speedtest1_begin_test(410, "%d SELECTS on an IPK", n);
++  speedtest1_exec("BEGIN");
+   speedtest1_prepare("SELECT b FROM t5 WHERE a=?1; --  %d times",n);
+   for(i=1; i<=n; i++){
+     x1 = swizzle(i,maxb);
+     sqlite3_bind_int(g.pStmt, 1, (sqlite3_int64)x1);
+     speedtest1_run();
+   }
++  speedtest1_exec("COMMIT");
+   speedtest1_end_test();
+ 
+   sz = n = g.szTest*700;
+@@ -944,6 +946,7 @@ void testset_main(void){
+   speedtest1_exec("COMMIT");
+   speedtest1_end_test();
+   speedtest1_begin_test(510, "%d SELECTS on a TEXT PK", n);
++  speedtest1_exec("BEGIN");
+   speedtest1_prepare("SELECT b FROM t6 WHERE a=?1; --  %d times",n);
+   for(i=1; i<=n; i++){
+     x1 = swizzle(i,maxb);
+@@ -951,6 +954,7 @@ void testset_main(void){
+     sqlite3_bind_text(g.pStmt, 1, zNum, -1, SQLITE_STATIC);
+     speedtest1_run();
+   }
++  speedtest1_exec("COMMIT");
+   speedtest1_end_test();
+   speedtest1_begin_test(520, "%d SELECT DISTINCT", n);
+   speedtest1_exec("SELECT DISTINCT b FROM t5;");
