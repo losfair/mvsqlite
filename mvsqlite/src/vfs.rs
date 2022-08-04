@@ -341,11 +341,8 @@ impl DatabaseHandle for Box<Connection> {
             let (txn, md) = match txn_info {
                 Ok(x) => x,
                 Err(e) => {
-                    panic!(
-                        "unrecoverable transaction initialization failure on nskey {}: {}",
-                        self.client.config().ns_key,
-                        e
-                    );
+                    tracing::error!(ns_key = self.client.config().ns_key, error = %e, "transaction initialization failed");
+                    return Ok(false);
                 }
             };
             let md: Option<NsMetadata> = md.map(|x| serde_json::from_str(&x).unwrap_or_default());

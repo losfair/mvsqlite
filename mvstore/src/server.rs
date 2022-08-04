@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
-    future::FdbSlice,
+    future::{FdbSlice, FdbValues},
     options::{MutationType, StreamingMode},
-    tuple::pack,
+    tuple::{pack, unpack},
     Database, RangeOption, Transaction,
 };
 use futures::{stream::FuturesOrdered, Future, StreamExt};
@@ -101,6 +101,18 @@ pub struct CommitRequest<'a> {
     pub page_index: u32,
     #[serde(with = "serde_bytes")]
     pub hash: &'a [u8],
+}
+
+#[derive(Serialize)]
+pub struct TimeToVersionResponse {
+    pub after: Option<TimeToVersionPoint>,
+    pub not_after: Option<TimeToVersionPoint>,
+}
+
+#[derive(Serialize)]
+pub struct TimeToVersionPoint {
+    pub version: String,
+    pub time: u64,
 }
 
 #[derive(Deserialize)]
@@ -1046,6 +1058,80 @@ impl Server {
                     }
                 }
             }
+            "/time2version" => {
+                let query: HashMap<String, String> = uri
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+                let time_in_seconds = query
+                    .get("t")
+                    .with_context(|| "missing t")?
+                    .parse::<u64>()
+                    .with_context(|| "invalid t")?;
+                let key = self.construct_time2version_key(time_in_seconds);
+                let lower_bound = self.construct_time2version_key(std::u64::MIN);
+                let upper_bound = self.construct_time2version_key(std::u64::MAX);
+                let prefix = self.construct_time2version_prefix();
+                let txn = self.db.create_trx()?;
+
+                let after = txn
+                    .get_range(
+                        &RangeOption {
+                            limit: Some(1),
+                            reverse: true,
+                            mode: StreamingMode::Small,
+                            ..RangeOption::from(lower_bound.clone()..key.clone())
+                        },
+                        0,
+                        true,
+                    )
+                    .await?;
+
+                let not_after = txn
+                    .get_range(
+                        &RangeOption {
+                            limit: Some(1),
+                            reverse: false,
+                            mode: StreamingMode::Small,
+                            ..RangeOption::from(key.clone()..upper_bound.clone())
+                        },
+                        0,
+                        true,
+                    )
+                    .await?;
+                let map_it = |x: FdbValues| -> Option<TimeToVersionPoint> {
+                    if x.len() == 0 || x[0].key().len() < prefix.len() {
+                        None
+                    } else {
+                        let item = &x[0];
+                        let time_suffix = &item.key()[prefix.len()..];
+                        match unpack::<u64>(time_suffix) {
+                            Ok(time_secs) => match <[u8; 10]>::try_from(item.value()) {
+                                Ok(version) => Some(TimeToVersionPoint {
+                                    version: hex::encode(&version),
+                                    time: time_secs,
+                                }),
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
+                        }
+                    }
+                };
+                let after = map_it(after);
+                let not_after = map_it(not_after);
+
+                let body = serde_json::to_vec(&TimeToVersionResponse { after, not_after })
+                    .with_context(|| "cannot serialize time2version response")?;
+
+                res = Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?;
+            }
             _ => {
                 res = Response::builder().status(404).body("not found".into())?;
             }
@@ -1147,6 +1233,11 @@ impl Server {
 
     pub fn construct_globaltask_key(&self, task: &str) -> Vec<u8> {
         let key = pack(&(self.metadata_prefix.as_str(), "globaltask", task));
+        key
+    }
+
+    pub fn construct_time2version_prefix(&self) -> Vec<u8> {
+        let key = pack(&(self.metadata_prefix.as_str(), "time2version"));
         key
     }
 
