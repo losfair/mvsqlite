@@ -227,7 +227,7 @@ jobs:
           git apply ../res/ci/sqlite.patch
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
           ./speedtest1 ./test.db
-          LD_PRELOAD=../build/libmvsqlite_preload.so RUST_LOG=error ./speedtest1 test
+          LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 RUST_LOG=error ./speedtest1 test
   release:
     name: Release
     needs:
