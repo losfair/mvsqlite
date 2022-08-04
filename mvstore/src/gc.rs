@@ -8,14 +8,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use bloom::{BloomFilter, ASMS};
-use foundationdb::{future::FdbKeyValue, options::StreamingMode, RangeOption};
+use foundationdb::{
+    future::FdbKeyValue,
+    options::{ConflictRangeType, StreamingMode},
+    RangeOption,
+};
 
 use crate::{
     lock::DistributedLock,
     server::{ContentIndex, Server},
 };
 
-pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(10000);
+pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
 impl Server {
@@ -287,36 +291,41 @@ impl Server {
             let prefix_len = scan_start.len() - 32;
             let mut count = 0usize;
             loop {
-                let scan_result = loop {
-                    let txn = lock.create_txn_and_check_sync(&self.db).await?;
-                    let range = match txn
-                        .get_range(
-                            &RangeOption {
-                                limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
-                                reverse: false,
-                                mode: StreamingMode::WantAll,
-                                ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
-                            },
-                            0,
-                            true,
-                        )
-                        .await
-                    {
-                        Ok(x) => x,
-                        Err(e) => {
-                            txn.on_error(e).await?;
-                            continue;
-                        }
-                    };
-                    break range;
+                // Step 3, TXN1
+                let mut txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let txn1_rv = match txn.get_read_version().await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        txn.on_error(e).await?;
+                        continue;
+                    }
+                };
+                let scan_result = match txn
+                    .get_range(
+                        &RangeOption {
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                            reverse: false,
+                            mode: StreamingMode::WantAll,
+                            ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
+                        },
+                        0,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(x) => x,
+                    Err(e) => {
+                        txn.on_error(e).await?;
+                        continue;
+                    }
                 };
 
                 if scan_result.len() == 0 {
                     break;
                 }
 
-                scan_cursor = scan_result.last().unwrap().key().to_vec();
-                scan_cursor.push(0x00);
+                let mut next_scan_cursor = scan_result.last().unwrap().key().to_vec();
+                next_scan_cursor.push(0x00);
 
                 let mut delete_queue: Vec<[u8; 32]> = vec![];
                 let now = SystemTime::now()
@@ -356,38 +365,58 @@ impl Server {
                 }
                 drop(scan_result);
 
+                // Fast path: do nothing if there's nothing to do
                 if delete_queue.len() == 0 {
+                    scan_cursor = next_scan_cursor;
                     continue;
                 }
 
-                loop {
-                    let txn = lock.create_txn_and_check_sync(&self.db).await?;
-                    for hash in &delete_queue {
-                        let ci_key = self.construct_contentindex_key(ns_id, *hash);
-                        let content_key = self.construct_content_key(ns_id, *hash);
-                        let delta_referrer_key = self.construct_delta_referrer_key(ns_id, *hash);
-                        txn.clear(&ci_key);
-                        txn.clear(&content_key);
-                        txn.clear(&delta_referrer_key);
-                    }
-                    txn.clear(&commit_token_key);
+                // 3d. Set TXN2.RV to TXN1.RV (after creating TXN2)
+                txn.reset();
+                txn.set_read_version(txn1_rv);
 
-                    if !dry_run {
-                        match txn.commit().await {
-                            Ok(_) => {}
-                            Err(e) => match e.on_error().await {
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    tracing::error!(error = %e, "delete_unreferenced_content: failed to commit transaction");
-                                    break;
-                                }
-                            },
+                for hash in &delete_queue {
+                    let ci_key = self.construct_contentindex_key(ns_id, *hash);
+                    let content_key = self.construct_content_key(ns_id, *hash);
+                    let delta_referrer_key = self.construct_delta_referrer_key(ns_id, *hash);
+
+                    // 3e. Add the CAM index of the remaining pages to the conflict set.
+                    txn.add_conflict_range(
+                        &ci_key,
+                        &ci_key
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(0u8))
+                            .collect::<Vec<u8>>(),
+                        ConflictRangeType::Read,
+                    )?;
+
+                    // 3f. Delete the remaining pages from the CAM.
+                    txn.clear(&ci_key);
+                    txn.clear(&content_key);
+                    txn.clear(&delta_referrer_key);
+                }
+
+                // 3g. Delete COMMIT-TOKEN.
+                txn.clear(&commit_token_key);
+
+                if !dry_run {
+                    match txn.commit().await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            // If this is a busy range we may keep getting
+                            // conflict on contentindex. It isn't worthy to retry in that case.
+                            //
+                            // Just defer to the next GC run.
+                            tracing::warn!(error = %e, "failed to commit GC clear operation, skipping");
                         }
                     }
-                    count += delete_queue.len();
-                    progress_callback(format!("{}\n", count));
-                    break;
                 }
+
+                count += delete_queue.len();
+                progress_callback(format!("{}\n", count));
+
+                scan_cursor = next_scan_cursor;
             }
         }
 

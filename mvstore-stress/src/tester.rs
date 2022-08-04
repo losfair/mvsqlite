@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::RwLock;
 
 use anyhow::Result;
-use mvclient::{MultiVersionClient, Transaction};
+use mvclient::{CommitError, MultiVersionClient, Transaction};
 use rand::{thread_rng, Rng, RngCore};
 
 use crate::inmem::Inmem;
@@ -14,19 +14,24 @@ use crate::inmem::Inmem;
 pub struct Tester {
     mem: RwLock<Inmem>,
     client: Arc<MultiVersionClient>,
-    num_pages: u32,
-    admin_api: String,
     busy_versions: Mutex<BTreeMap<String, u64>>,
+    config: TesterConfig,
+}
+
+pub struct TesterConfig {
+    pub disable_ryw: bool,
+    pub admin_api: String,
+    pub num_pages: u32,
+    pub permit_410: bool,
 }
 
 impl Tester {
-    pub fn new(client: Arc<MultiVersionClient>, admin_api: String, num_pages: u32) -> Arc<Self> {
+    pub fn new(client: Arc<MultiVersionClient>, config: TesterConfig) -> Arc<Self> {
         Arc::new(Self {
             mem: RwLock::new(Inmem::new()),
             client,
-            num_pages,
-            admin_api,
             busy_versions: Mutex::new(BTreeMap::new()),
+            config,
         })
     }
 
@@ -92,7 +97,7 @@ impl Tester {
             });
             tracing::info!(remove_point = remove_point, "triggering truncation");
             match rc
-                .post(format!("{}/api/truncate_namespace", self.admin_api,))
+                .post(format!("{}/api/truncate_namespace", self.config.admin_api,))
                 .json(&payload)
                 .send()
                 .await
@@ -115,7 +120,7 @@ impl Tester {
     async fn delete_unreferenced_content_worker(self: Arc<Self>) {
         let rc = reqwest::Client::new();
         loop {
-            let sleep_dur_ms = rand::thread_rng().gen_range(1..10000);
+            let sleep_dur_ms = rand::thread_rng().gen_range(1..5000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
             tokio::time::sleep(sleep_dur).await;
             let payload = serde_json::json!({
@@ -126,7 +131,7 @@ impl Tester {
             match rc
                 .post(format!(
                     "{}/api/delete_unreferenced_content",
-                    self.admin_api,
+                    self.config.admin_api,
                 ))
                 .json(&payload)
                 .send()
@@ -166,23 +171,27 @@ impl Tester {
         }
     }
 
-    async fn task(self: Arc<Self>, task_id: usize, iterations: usize) -> Result<()> {
+    async fn task(self: Arc<Self>, _task_id: usize, iterations: usize) -> Result<()> {
         let mut mem = self.mem.write().await;
         let mut txn = self.client.create_transaction().await?;
         let mut txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
         drop(mem);
 
-        let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.num_pages as usize];
-        for it in 0..iterations {
+        let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.config.num_pages as usize];
+        for _ in 0..iterations {
             let mode = rand::thread_rng().gen_range(0..11);
             //tracing::info!(task = task_id, iteration = it, mode = mode, "iteration");
             match mode {
                 0..=5 => {
-                    let num_reads = rand::thread_rng().gen_range(1..=10);
-                    let reads = (0..num_reads)
-                        .map(|_| rand::thread_rng().gen_range::<u32, _>(0..self.num_pages))
+                    let num_reads_requested = rand::thread_rng().gen_range(1..=10);
+                    let reads = (0..num_reads_requested)
+                        .map(|_| rand::thread_rng().gen_range::<u32, _>(0..self.config.num_pages))
+                        .filter(|x| !self.config.disable_ryw || !txn.page_is_written(*x))
                         .collect::<Vec<_>>();
+                    if reads.len() == 0 {
+                        continue;
+                    }
                     let pages = txn.read_many(&reads).await?;
                     let mem = self.mem.read().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
@@ -195,7 +204,7 @@ impl Tester {
                     let writes = (0..num_writes)
                         .map(|_| {
                             let mut rng = rand::thread_rng();
-                            let index = rng.gen_range::<u32, _>(0..self.num_pages);
+                            let index = rng.gen_range::<u32, _>(0..self.config.num_pages);
 
                             // Test delta encoding
                             let data = {
@@ -234,11 +243,30 @@ impl Tester {
                 8 => {
                     let mut mem = self.mem.write().await;
                     let version = txn.version().to_string();
-                    match txn.commit(None).await? {
-                        Some(info) => {
+                    match txn.commit(None).await {
+                        Ok(Some(info)) => {
                             mem.commit_transaction(txn_id, &info.version);
                         }
-                        None => mem.drop_transaction(txn_id),
+                        Ok(None) => mem.drop_transaction(txn_id),
+                        Err(e) => {
+                            let mut ignore = false;
+                            if let Some(x) = e.downcast_ref::<CommitError>() {
+                                match x {
+                                    CommitError::Status(code)
+                                        if code.as_u16() == 410 && self.config.permit_410 =>
+                                    {
+                                        tracing::warn!("ignored http 410 as requested");
+                                        ignore = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if ignore {
+                                mem.drop_transaction(txn_id);
+                            } else {
+                                return Err(e);
+                            }
+                        }
                     }
                     self.release_version(&version);
                     drop(mem);

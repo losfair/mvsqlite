@@ -1004,7 +1004,7 @@ impl Server {
                 {
                     CommitResult::BadPageReference => {
                         res = Response::builder()
-                            .status(400)
+                            .status(410)
                             .body(Body::from("bad page reference"))?;
                     }
                     CommitResult::Committed { versionstamp } => {

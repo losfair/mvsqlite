@@ -5,7 +5,7 @@ use anyhow::Result;
 use backtrace::Backtrace;
 use mvclient::{MultiVersionClient, MultiVersionClientConfig};
 use structopt::StructOpt;
-use tester::Tester;
+use tester::{Tester, TesterConfig};
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
 
 #[derive(Debug, StructOpt)]
@@ -38,6 +38,14 @@ struct Opt {
     /// Number of pages.
     #[structopt(long)]
     pages: u32,
+
+    /// Disable read-your-writes tests.
+    #[structopt(long)]
+    disable_ryw: bool,
+
+    /// Permit HTTP 410 commit responses.
+    #[structopt(long)]
+    permit_410: bool,
 }
 
 #[tokio::main]
@@ -66,7 +74,15 @@ async fn main() -> Result<()> {
         data_plane: opt.data_plane.parse()?,
         ns_key: opt.ns_key.clone(),
     })?;
-    let t = Tester::new(client.clone(), opt.admin_api.clone(), opt.pages);
+    let t = Tester::new(
+        client.clone(),
+        TesterConfig {
+            admin_api: opt.admin_api.clone(),
+            num_pages: opt.pages,
+            disable_ryw: opt.disable_ryw,
+            permit_410: opt.permit_410,
+        },
+    );
     t.run(opt.concurrency as _, opt.iterations as _).await;
     println!("Test succeeded.");
     Ok(())

@@ -9,6 +9,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     RequestBuilder, StatusCode, Url,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -17,9 +18,14 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore};
 
-use serde::{Deserialize, Serialize};
+#[derive(Debug, Error)]
+pub enum CommitError {
+    #[error("commit error: {0:?}")]
+    Status(StatusCode),
+}
 
 pub struct MultiVersionClient {
     client: reqwest::Client,
@@ -180,6 +186,10 @@ struct TxnAsyncCtx {
 impl Transaction {
     pub fn version(&self) -> &str {
         self.version.as_str()
+    }
+
+    pub fn page_is_written(&self, page_id: u32) -> bool {
+        self.page_buffer.contains_key(&page_id)
     }
 
     fn check_async_error(&self) -> Result<()> {
@@ -425,7 +435,7 @@ impl Transaction {
                     if status.as_u16() == 409 {
                         return Ok(None);
                     }
-                    anyhow::bail!("commit failed: {}", status);
+                    return Err(CommitError::Status(status).into());
                 }
             };
             let committed_version = headers
