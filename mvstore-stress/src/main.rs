@@ -85,5 +85,8 @@ async fn main() -> Result<()> {
     );
     t.run(opt.concurrency as _, opt.iterations as _).await;
     println!("Test succeeded.");
-    Ok(())
+
+    // Otherwise we might get "ERROR mvstore_stress: panicked at 'dispatch dropped without returning error', /home/runner/.cargo/registry/src/github.com-1ecc6299db9ec823/hyper-0.14.20/src/client/conn.rs:397:35".
+    // https://github.com/losfair/mvsqlite/runs/7676519092
+    std::process::exit(0);
 }
