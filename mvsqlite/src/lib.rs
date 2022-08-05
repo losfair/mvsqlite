@@ -1,11 +1,13 @@
+pub mod commit_group;
 pub mod io_engine;
-pub mod sqlite;
+#[allow(non_snake_case, non_camel_case_types)]
+pub mod sqlite_c;
 pub mod sqlite_vfs;
 pub mod vfs;
+
 use std::sync::Arc;
 
 use backtrace::Backtrace;
-use sqlite::SqlitePtr;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
 
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
@@ -44,4 +46,4 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub extern "C" fn init_mvsqlite_connection(_db: SqlitePtr) {}
+pub extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {}
