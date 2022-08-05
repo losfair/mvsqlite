@@ -79,26 +79,37 @@ pub struct WriteResponse<'a> {
 }
 
 #[derive(Serialize)]
-pub struct CommitInit<'a> {
-    pub version: &'a str,
-    pub metadata: Option<&'a str>,
-    pub num_pages: u32,
-
+pub struct CommitGlobalInit<'a> {
     #[serde(with = "serde_bytes")]
     pub idempotency_key: &'a [u8],
+
+    pub num_namespaces: usize,
 }
 
 #[derive(Serialize)]
-pub struct CommitRequest<'a> {
+pub struct CommitNamespaceInit {
+    pub ns_key: String,
+    pub version: String,
+    pub metadata: Option<String>,
+    pub num_pages: u32,
+}
+
+#[derive(Serialize)]
+pub struct CommitRequest {
     pub page_index: u32,
     #[serde(with = "serde_bytes")]
-    pub hash: &'a [u8],
+    pub hash: Vec<u8>,
 }
 
 pub struct CommitResult {
     pub version: String,
     pub duration: Duration,
     pub num_pages: u64,
+}
+
+pub struct NamespaceCommitIntent {
+    pub init: CommitNamespaceInit,
+    pub requests: Vec<CommitRequest>,
 }
 
 impl MultiVersionClient {
@@ -165,6 +176,81 @@ impl MultiVersionClient {
         };
 
         txn
+    }
+
+    pub async fn apply_commit_intents(
+        &self,
+        intents: &[NamespaceCommitIntent],
+    ) -> Result<Option<CommitResult>> {
+        if intents.is_empty() {
+            anyhow::bail!("no commit intents");
+        }
+
+        let start_time = Instant::now();
+        let mut url = self.config.data_plane.clone();
+        url.set_path("/batch/commit");
+        let mut raw_request: Vec<u8> = Vec::new();
+
+        let mut idempotency_key: [u8; 16] = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut idempotency_key);
+
+        let global_init = CommitGlobalInit {
+            idempotency_key: &idempotency_key[..],
+            num_namespaces: intents.len(),
+        };
+
+        {
+            let serialized = rmp_serde::to_vec_named(&global_init)?;
+            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
+            raw_request.extend_from_slice(&serialized);
+        }
+
+        let mut total_num_pages: usize = 0;
+
+        for intent in intents {
+            let serialized = rmp_serde::to_vec_named(&intent.init)?;
+            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
+            raw_request.extend_from_slice(&serialized);
+            for req in &intent.requests {
+                let serialized = rmp_serde::to_vec_named(&req)?;
+                raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
+                raw_request.extend_from_slice(&serialized);
+            }
+            total_num_pages += intent.requests.len();
+        }
+
+        let raw_request = Bytes::from(raw_request);
+        let mut boff = RandomizedExponentialBackoff::default();
+
+        loop {
+            let response = request_and_check_returning_status(
+                self.client.post(url.clone()).body(raw_request.clone()),
+            )
+            .await;
+            let (headers, _) = match response {
+                Ok(Some(x)) => x,
+                Ok(None) => {
+                    boff.wait().await;
+                    continue;
+                }
+                Err(status) => {
+                    if status.as_u16() == 409 {
+                        return Ok(None);
+                    }
+                    return Err(CommitError::Status(status).into());
+                }
+            };
+            let committed_version = headers
+                .get("x-committed-version")
+                .with_context(|| format!("missing committed version header"))?
+                .to_str()?;
+            tracing::debug!(version = committed_version, "committed transaction");
+            return Ok(Some(CommitResult {
+                version: committed_version.into(),
+                duration: start_time.elapsed(),
+                num_pages: total_num_pages as u64,
+            }));
+        }
     }
 }
 
@@ -373,82 +459,51 @@ impl Transaction {
         Ok(())
     }
 
-    pub async fn commit(self, metadata: Option<&str>) -> Result<Option<CommitResult>> {
-        if self.page_buffer.is_empty() && metadata.is_none() {
-            return Ok(Some(CommitResult {
-                version: self.version,
-                duration: self.start_time.elapsed(),
-                num_pages: 0,
-            }));
-        }
-
-        let mut idempotency_key: [u8; 16] = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut idempotency_key);
-
+    pub async fn commit_intent(
+        &self,
+        metadata: Option<String>,
+    ) -> Result<Option<NamespaceCommitIntent>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
 
-        let mut url = self.c.config.data_plane.clone();
-        url.set_path("/batch/commit");
-        let mut raw_request: Vec<u8> = Vec::new();
+        if self.page_buffer.is_empty() && metadata.is_none() {
+            return Ok(None);
+        }
 
-        let init = CommitInit {
-            version: self.version.as_str(),
-            metadata,
-            num_pages: self.page_buffer.len() as u32,
-            idempotency_key: &idempotency_key[..],
+        let mut out = NamespaceCommitIntent {
+            init: CommitNamespaceInit {
+                version: self.version.clone(),
+                metadata,
+                num_pages: self.page_buffer.len() as u32,
+                ns_key: self.c.config.ns_key.clone(),
+            },
+            requests: Vec::with_capacity(self.page_buffer.len()),
         };
 
-        {
-            let serialized = rmp_serde::to_vec_named(&init)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-        }
-
         for (&page_index, hash) in self.page_buffer.iter() {
-            let req = CommitRequest { page_index, hash };
-            let serialized = rmp_serde::to_vec_named(&req)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-        }
-
-        if raw_request.len() > 8 * 1024 * 1024 {
-            anyhow::bail!("transaction too large");
-        }
-
-        let raw_request = Bytes::from(raw_request);
-        let mut boff = RandomizedExponentialBackoff::default();
-
-        loop {
-            let response = request_and_check_returning_status(
-                self.c.client.post(url.clone()).body(raw_request.clone()),
-            )
-            .await;
-            let (headers, _) = match response {
-                Ok(Some(x)) => x,
-                Ok(None) => {
-                    boff.wait().await;
-                    continue;
-                }
-                Err(status) => {
-                    if status.as_u16() == 409 {
-                        return Ok(None);
-                    }
-                    return Err(CommitError::Status(status).into());
-                }
+            let req = CommitRequest {
+                page_index,
+                hash: hash.to_vec(),
             };
-            let committed_version = headers
-                .get("x-committed-version")
-                .with_context(|| format!("missing committed version header"))?
-                .to_str()?;
-            tracing::debug!(version = committed_version, "committed transaction");
-            return Ok(Some(CommitResult {
-                version: committed_version.into(),
-                duration: self.start_time.elapsed(),
-                num_pages: self.page_buffer.len() as u64,
-            }));
+            out.requests.push(req);
         }
+
+        Ok(Some(out))
+    }
+
+    pub async fn commit(self, metadata: Option<&str>) -> Result<Option<CommitResult>> {
+        let intent = match self.commit_intent(metadata.map(|x| x.to_string())).await? {
+            Some(x) => x,
+            None => {
+                return Ok(Some(CommitResult {
+                    version: self.version,
+                    duration: self.start_time.elapsed(),
+                    num_pages: 0,
+                }))
+            }
+        };
+        self.c.apply_commit_intents(&[intent]).await
     }
 }
 

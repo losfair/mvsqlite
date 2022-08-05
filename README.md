@@ -20,7 +20,7 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - **Full feature-set from SQLite**: mvsqlite integrates with SQLite using a custom [VFS](https://www.sqlite.org/vfs.html) layer.
 - **Time travel**: Checkout the snapshot of your database at any point of time in the past.
-- **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be 50x larger than FDB's native one.
+- **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
 - **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
 
 ### Upcoming features

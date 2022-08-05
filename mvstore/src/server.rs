@@ -7,7 +7,7 @@ use foundationdb::{
     Database, RangeOption, Transaction,
 };
 use futures::{stream::FuturesOrdered, Future, StreamExt};
-use hyper::{body::HttpBody, Body, Request, Response};
+use hyper::{Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,14 +24,15 @@ use tokio_util::{
 };
 
 use crate::{
-    commit::{CommitContext, CommitResult},
+    commit::{CommitContext, CommitNamespaceContext, CommitResult},
     lock::DistributedLock,
 };
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
-const COMMIT_MESSAGE_SIZE: usize = 9 * 1024 * 1024; // 9 MiB
 const MAX_PAGE_SIZE: usize = 8192;
 const MAX_PAGES_PER_BATCH_READ: usize = 100;
+const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
+const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 
 pub struct Server {
@@ -87,13 +88,19 @@ pub struct WriteResponse<'a> {
 }
 
 #[derive(Deserialize)]
-pub struct CommitInit<'a> {
-    pub version: &'a str,
-    pub metadata: Option<&'a str>,
-    pub num_pages: u32,
-
+pub struct CommitGlobalInit<'a> {
     #[serde(with = "serde_bytes")]
     pub idempotency_key: &'a [u8],
+
+    pub num_namespaces: usize,
+}
+
+#[derive(Deserialize)]
+pub struct CommitNamespaceInit<'a> {
+    pub version: &'a str,
+    pub ns_key: &'a str,
+    pub metadata: Option<&'a str>,
+    pub num_pages: u32,
 }
 
 #[derive(Deserialize)]
@@ -569,32 +576,33 @@ impl Server {
         self: Arc<Self>,
         req: Request<Body>,
     ) -> Result<Response<Body>> {
-        let ns_key = match req
-            .headers()
-            .get("x-namespace-key")
-            .and_then(|x| x.to_str().ok())
-        {
-            Some(x) => x,
-            None => {
-                return Ok(Response::builder()
-                    .status(400)
-                    .body(Body::from("missing or invalid x-namespace-key"))
-                    .unwrap())
-            }
-        };
-        let ns_id = self.lookup_nskey(ns_key).await?;
-        let ns_id = match ns_id {
-            Some(x) => x,
-            None => {
-                return Ok(Response::builder()
-                    .status(404)
-                    .body(Body::from("namespace not found"))?)
-            }
+        let ns_id = if let Some(ns_key) = req.headers().get("x-namespace-key") {
+            let ns_key = match ns_key.to_str() {
+                Ok(x) => x,
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(400)
+                        .body(Body::from("invalid x-namespace-key"))
+                        .unwrap())
+                }
+            };
+            let ns_id = self.lookup_nskey(ns_key).await?;
+            let ns_id = match ns_id {
+                Some(x) => x,
+                None => {
+                    return Ok(Response::builder()
+                        .status(404)
+                        .body(Body::from("namespace not found"))?)
+                }
+            };
+            Some(ns_id)
+        } else {
+            None
         };
         match self.do_serve_data_plane_stage2(ns_id, req).await {
             Ok(res) => Ok(res),
             Err(e) => {
-                let ns_id_hex = hex::encode(&ns_id);
+                let ns_id_hex = ns_id.map(|x| hex::encode(&x)).unwrap_or_default();
                 tracing::warn!(ns = ns_id_hex, error = %e, "stage 2 failure");
                 Ok(Response::builder().status(500).body(Body::empty())?)
             }
@@ -632,14 +640,24 @@ impl Server {
 
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
-        ns_id: [u8; 10],
-        mut req: Request<Body>,
+        ns_id: Option<[u8; 10]>,
+        req: Request<Body>,
     ) -> Result<Response<Body>> {
-        let ns_id_hex = hex::encode(&ns_id);
+        let require_ns_id = || match ns_id {
+            Some(x) => Ok((x, hex::encode(&x))),
+            None => Err(Response::builder()
+                .status(400)
+                .body(Body::from("this operation requires x-namespace-key"))
+                .unwrap()),
+        };
         let uri = req.uri();
         let res: Response<Body>;
         match uri.path() {
             "/stat" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
                 let txn = self.db.create_trx()?;
                 let buf = self.get_read_version_as_versionstamp(&txn).await?;
                 let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
@@ -661,6 +679,10 @@ impl Server {
                     .body(Body::from(stat))?;
             }
             "/read" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
                 let query: HashMap<String, String> = uri
                     .query()
                     .map(|v| {
@@ -694,6 +716,10 @@ impl Server {
                 }
             }
             "/batch/read" => {
+                let (ns_id, ns_id_hex) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
                 let body = req.into_body();
                 let mut body = new_body_reader(body);
                 let (mut res_sender, res_body) = Body::channel();
@@ -833,6 +859,10 @@ impl Server {
                 });
             }
             "/batch/write" => {
+                let (ns_id, ns_id_hex) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
                 let body = req.into_body();
                 let mut body = new_body_reader(body);
                 let (mut res_sender, res_body) = Body::channel();
@@ -992,54 +1022,94 @@ impl Server {
                 });
             }
             "/batch/commit" => {
-                let commit_message = self.check_and_read_commit_message(req.body_mut()).await?;
-                let mut reader = FramedRead::new(
-                    &commit_message[..],
-                    LengthDelimitedCodec::builder()
-                        .max_frame_length(MAX_MESSAGE_SIZE)
-                        .new_codec(),
-                );
+                // x-namespace-key ignored
+                let body = req.into_body();
+                let mut reader = new_body_reader(body);
 
-                let commit_init = reader
+                let commit_global_init = reader
                     .next()
                     .await
-                    .with_context(|| "missing commit init")?
-                    .with_context(|| "invalid commit init")?;
-                let commit_init: CommitInit = rmp_serde::from_slice(&commit_init)
-                    .with_context(|| "error deserializing commit init")?;
+                    .with_context(|| "missing commit global init")?
+                    .with_context(|| "invalid commit global init")?;
+                let commit_global_init: CommitGlobalInit =
+                    rmp_serde::from_slice(&commit_global_init)
+                        .with_context(|| "error deserializing commit global init")?;
 
-                let client_assumed_version = decode_version(&commit_init.version)?;
-                let idempotency_key = <[u8; 16]>::try_from(commit_init.idempotency_key)
+                if commit_global_init.num_namespaces < 1
+                    || commit_global_init.num_namespaces > MAX_NUM_NAMESPACES_PER_COMMIT
+                {
+                    return Ok(Response::builder()
+                        .status(412)
+                        .body(Body::from("num_namespaces out of bound"))?);
+                }
+
+                let idempotency_key = <[u8; 16]>::try_from(commit_global_init.idempotency_key)
                     .with_context(|| "invalid idempotency key")?;
 
-                // Decode data
-                let mut index_writes: Vec<(u32, [u8; 32])> = Vec::new();
+                let mut ns_contexts: Vec<CommitNamespaceContext> =
+                    Vec::with_capacity(commit_global_init.num_namespaces);
+                let mut total_page_count: usize = 0;
 
-                for _ in 0..commit_init.num_pages {
-                    let message = match reader.next().await {
-                        Some(x) => x.with_context(|| "error reading commit request")?,
-                        None => anyhow::bail!("early end of commit stream"),
-                    };
-                    let commit_req: CommitRequest = rmp_serde::from_slice(&message)
-                        .with_context(|| "error deserializing commit request")?;
-                    if commit_req.hash.len() != 32 {
+                for _ in 0..commit_global_init.num_namespaces {
+                    let init = reader
+                        .next()
+                        .await
+                        .with_context(|| "missing commit init")?
+                        .with_context(|| "invalid commit init")?;
+                    let init: CommitNamespaceInit = rmp_serde::from_slice(&init)
+                        .with_context(|| "error deserializing commit init")?;
+                    if total_page_count.saturating_add(init.num_pages as usize)
+                        > MAX_PAGES_PER_COMMIT
+                    {
                         return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("invalid hash"))?);
+                            .status(413)
+                            .body(Body::from("too many pages in commit"))?);
                     }
-                    index_writes.push((
-                        commit_req.page_index,
-                        <[u8; 32]>::try_from(commit_req.hash).unwrap(),
-                    ));
+                    total_page_count += init.num_pages as usize;
+
+                    let ns_id = match self.lookup_nskey(init.ns_key).await? {
+                        Some(x) => x,
+                        None => {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Body::from("namespace not found"))?);
+                        }
+                    };
+
+                    let client_assumed_version = decode_version(&init.version)?;
+
+                    let mut ns_ctx = CommitNamespaceContext {
+                        ns_id,
+                        client_assumed_version,
+                        index_writes: Vec::new(),
+                        metadata: init.metadata.map(|x| x.to_string()),
+                    };
+
+                    for _ in 0..init.num_pages {
+                        let message = match reader.next().await {
+                            Some(x) => x.with_context(|| "error reading commit request")?,
+                            None => anyhow::bail!("early end of commit stream"),
+                        };
+                        let commit_req: CommitRequest = rmp_serde::from_slice(&message)
+                            .with_context(|| "error deserializing commit request")?;
+                        if commit_req.hash.len() != 32 {
+                            return Ok(Response::builder()
+                                .status(400)
+                                .body(Body::from("invalid hash"))?);
+                        }
+                        ns_ctx.index_writes.push((
+                            commit_req.page_index,
+                            <[u8; 32]>::try_from(commit_req.hash).unwrap(),
+                        ));
+                    }
+
+                    ns_contexts.push(ns_ctx);
                 }
 
                 match self
                     .commit(CommitContext {
-                        ns_id,
-                        client_assumed_version,
                         idempotency_key,
-                        metadata: commit_init.metadata,
-                        index_writes: &index_writes,
+                        namespaces: &ns_contexts,
                     })
                     .await?
                 {
@@ -1138,22 +1208,6 @@ impl Server {
         }
 
         Ok(res)
-    }
-
-    async fn check_and_read_commit_message(&self, body: &mut Body) -> Result<Bytes> {
-        let response_content_length = match HttpBody::size_hint(body).upper() {
-            Some(v) => v,
-            None => (COMMIT_MESSAGE_SIZE as u64) + 1,
-        };
-
-        if response_content_length <= COMMIT_MESSAGE_SIZE as u64 {
-            let body_bytes = hyper::body::to_bytes(body)
-                .await
-                .with_context(|| "failed to read commit message")?;
-            Ok(body_bytes)
-        } else {
-            anyhow::bail!("commit message too large");
-        }
     }
 
     async fn read_page_hash(
