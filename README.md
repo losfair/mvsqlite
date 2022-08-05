@@ -6,7 +6,6 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - [mvsqlite](#mvsqlite)
   - [Features](#features)
-    - [Upcoming features](#upcoming-features)
   - [Comparison with dqlite and rqlite](#comparison-with-dqlite-and-rqlite)
   - [Demo](#demo)
   - [Try it](#try-it)
@@ -20,13 +19,9 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - **Full feature-set from SQLite**: mvsqlite integrates with SQLite using a custom [VFS](https://www.sqlite.org/vfs.html) layer.
 - **Time travel**: Checkout the snapshot of your database at any point of time in the past.
+- **Zero-overhead multi-database transactions**: While each SQLite database remains single-writer, you can horizontally scale your application with multi-database strictly serializable transactions without additional overhead. [How to use](https://github.com/losfair/mvsqlite/wiki/Commit-group)
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
 - **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
-
-### Upcoming features
-
-- **Branching**: Create a writable snapshot from a past version of your database.
-- **Zero-overhead cross-database transactions**: While each SQLite database remains single-writer, you can horizontally scale your application with cross-database serializable transactions without additional overhead.
 
 ## Comparison with dqlite and rqlite
 
@@ -38,6 +33,7 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 - **(+)**: mvsqlite is a drop-in replacement. To run existing applications with mvsqlite, setting `LD_PRELOAD` is enough.
 - **(+)**: mvsqlite runs on a production-grade distributed key-value store, FoundationDB, instead of implementing its own consensus subsystem.
 - **(+)**: mvsqlite has advanced multi-version features like point-in-time snapshot reads.
+- **(+)**: Writes to mvsqlite can be horizontally scaled with serializable multi-database transactions.
 - **(-)**: Reads in mvsqlite are sensitive to network latency. The client is stateless, and data needs to be fetched from FDB on demand.
 - **(-)**: mvsqlite is a little more complex to deploy than the alternative.
   - Three moving parts: FoundationDB, `mvstore`, and `libmvsqlite_preload.so`, instead of a single library.

@@ -2,6 +2,8 @@ pub mod commit_group;
 pub mod io_engine;
 #[allow(non_snake_case, non_camel_case_types)]
 pub mod sqlite_c;
+#[allow(non_snake_case, non_camel_case_types)]
+pub mod sqlite_misc;
 pub mod sqlite_vfs;
 pub mod vfs;
 
@@ -46,4 +48,44 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {}
+pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
+    let mv_commitgroup_begin_name = b"mv_commitgroup_begin\0";
+    let mv_commitgroup_commit_name = b"mv_commitgroup_commit\0";
+    let mv_commitgroup_drop_name = b"mv_commitgroup_drop\0";
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_commitgroup_begin_name.as_ptr() as *const i8,
+        0,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(commit_group::mv_commitgroup_begin),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_commitgroup_commit_name.as_ptr() as *const i8,
+        0,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(commit_group::mv_commitgroup_commit),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_commitgroup_drop_name.as_ptr() as *const i8,
+        0,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(commit_group::mv_commitgroup_drop),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+}

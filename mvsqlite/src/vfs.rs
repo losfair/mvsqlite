@@ -9,6 +9,7 @@ use std::{
 use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
+    commit_group::CURRENT_COMMIT_GROUP,
     io_engine::IoEngine,
     sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
 };
@@ -330,6 +331,13 @@ impl DatabaseHandle for Box<Connection> {
         }
 
         if self.txn.is_none() {
+            if CURRENT_COMMIT_GROUP.with(|x| x.borrow().is_some()) {
+                tracing::error!(
+                    "attempting to lock database on a thread with an active commit group"
+                );
+                return Ok(false);
+            }
+
             let txn_info = if let Some(version) = &self.fixed_version {
                 Ok((self.client.create_transaction_at_version(version), None))
             } else {
@@ -438,21 +446,41 @@ impl DatabaseHandle for Box<Connection> {
                 .txn
                 .take()
                 .expect("did not find transaction for commit");
-            let result = self
-                .io
-                .run(async { txn.commit(md.as_ref().map(|x| x.as_str())).await });
 
-            // At this point we don't have a reliable way to propagate the error. So, we have
-            // to abort the process.
-            let result = result.expect("transaction commit failed");
-            let result = result.expect("transaction conflict");
-            tracing::info!(version = result.version, duration = ?result.duration, num_pages = result.num_pages, "transaction committed");
-            self.txn = Some(self.client.create_transaction_at_version(&result.version));
+            let mut cg_ok = false;
+
+            CURRENT_COMMIT_GROUP
+                .with(|cg| {
+                    let mut cg = cg.borrow_mut();
+                    if let Some(cg) = &mut *cg {
+                        cg_ok = true;
+                        let intent = self.io.run(async { txn.commit_intent(md.clone()).await })?;
+                        if let Some(intent) = intent {
+                            cg.set_client_and_io(&self.client, &self.io);
+                            cg.append(intent);
+                            tracing::info!("added intent to commit group");
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .expect("failed to append to commit group");
+
+            if !cg_ok {
+                let result = self
+                    .io
+                    .run(async { txn.commit(md.as_ref().map(|x| x.as_str())).await });
+
+                // At this point we don't have a reliable way to propagate the error. So, we have
+                // to abort the process.
+                let result = result.expect("transaction commit failed");
+                let result = result.expect("transaction conflict");
+                tracing::info!(version = result.version, duration = ?result.duration, num_pages = result.num_pages, "transaction committed");
+            }
         }
 
         if lock == LockKind::None {
             // All locks dropped
-            self.txn.take().expect("unlocked without locking");
+            self.txn = None;
             self.txn_buffered_page = HashMap::new();
             self.txn_metadata = None;
             self.history.prev_index = 0;
