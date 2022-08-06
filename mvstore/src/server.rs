@@ -1336,6 +1336,13 @@ impl Server {
         page_version_hex: &str,
     ) -> Result<Option<(String, [u8; 32])>> {
         let page_version = decode_version(&page_version_hex)?;
+        if self.read_only {
+            let current_rv = txn.get_read_version().await?;
+            let requested_rv = i64::from_be_bytes(page_version[0..8].try_into().unwrap());
+            if current_rv < requested_rv {
+                anyhow::bail!("this replica does not have the requested read version");
+            }
+        }
         let scan_end = self.construct_page_key(ns_id, page_index, page_version);
         let scan_start = self.construct_page_key(ns_id, page_index, [0u8; 10]);
         let page_vec = txn
