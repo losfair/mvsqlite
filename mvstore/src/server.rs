@@ -57,6 +57,7 @@ pub struct ServerConfig {
 pub struct StatResponse<'a> {
     pub version: String,
     pub metadata: &'a str,
+    pub read_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -770,6 +771,7 @@ impl Server {
                 let stat = StatResponse {
                     version: hex::encode(&buf),
                     metadata: nsmd,
+                    read_only: self.read_only,
                 };
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
