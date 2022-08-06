@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::{FdbSlice, FdbValues},
-    options::{MutationType, StreamingMode},
+    options::{MutationType, StreamingMode, TransactionOption},
     tuple::{pack, unpack},
     Database, RangeOption, Transaction,
 };
@@ -42,12 +42,15 @@ pub struct Server {
 
     nskey_cache: Cache<String, [u8; 10]>,
     read_version_cache: Cache<[u8; 10], i64>,
+
+    read_only: bool,
 }
 
 pub struct ServerConfig {
     pub cluster: String,
     pub raw_data_prefix: String,
     pub metadata_prefix: String,
+    pub read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -195,6 +198,7 @@ impl Server {
                 .time_to_live(Duration::from_secs(2))
                 .max_capacity(1000)
                 .build(),
+            read_only: config.read_only,
         }))
     }
 
@@ -636,15 +640,20 @@ impl Server {
             .try_get_with(nskey.to_string(), async {
                 let txn = self.db.create_trx();
                 match txn {
-                    Ok(txn) => match txn.get(&self.construct_nskey_key(nskey), false).await {
-                        Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
-                            .with_context(|| "invalid namespace id")
-                            .map_err(GetError::Other),
-                        Ok(None) => Err(GetError::NotFound),
-                        Err(e) => Err(GetError::Other(
-                            anyhow::Error::from(e).context("transaction failed"),
-                        )),
-                    },
+                    Ok(txn) => {
+                        if self.read_only {
+                            txn.set_option(TransactionOption::ReadLockAware).unwrap();
+                        }
+                        match txn.get(&self.construct_nskey_key(nskey), false).await {
+                            Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
+                                .with_context(|| "invalid namespace id")
+                                .map_err(GetError::Other),
+                            Ok(None) => Err(GetError::NotFound),
+                            Err(e) => Err(GetError::Other(
+                                anyhow::Error::from(e).context("transaction failed"),
+                            )),
+                        }
+                    }
                     Err(e) => Err(GetError::Other(
                         anyhow::Error::from(e).context("transaction creation failed"),
                     )),
@@ -709,6 +718,9 @@ impl Server {
     async fn create_versioned_read_txn(&self, version: &str) -> Result<Transaction> {
         let version = decode_version(version)?;
         let txn = self.db.create_trx()?;
+        if self.read_only {
+            txn.set_option(TransactionOption::ReadLockAware).unwrap();
+        }
         let mut grv_called = false;
         let fdb_rv = self
             .read_version_cache
@@ -745,6 +757,9 @@ impl Server {
                     Err(x) => return Ok(x),
                 };
                 let txn = self.db.create_trx()?;
+                if self.read_only {
+                    txn.set_option(TransactionOption::ReadLockAware).unwrap();
+                }
                 let buf = self.get_read_version_as_versionstamp(&txn).await?;
                 let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
                 let nsmd = nsmd
@@ -861,6 +876,11 @@ impl Server {
                                             break Err(());
                                         }
                                     };
+
+                                    if me.read_only {
+                                        txn.set_option(TransactionOption::ReadLockAware).unwrap();
+                                    }
+
                                     let hash = match <[u8; 32]>::try_from(hash) {
                                         Ok(x) => x,
                                         Err(e) => {
@@ -945,6 +965,10 @@ impl Server {
                 });
             }
             "/batch/write" => {
+                if self.read_only {
+                    return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
+                }
+
                 let (ns_id, ns_id_hex) = match require_ns_id() {
                     Ok(x) => x,
                     Err(x) => return Ok(x),
@@ -1108,6 +1132,10 @@ impl Server {
                 });
             }
             "/batch/commit" => {
+                if self.read_only {
+                    return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
+                }
+
                 // x-namespace-key ignored
                 let body = req.into_body();
                 let mut reader = new_body_reader(body);
@@ -1233,6 +1261,10 @@ impl Server {
                 let upper_bound = self.construct_time2version_key(std::u64::MAX);
                 let prefix = self.construct_time2version_prefix();
                 let txn = self.db.create_trx()?;
+
+                if self.read_only {
+                    txn.set_option(TransactionOption::ReadLockAware).unwrap();
+                }
 
                 let after = txn
                     .get_range(

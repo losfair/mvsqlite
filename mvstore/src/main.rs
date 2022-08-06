@@ -84,6 +84,10 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
 
+    /// Whether this instance is read-only. This enables replica-read from FDB DR replica.
+    #[structopt(long)]
+    read_only: bool,
+
     /// ADVANCED. Configure the GC scan batch size.
     #[structopt(long, env = "MVSTORE_KNOB_GC_SCAN_BATCH_SIZE")]
     knob_gc_scan_batch_size: Option<usize>,
@@ -117,10 +121,13 @@ async fn async_main(opt: Opt) -> Result<()> {
         cluster: opt.cluster.clone(),
         raw_data_prefix: opt.raw_data_prefix.clone(),
         metadata_prefix: opt.metadata_prefix.clone(),
+        read_only: opt.read_only,
     })
     .with_context(|| "failed to initialize server")?;
 
-    server.clone().spawn_background_tasks();
+    if !opt.read_only {
+        server.clone().spawn_background_tasks();
+    }
 
     let data_plane_server = {
         let server = server.clone();
@@ -132,13 +139,26 @@ async fn async_main(opt: Opt) -> Result<()> {
         }))
     };
 
-    let admin_api_server =
-        hyper::Server::bind(&opt.admin_api).serve(make_service_fn(move |_conn| {
-            let server = server.clone();
-            async move {
-                Ok::<_, anyhow::Error>(service_fn(move |req| server.clone().serve_admin_api(req)))
-            }
-        }));
+    let admin_api_server = if opt.read_only {
+        None
+    } else {
+        Some(
+            hyper::Server::bind(&opt.admin_api).serve(make_service_fn(move |_conn| {
+                let server = server.clone();
+                async move {
+                    Ok::<_, anyhow::Error>(service_fn(move |req| {
+                        server.clone().serve_admin_api(req)
+                    }))
+                }
+            })),
+        )
+    };
+    let admin_api_server = async move {
+        match admin_api_server {
+            Some(x) => x.await,
+            None => futures::future::pending().await,
+        }
+    };
 
     tracing::info!("server initialized");
     tokio::select! {
