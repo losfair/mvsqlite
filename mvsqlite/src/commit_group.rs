@@ -108,16 +108,44 @@ pub unsafe extern "C" fn mv_commitgroup_commit(
     }
 }
 
-pub unsafe extern "C" fn mv_commitgroup_drop(
+pub unsafe extern "C" fn mv_commitgroup_rollback(
     _ctx: *mut sqlite3_context,
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
-    CURRENT_COMMIT_GROUP.with(|cg| {
+    let mut cg = CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
         cg.take()
-            .expect("mv_commitgroup_drop called without a commit group open");
+            .expect("mv_commitgroup_rollback called without a commit group open")
     });
 
-    tracing::info!("commit group dropped");
+    if cg.intents.is_empty() {
+        return;
+    }
+
+    // Discard all page changes
+    for intent in &mut cg.intents {
+        intent.init.num_pages = 0;
+        intent.requests.clear();
+    }
+
+    let client = cg
+        .client
+        .take()
+        .expect("mv_commitgroup_rollback called without a client");
+    let io = cg
+        .io
+        .take()
+        .expect("mv_commitgroup_rollback called without an io engine");
+    let res = io
+        .run(async { client.apply_commit_intents(&cg.intents).await })
+        .expect("Failed to apply commit intents");
+    match res {
+        Some(result) => {
+            tracing::info!(version = result.version, duration = ?result.duration, num_pages = result.num_pages, "transaction rolled back (commit group)");
+        }
+        None => {
+            tracing::warn!("conflict during rollback (commit group)");
+        }
+    }
 }
