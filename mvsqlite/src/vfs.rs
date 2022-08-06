@@ -331,19 +331,15 @@ impl DatabaseHandle for Box<Connection> {
         }
 
         if self.txn.is_none() {
-            if CURRENT_COMMIT_GROUP.with(|x| x.borrow().is_some()) {
-                tracing::error!(
-                    "attempting to lock database on a thread with an active commit group"
-                );
-                return Ok(false);
-            }
-
             let txn_info = if let Some(version) = &self.fixed_version {
-                Ok((self.client.create_transaction_at_version(version), None))
+                Ok((
+                    self.client.create_transaction_at_version(version, true),
+                    None,
+                ))
             } else {
                 let client = self.client.clone();
                 self.io
-                    .run(async move { client.create_transaction_with_metadata().await })
+                    .run(async move { client.create_transaction_with_info().await })
                     .map(|(txn, md)| (txn, Some(md)))
             };
             let (txn, md) = match txn_info {
@@ -353,7 +349,8 @@ impl DatabaseHandle for Box<Connection> {
                     return Ok(false);
                 }
             };
-            let md: Option<NsMetadata> = md.map(|x| serde_json::from_str(&x).unwrap_or_default());
+            let md: Option<NsMetadata> =
+                md.map(|x| serde_json::from_str(&x.metadata).unwrap_or_default());
             self.txn = Some(txn);
             self.txn_metadata = md;
         }
@@ -372,6 +369,12 @@ impl DatabaseHandle for Box<Connection> {
             };
 
             if !self.mvcc_aware {
+                let txn = self.txn.as_ref().unwrap();
+                if txn.is_read_only() {
+                    tracing::error!("cannot acquire reserved lock on read-only transaction");
+                    return Ok(false);
+                }
+
                 // Acquire a one-minute lock.
                 // TODO: Lock renew
                 let now = SystemTime::now()
@@ -389,9 +392,10 @@ impl DatabaseHandle for Box<Connection> {
                 new_md.lock = Some(now + 60);
                 let metadata =
                     serde_json::to_string(&new_md).expect("failed to serialize metadata");
-                let txn = self.txn.as_ref().unwrap();
                 let lock_res = self.io.run(async {
-                    let lock_txn = self.client.create_transaction_at_version(txn.version());
+                    let lock_txn = self
+                        .client
+                        .create_transaction_at_version(txn.version(), false);
                     lock_txn
                         .commit(Some(metadata.as_str()))
                         .await
@@ -399,7 +403,10 @@ impl DatabaseHandle for Box<Connection> {
                 });
                 match lock_res {
                     Some(info) => {
-                        self.txn = Some(self.client.create_transaction_at_version(&info.version));
+                        self.txn = Some(
+                            self.client
+                                .create_transaction_at_version(&info.version, false),
+                        );
                         self.lock = lock;
                         *md = new_md;
                         return Ok(true);

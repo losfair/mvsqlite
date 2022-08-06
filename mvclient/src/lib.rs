@@ -45,6 +45,7 @@ pub struct MultiVersionClientConfig {
 pub struct StatResponse {
     pub version: String,
     pub metadata: String,
+    pub read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -129,12 +130,12 @@ impl MultiVersionClient {
     }
 
     pub async fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
-        self.create_transaction_with_metadata().await.map(|x| x.0)
+        self.create_transaction_with_info().await.map(|x| x.0)
     }
 
-    pub async fn create_transaction_with_metadata(
+    pub async fn create_transaction_with_info(
         self: &Arc<Self>,
-    ) -> Result<(Transaction, String)> {
+    ) -> Result<(Transaction, TransactionInfo)> {
         let mut url = self.config.data_plane.clone();
         url.set_path("/stat");
 
@@ -156,12 +157,18 @@ impl MultiVersionClient {
             "created transaction"
         );
         Ok((
-            self.create_transaction_at_version(&stat_res.version),
-            stat_res.metadata,
+            self.create_transaction_at_version(&stat_res.version, stat_res.read_only),
+            TransactionInfo {
+                metadata: stat_res.metadata,
+            },
         ))
     }
 
-    pub fn create_transaction_at_version(self: &Arc<Self>, version: &str) -> Transaction {
+    pub fn create_transaction_at_version(
+        self: &Arc<Self>,
+        version: &str,
+        read_only: bool,
+    ) -> Transaction {
         let txn = Transaction {
             c: self.clone(),
             version: version.into(),
@@ -173,6 +180,7 @@ impl MultiVersionClient {
             }),
             seen_hashes: Mutex::new(HashSet::new()),
             start_time: Instant::now(),
+            read_only,
         };
 
         txn
@@ -261,6 +269,11 @@ pub struct Transaction {
     async_ctx: Arc<TxnAsyncCtx>,
     seen_hashes: Mutex<HashSet<[u8; 32]>>,
     start_time: Instant,
+    read_only: bool,
+}
+
+pub struct TransactionInfo {
+    pub metadata: String,
 }
 
 struct TxnAsyncCtx {
@@ -272,6 +285,10 @@ struct TxnAsyncCtx {
 impl Transaction {
     pub fn version(&self) -> &str {
         self.version.as_str()
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn page_is_written(&self, page_id: u32) -> bool {
