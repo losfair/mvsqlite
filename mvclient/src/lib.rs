@@ -119,7 +119,6 @@ impl MultiVersionClient {
         headers.insert("x-namespace-key", HeaderValue::from_str(&config.ns_key)?);
 
         let client = reqwest::ClientBuilder::new()
-            .http2_prior_knowledge()
             .default_headers(headers)
             .build()?;
         Ok(Arc::new(Self { client, config }))
