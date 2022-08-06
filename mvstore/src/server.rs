@@ -455,6 +455,92 @@ impl Server {
                 res = Response::builder().status(200).body(res_body)?;
             }
 
+            "/api/list_namespace" => {
+                let query: HashMap<String, String> = uri
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+
+                let text_prefix = query.get("prefix").map(|x| x.as_str()).unwrap_or_default();
+                let start = self.construct_nskey_key(text_prefix);
+                let key_prefix = self.construct_nskey_prefix();
+                let mut cursor = start.clone();
+                let mut end = start.clone();
+                *end.last_mut().unwrap() = 0xff;
+
+                let (mut res_sender, res_body) = Body::channel();
+                res = Response::builder().body(res_body)?;
+                let me = self.clone();
+
+                tokio::spawn(async move {
+                    'outer: loop {
+                        let mut txn = match me.db.create_trx() {
+                            Ok(txn) => txn,
+                            Err(e) => {
+                                tracing::error!(error = %e, "create_trx failed");
+                                res_sender.abort();
+                                break;
+                            }
+                        };
+                        let range = loop {
+                            let range = txn
+                                .get_range(
+                                    &RangeOption {
+                                        limit: Some(100),
+                                        reverse: false,
+                                        mode: StreamingMode::WantAll,
+                                        ..RangeOption::from(cursor.clone()..end.clone())
+                                    },
+                                    0,
+                                    true,
+                                )
+                                .await;
+                            match range {
+                                Ok(x) => break x,
+                                Err(e) => match txn.on_error(e).await {
+                                    Ok(x) => {
+                                        txn = x;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "list_namespace range scan failed");
+                                        res_sender.abort();
+                                        break 'outer;
+                                    }
+                                },
+                            }
+                        };
+                        if range.is_empty() {
+                            break;
+                        }
+                        cursor = range.last().unwrap().key().to_vec();
+                        cursor.push(0x00);
+
+                        for item in range {
+                            let key = item.key();
+                            let value = item.value();
+                            if key.len() >= key_prefix.len() {
+                                if let Ok(nskey) = unpack::<String>(&key[key_prefix.len()..]) {
+                                    let entry = serde_json::json!({
+                                        "nskey": nskey,
+                                        "nsid": hex::encode(value),
+                                    });
+                                    let mut entry = entry.to_string();
+                                    entry.push('\n');
+                                    if res_sender.send_data(Bytes::from(entry)).await.is_err() {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
             _ => {
                 res = Response::builder().status(404).body(Body::empty())?;
             }
@@ -1298,6 +1384,10 @@ impl Server {
     pub fn construct_time2version_key(&self, time_secs: u64) -> Vec<u8> {
         let key = pack(&(self.metadata_prefix.as_str(), "time2version", time_secs));
         key
+    }
+
+    pub fn construct_nskey_prefix(&self) -> Vec<u8> {
+        pack(&(self.metadata_prefix.as_str(), "nskey"))
     }
 
     pub fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
