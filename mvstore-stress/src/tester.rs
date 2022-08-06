@@ -299,7 +299,7 @@ impl Tester {
 
         if thread_rng().gen_bool(0.5) {
             if let Some(version) = mem.pick_random_version() {
-                let txn = self.client.create_transaction_at_version(version);
+                let txn = self.client.create_transaction_at_version(version, false);
                 let txn_id = mem.start_transaction(txn.version());
                 self.acquire_version(txn.version());
                 return Ok((txn, txn_id));
