@@ -239,6 +239,7 @@ jobs:
           sudo dpkg -i fdb-client.deb
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
           sudo dpkg -i fdb-server.deb
+          sudo apt install -y libsqlite3-0 # update
       - name: Fetch binaries
         uses: actions/download-artifact@v2
         with:
