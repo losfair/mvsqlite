@@ -1076,6 +1076,7 @@ dependencies = [
  "async-trait",
  "backtrace",
  "ctor",
+ "lazy_static",
  "libc",
  "log",
  "moka",

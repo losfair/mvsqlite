@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    io::ErrorKind,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +10,8 @@ use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 use crate::{
     commit_group::CURRENT_COMMIT_GROUP,
     io_engine::IoEngine,
-    sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
+    sqlite_vfs::{wip::WalIndex, DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
+    tempfile::TempFile,
 };
 
 const PAGE_SIZE: usize = 8192;
@@ -29,16 +29,16 @@ pub struct NsMetadata {
 }
 
 impl Vfs for MultiVersionVfs {
-    type Handle = Box<Connection>;
+    type Handle = Box<dyn DatabaseHandle<WalIndex = WalDisabled>>;
 
     fn open(
         &self,
         db: &str,
         opts: crate::sqlite_vfs::OpenOptions,
     ) -> Result<Self::Handle, std::io::Error> {
-        tracing::debug!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
+        tracing::info!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
         if !matches!(opts.kind, OpenKind::MainDb) {
-            return Err(ErrorKind::NotFound.into());
+            return Ok(Box::new(TempFile::new()));
         }
 
         let db_str_segs = db.split("@").collect::<Vec<_>>();
@@ -235,7 +235,7 @@ impl Connection {
     }
 }
 
-impl DatabaseHandle for Box<Connection> {
+impl DatabaseHandle for Connection {
     type WalIndex = WalDisabled;
 
     fn size(&self) -> Result<u64, std::io::Error> {
@@ -506,6 +506,50 @@ impl DatabaseHandle for Box<Connection> {
 
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
+    }
+}
+
+impl<W: WalIndex> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
+    type WalIndex = W;
+
+    fn size(&self) -> Result<u64, std::io::Error> {
+        (**self).size()
+    }
+
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        (**self).read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
+        (**self).write_all_at(buf, offset)
+    }
+
+    fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error> {
+        (**self).sync(data_only)
+    }
+
+    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
+        (**self).set_len(size)
+    }
+
+    fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+        (**self).lock(lock)
+    }
+
+    fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+        (**self).unlock(lock)
+    }
+
+    fn reserved(&mut self) -> Result<bool, std::io::Error> {
+        (**self).reserved()
+    }
+
+    fn current_lock(&self) -> Result<LockKind, std::io::Error> {
+        (**self).current_lock()
+    }
+
+    fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
+        (**self).wal_index(readonly)
     }
 }
 
