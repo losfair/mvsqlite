@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -85,6 +85,7 @@ impl Vfs for MultiVersionVfs {
             txn_metadata: None,
             sector_size: self.sector_size,
             first_page,
+            size_cache_in_bytes: Mutex::new(None),
         };
         let conn = Box::new(conn);
 
@@ -135,6 +136,7 @@ pub struct Connection {
     txn_metadata: Option<NsMetadata>,
 
     first_page: Vec<u8>,
+    size_cache_in_bytes: Mutex<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -263,6 +265,10 @@ impl DatabaseHandle for Connection {
     type WalIndex = WalDisabled;
 
     fn size(&self) -> Result<u64, std::io::Error> {
+        if let Some(x) = self.size_cache_in_bytes.lock().unwrap().as_ref() {
+            return Ok(*x);
+        }
+
         let txn = match &self.txn {
             Some(x) => x,
             None => {
@@ -283,8 +289,10 @@ impl DatabaseHandle for Connection {
         }
 
         let num_pages = u32::from_be_bytes(pzero[28..32].try_into().unwrap());
-        tracing::info!(num_pages, "db size");
-        Ok(self.sector_size as u64 * num_pages as u64)
+        tracing::debug!(num_pages, "db size");
+        let size = self.sector_size as u64 * num_pages as u64;
+        self.size_cache_in_bytes.lock().unwrap().replace(size);
+        Ok(size)
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
@@ -340,6 +348,10 @@ impl DatabaseHandle for Connection {
             if buf[18] == 2 || buf[19] == 2 {
                 panic!("attempting to enable wal mode");
             }
+
+            let num_pages = u32::from_be_bytes(buf[28..32].try_into().unwrap());
+            let size = self.sector_size as u64 * num_pages as u64;
+            self.size_cache_in_bytes.lock().unwrap().replace(size);
         }
 
         tracing::debug!(
@@ -546,6 +558,7 @@ impl DatabaseHandle for Connection {
             self.txn_buffered_page = HashMap::new();
             self.txn_metadata = None;
             self.history.prev_index = 0;
+            self.size_cache_in_bytes.lock().unwrap().take();
         }
 
         Ok(true)
