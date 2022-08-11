@@ -5,6 +5,7 @@ pub mod sqlite_c;
 #[allow(non_snake_case, non_camel_case_types)]
 pub mod sqlite_misc;
 pub mod sqlite_vfs;
+pub mod tempfile;
 pub mod vfs;
 
 use std::sync::Arc;
@@ -36,15 +37,27 @@ pub extern "C" fn init_mvsqlite() {
         std::process::abort();
     }));
 
+    let mut sector_size: usize = 8192;
+    if let Ok(s) = std::env::var("MVSQLITE_SECTOR_SIZE") {
+        let requested_ss = s
+            .parse::<usize>()
+            .expect("MVSQLITE_SECTOR_SIZE must be a usize");
+        if ![4096, 8192, 16384, 32768].contains(&requested_ss) {
+            panic!("MVSQLITE_SECTOR_SIZE must be one of 4096, 8192, 16384, 32768");
+        }
+        sector_size = requested_ss;
+    }
+
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
     let io_engine = Arc::new(IoEngine::new(false));
     let vfs = MultiVersionVfs {
         data_plane,
         io: io_engine,
+        sector_size,
     };
 
     sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");
-    tracing::info!("mvsqlite initialized");
+    tracing::info!(sector_size = sector_size, "mvsqlite initialized");
 }
 
 #[no_mangle]

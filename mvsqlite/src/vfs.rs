@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    io::ErrorKind,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,16 +10,20 @@ use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
 use crate::{
     commit_group::CURRENT_COMMIT_GROUP,
     io_engine::IoEngine,
-    sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
+    sqlite_vfs::{wip::WalIndex, DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
+    tempfile::TempFile,
 };
 
-const PAGE_SIZE: usize = 8192;
 const TRANSITION_HISTORY_SIZE: usize = 10;
-static FIRST_PAGE_TEMPLATE: &'static [u8; 8192] = include_bytes!("../template.db");
+static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template_4k.db");
+static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
+static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../template_16k.db");
+static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
     pub io: Arc<IoEngine>,
+    pub sector_size: usize,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -29,16 +32,16 @@ pub struct NsMetadata {
 }
 
 impl Vfs for MultiVersionVfs {
-    type Handle = Box<Connection>;
+    type Handle = Box<dyn DatabaseHandle<WalIndex = WalDisabled>>;
 
     fn open(
         &self,
         db: &str,
         opts: crate::sqlite_vfs::OpenOptions,
     ) -> Result<Self::Handle, std::io::Error> {
-        tracing::debug!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
+        tracing::info!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
         if !matches!(opts.kind, OpenKind::MainDb) {
-            return Err(ErrorKind::NotFound.into());
+            return Ok(Box::new(TempFile::new()));
         }
 
         let db_str_segs = db.split("@").collect::<Vec<_>>();
@@ -63,6 +66,14 @@ impl Vfs for MultiVersionVfs {
         })
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
+        let first_page = match self.sector_size {
+            4096 => FIRST_PAGE_TEMPLATE_4K.to_vec(),
+            8192 => FIRST_PAGE_TEMPLATE_8K.to_vec(),
+            16384 => FIRST_PAGE_TEMPLATE_16K.to_vec(),
+            32768 => FIRST_PAGE_TEMPLATE_32K.to_vec(),
+            _ => panic!("unsupported sector size"),
+        };
+
         let conn = Connection {
             client,
             io: self.io.clone(),
@@ -73,6 +84,8 @@ impl Vfs for MultiVersionVfs {
             txn_buffered_page: HashMap::new(),
             txn_metadata: None,
             mvcc_aware: false,
+            sector_size: self.sector_size,
+            first_page,
         };
         let conn = Box::new(conn);
 
@@ -90,7 +103,7 @@ impl Vfs for MultiVersionVfs {
     }
 
     fn temporary_name(&self) -> String {
-        panic!("Not implemented: temporary_name")
+        "[temp]".into()
     }
 
     fn random(&self, buffer: &mut [i8]) {
@@ -103,6 +116,10 @@ impl Vfs for MultiVersionVfs {
         });
         duration
     }
+
+    fn sector_size(&self) -> usize {
+        self.sector_size
+    }
 }
 
 pub struct Connection {
@@ -112,12 +129,14 @@ pub struct Connection {
     txn: Option<Transaction>,
     lock: LockKind,
     history: TransitionHistory,
+    sector_size: usize,
 
     /// Clear this when writing or dropping txn!
     txn_buffered_page: HashMap<u32, Vec<u8>>,
     txn_metadata: Option<NsMetadata>,
 
     mvcc_aware: bool,
+    first_page: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -178,12 +197,12 @@ impl TransitionHistory {
 
 impl Connection {
     fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        assert!(offset as usize % PAGE_SIZE == 0);
-        assert!(buf.len() == PAGE_SIZE);
+        assert!(offset as usize % self.sector_size == 0);
+        assert!(buf.len() == self.sector_size);
 
         let txn = self.txn.as_mut().unwrap();
-        let num_pages = buf.len() / PAGE_SIZE;
-        let page_offset = u32::try_from(offset as usize / PAGE_SIZE).unwrap();
+        let num_pages = buf.len() / self.sector_size;
+        let page_offset = u32::try_from(offset as usize / self.sector_size).unwrap();
 
         tracing::debug!(
             num_pages = num_pages,
@@ -224,40 +243,73 @@ impl Connection {
 
         if page.is_empty() {
             if offset == 0 {
-                buf.copy_from_slice(FIRST_PAGE_TEMPLATE);
+                buf.copy_from_slice(&self.first_page);
             } else {
                 buf.iter_mut().for_each(|b| *b = 0);
             }
         } else {
+            if offset == 0 {
+                let actual_page_size =
+                    u16::from_be_bytes(page[16..18].try_into().unwrap()) as usize;
+                if actual_page_size != self.sector_size {
+                    panic!("page size mismatch with sector size. actual page size = {}, sector size = {}", actual_page_size, self.sector_size);
+                }
+            }
             buf.copy_from_slice(&page);
         }
         Ok(())
     }
 }
 
-impl DatabaseHandle for Box<Connection> {
+impl DatabaseHandle for Connection {
     type WalIndex = WalDisabled;
 
     fn size(&self) -> Result<u64, std::io::Error> {
-        Ok(PAGE_SIZE as u64 * u32::MAX as u64)
+        let txn = match &self.txn {
+            Some(x) => x,
+            None => {
+                tracing::warn!("file_size called without a transaction");
+                return Ok(self.sector_size as u64 * u32::MAX as u64);
+            }
+        };
+
+        let mut pzero = self
+            .io
+            .run(txn.read_many(&[0]))
+            .expect("unrecoverable read failure")
+            .into_iter()
+            .next()
+            .unwrap();
+        if pzero.is_empty() {
+            pzero = self.first_page.clone();
+        }
+
+        let num_pages = u32::from_be_bytes(pzero[28..32].try_into().unwrap());
+        tracing::info!(num_pages, "db size");
+        Ok(self.sector_size as u64 * num_pages as u64)
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         if self.txn.is_none() {
+            tracing::warn!(
+                offset = offset,
+                len = buf.len(),
+                "read_exact_at called without a transaction"
+            );
             let len = buf.len();
-            buf.copy_from_slice(&FIRST_PAGE_TEMPLATE[offset as usize..(offset as usize) + len]);
+            buf.copy_from_slice(&self.first_page[offset as usize..(offset as usize) + len]);
             return Ok(());
         }
 
-        if offset as usize % PAGE_SIZE != 0 || buf.len() % PAGE_SIZE != 0 {
+        if offset as usize % self.sector_size != 0 || buf.len() % self.sector_size != 0 {
             // special case
             assert!(
-                (offset as usize) < PAGE_SIZE
-                    && buf.len() < PAGE_SIZE
-                    && offset as usize + buf.len() <= PAGE_SIZE,
+                (offset as usize) < self.sector_size
+                    && buf.len() < self.sector_size
+                    && offset as usize + buf.len() <= self.sector_size,
                 "unexpected read"
             );
-            let mut page_buf = vec![0; PAGE_SIZE];
+            let mut page_buf = vec![0; self.sector_size];
             self.do_read(&mut page_buf, 0)?;
             buf.copy_from_slice(&page_buf[offset as usize..offset as usize + buf.len()]);
             return Ok(());
@@ -267,14 +319,14 @@ impl DatabaseHandle for Box<Connection> {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
-        assert!(offset as usize % PAGE_SIZE == 0);
-        assert!(buf.len() % PAGE_SIZE == 0);
+        assert!(offset as usize % self.sector_size == 0);
+        assert!(buf.len() % self.sector_size == 0);
 
         self.txn_buffered_page = HashMap::new();
         self.history.prev_index = 0;
 
-        let num_pages = buf.len() / PAGE_SIZE;
-        let page_offset = offset as usize / PAGE_SIZE;
+        let num_pages = buf.len() / self.sector_size;
+        let page_offset = offset as usize / self.sector_size;
         let txn = self
             .txn
             .as_mut()
@@ -283,7 +335,7 @@ impl DatabaseHandle for Box<Connection> {
         if offset == 0 {
             // validate first page
             let page_size = u16::from_be_bytes(<[u8; 2]>::try_from(&buf[16..18]).unwrap());
-            if page_size as usize != PAGE_SIZE {
+            if page_size as usize != self.sector_size {
                 panic!("attempting to change page size");
             }
 
@@ -302,7 +354,7 @@ impl DatabaseHandle for Box<Connection> {
             .map(|i| {
                 (
                     (page_offset + i) as u32,
-                    &buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE],
+                    &buf[i * self.sector_size..(i + 1) * self.sector_size],
                 )
             })
             .collect::<Vec<_>>();
@@ -506,6 +558,50 @@ impl DatabaseHandle for Box<Connection> {
 
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
+    }
+}
+
+impl<W: WalIndex> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
+    type WalIndex = W;
+
+    fn size(&self) -> Result<u64, std::io::Error> {
+        (**self).size()
+    }
+
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        (**self).read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
+        (**self).write_all_at(buf, offset)
+    }
+
+    fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error> {
+        (**self).sync(data_only)
+    }
+
+    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
+        (**self).set_len(size)
+    }
+
+    fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+        (**self).lock(lock)
+    }
+
+    fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+        (**self).unlock(lock)
+    }
+
+    fn reserved(&mut self) -> Result<bool, std::io::Error> {
+        (**self).reserved()
+    }
+
+    fn current_lock(&self) -> Result<LockKind, std::io::Error> {
+        (**self).current_lock()
+    }
+
+    fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
+        (**self).wal_index(readonly)
     }
 }
 

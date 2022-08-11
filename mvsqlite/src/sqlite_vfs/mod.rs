@@ -5,13 +5,11 @@
 //! https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::io::ErrorKind;
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::ops::Range;
 use std::os::raw::{c_char, c_int};
-use std::pin::Pin;
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -105,6 +103,10 @@ pub trait Vfs: Sync {
     /// Retrieve the full pathname of a database `db`.
     fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
         Ok(db.into())
+    }
+
+    fn sector_size(&self) -> usize {
+        4096
     }
 }
 
@@ -245,12 +247,12 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xUnlock: Some(io::unlock::<V, F>),
         xCheckReservedLock: Some(io::check_reserved_lock::<V, F>),
         xFileControl: Some(io::file_control::<V, F>),
-        xSectorSize: Some(io::sector_size::<F>),
+        xSectorSize: Some(io::sector_size::<V, F>),
         xDeviceCharacteristics: Some(io::device_characteristics::<V, F>),
-        xShmMap: Some(io::shm_map::<V, F>),
-        xShmLock: Some(io::shm_lock::<V, F>),
-        xShmBarrier: Some(io::shm_barrier::<V, F>),
-        xShmUnmap: Some(io::shm_unmap::<V, F>),
+        xShmMap: None,
+        xShmLock: None,
+        xShmBarrier: None,
+        xShmUnmap: None,
         xFetch: None,
         xUnfetch: None,
     };
@@ -334,13 +336,8 @@ struct FileExt<V, F: DatabaseHandle> {
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
     /// The last error number of this file/connection (not shared with the VFS).
     last_errno: i32,
-    wal_index: Option<(F::WalIndex, bool)>,
-    wal_index_regions: HashMap<u32, Pin<Box<[u8; 32768]>>>,
-    wal_index_locks: HashMap<u8, wip::WalIndexLock>,
-    has_exclusive_lock: bool,
     id: usize,
     chunk_size: Option<usize>,
-    persist_wal: bool,
     powersafe_overwrite: bool,
 }
 
@@ -473,13 +470,8 @@ mod vfs {
             delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
             last_errno: 0,
-            wal_index: None,
-            wal_index_regions: Default::default(),
-            wal_index_locks: Default::default(),
-            has_exclusive_lock: false,
             id: state.next_id,
             chunk_size: None,
-            persist_wal: false,
             powersafe_overwrite,
         });
         state.next_id = state.next_id.overflowing_add(1).0;
@@ -898,11 +890,9 @@ mod vfs {
 }
 
 mod io {
-    use std::collections::hash_map::Entry;
     use std::mem;
 
     use super::*;
-    use wip::WalIndex;
 
     /// Close a file.
     pub unsafe extern "C" fn close<V: Vfs, F: DatabaseHandle>(
@@ -1112,36 +1102,7 @@ mod io {
         };
         match state.file.lock(lock) {
             Ok(true) => {
-                state.has_exclusive_lock = lock == LockKind::Exclusive;
                 log::trace!("[{}] lock={:?} ({})", state.id, lock, state.db_name);
-
-                // If just acquired a exclusive database lock while not having any exclusive lock
-                // on the wal index, make sure the wal index is up to date.
-                if state.has_exclusive_lock {
-                    let has_exclusive_wal_index = state
-                        .wal_index_locks
-                        .iter()
-                        .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
-
-                    if !has_exclusive_wal_index {
-                        log::trace!(
-                            "[{}] acquired exclusive db lock, pulling wal index changes",
-                            state.id,
-                        );
-
-                        if let Some((wal_index, _)) = state.wal_index.as_mut() {
-                            for (region, data) in &mut state.wal_index_regions {
-                                if let Err(err) = wal_index.pull(*region as u32, data) {
-                                    log::error!(
-                                        "[{}] pulling wal index changes failed: {}",
-                                        state.id,
-                                        err
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
 
                 ffi::SQLITE_OK
             }
@@ -1175,7 +1136,6 @@ mod io {
         };
         match state.file.unlock(lock) {
             Ok(true) => {
-                state.has_exclusive_lock = lock == LockKind::Exclusive;
                 log::trace!("[{}] unlock={:?} ({})", state.id, lock, state.db_name);
                 ffi::SQLITE_OK
             }
@@ -1340,18 +1300,7 @@ mod io {
             ffi::SQLITE_FCNTL_WIN32_AV_RETRY => ffi::SQLITE_NOTFOUND,
 
             // Enable or disable the persistent WAL setting.
-            ffi::SQLITE_FCNTL_PERSIST_WAL => {
-                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
-                    if *p_arg < 0 {
-                        // query current setting
-                        *p_arg = state.persist_wal as i32;
-                    } else {
-                        state.persist_wal = *p_arg == 1;
-                    }
-                };
-
-                ffi::SQLITE_OK
-            }
+            ffi::SQLITE_FCNTL_PERSIST_WAL => ffi::SQLITE_NOTFOUND,
 
             // Indicate that, unless it is rolled back for some reason, the entire database file
             // will be overwritten by the current transaction. Not implemented.
@@ -1492,10 +1441,14 @@ mod io {
     }
 
     /// Return the sector-size in bytes for a file.
-    pub unsafe extern "C" fn sector_size<F>(_p_file: *mut ffi::sqlite3_file) -> c_int {
-        log::trace!("sector_size");
-
-        8192
+    pub unsafe extern "C" fn sector_size<V: Vfs, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+    ) -> c_int {
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR,
+        };
+        state.vfs.sector_size() as _
     }
 
     /// Return the device characteristic flags supported by a file.
@@ -1519,268 +1472,6 @@ mod io {
         } else {
             0
         }
-    }
-
-    /// Create a shared memory file mapping.
-    pub unsafe extern "C" fn shm_map<V, F: DatabaseHandle>(
-        p_file: *mut ffi::sqlite3_file,
-        region_ix: i32,
-        region_size: i32,
-        b_extend: i32,
-        pp: *mut *mut c_void,
-    ) -> i32 {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
-        };
-        log::trace!(
-            "[{}] shm_map pg={} sz={} extend={} ({})",
-            state.id,
-            region_ix,
-            region_size,
-            b_extend,
-            state.db_name
-        );
-
-        if !F::WalIndex::enabled() {
-            return ffi::SQLITE_IOERR_SHMLOCK;
-        }
-
-        if region_size != 32768 {
-            return state.set_last_error(
-                ffi::SQLITE_IOERR_SHMMAP,
-                std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "encountered region size other than 32kB; got {}",
-                        region_size
-                    ),
-                ),
-            );
-        }
-
-        let (wal_index, readonly) = match state.wal_index.as_mut() {
-            Some((wal_index, readonly)) => (wal_index, *readonly),
-            None => {
-                let (wal_index, readonly) = state.wal_index.get_or_insert(
-                    match state
-                        .file
-                        .wal_index(false)
-                        .map(|wal_index| (wal_index, false))
-                        .or_else(|err| {
-                            if err.kind() == ErrorKind::PermissionDenied {
-                                // Try again as readonly
-                                state
-                                    .file
-                                    .wal_index(true)
-                                    .map(|wal_index| (wal_index, true))
-                                    .map_err(|_| err)
-                            } else {
-                                Err(err)
-                            }
-                        }) {
-                        Ok((wal_index, readonly)) => (wal_index, readonly),
-                        Err(err) => {
-                            return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
-                        }
-                    },
-                );
-                (wal_index, *readonly)
-            }
-        };
-
-        let entry = state.wal_index_regions.entry(region_ix as u32);
-        match entry {
-            Entry::Occupied(mut entry) => {
-                *pp = entry.get_mut().as_mut_ptr() as *mut c_void;
-            }
-            Entry::Vacant(entry) => {
-                let mut m = match wal_index.map(region_ix as u32) {
-                    Ok(m) => Box::pin(m),
-                    Err(err) => {
-                        return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
-                    }
-                };
-                *pp = m.as_mut_ptr() as *mut c_void;
-                entry.insert(m);
-            }
-        }
-
-        if readonly {
-            ffi::SQLITE_READONLY
-        } else {
-            ffi::SQLITE_OK
-        }
-    }
-
-    /// Perform locking on a shared-memory segment.
-    pub unsafe extern "C" fn shm_lock<V, F: DatabaseHandle>(
-        p_file: *mut ffi::sqlite3_file,
-        offset: i32,
-        n: i32,
-        flags: i32,
-    ) -> i32 {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
-        };
-        let locking = flags & ffi::SQLITE_SHM_LOCK > 0;
-        let exclusive = flags & ffi::SQLITE_SHM_EXCLUSIVE > 0;
-        log::trace!(
-            "[{}] shm_lock offset={} n={} lock={} exclusive={} (flags={}) ({})",
-            state.id,
-            offset,
-            n,
-            locking,
-            exclusive,
-            flags,
-            state.db_name
-        );
-
-        let range = offset as u8..(offset + n) as u8;
-        let lock = match (locking, exclusive) {
-            (true, true) => wip::WalIndexLock::Exclusive,
-            (true, false) => wip::WalIndexLock::Shared,
-            (false, _) => wip::WalIndexLock::None,
-        };
-
-        let (wal_index, readonly) = match state.wal_index.as_mut() {
-            Some((wal_index, readonly)) => (wal_index, *readonly),
-            None => {
-                return state.set_last_error(
-                    ffi::SQLITE_IOERR_SHMLOCK,
-                    std::io::Error::new(
-                        ErrorKind::Other,
-                        "trying to lock wal index, which isn't created yet",
-                    ),
-                )
-            }
-        };
-
-        if locking {
-            let has_exclusive = state
-                .wal_index_locks
-                .iter()
-                .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
-
-            if !has_exclusive {
-                log::trace!(
-                    "[{}] does not have wal index write lock, pulling changes",
-                    state.id
-                );
-                for (region, data) in &mut state.wal_index_regions {
-                    if let Err(err) = wal_index.pull(*region as u32, data) {
-                        return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
-                    }
-                }
-            }
-        } else {
-            let releases_any_exclusive = state.wal_index_locks.iter().any(|(region, lock)| {
-                *lock == wip::WalIndexLock::Exclusive && range.contains(region)
-            });
-
-            // push index changes when moving from any exclusive lock to no exclusive locks
-            if releases_any_exclusive && !readonly {
-                log::trace!(
-                    "[{}] releasing an exclusive lock, pushing wal index changes",
-                    state.id,
-                );
-                for (region, data) in &mut state.wal_index_regions {
-                    if let Err(err) = wal_index.push(*region as u32, data) {
-                        return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
-                    }
-                }
-            }
-        }
-
-        match wal_index.lock(range.clone(), lock) {
-            Ok(true) => {
-                for region in range {
-                    state.wal_index_locks.insert(region, lock);
-                }
-                ffi::SQLITE_OK
-            }
-            Ok(false) => ffi::SQLITE_BUSY,
-            Err(err) => state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err),
-        }
-    }
-
-    /// Memory barrier operation on shared memory.
-    pub unsafe extern "C" fn shm_barrier<V, F: DatabaseHandle>(p_file: *mut ffi::sqlite3_file) {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        log::trace!("[{}] shm_barrier ({})", state.id, state.db_name);
-
-        let (wal_index, readonly) = if let Some((wal_index, readonly)) = state.wal_index.as_mut() {
-            (wal_index, *readonly)
-        } else {
-            return;
-        };
-
-        if state.has_exclusive_lock && !readonly {
-            log::trace!(
-                "[{}] has exclusive db lock, pushing wal index changes",
-                state.id,
-            );
-            for (region, data) in &mut state.wal_index_regions {
-                if let Err(err) = wal_index.push(*region as u32, data) {
-                    log::error!("[{}] pushing wal index changes failed: {}", state.id, err)
-                }
-            }
-
-            return;
-        }
-
-        let has_exclusive = state
-            .wal_index_locks
-            .iter()
-            .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
-
-        if !has_exclusive {
-            log::trace!(
-                "[{}] does not have wal index write lock, pulling changes",
-                state.id
-            );
-            for (region, data) in &mut state.wal_index_regions {
-                if let Err(err) = wal_index.pull(*region as u32, data) {
-                    log::error!("[{}] pulling wal index changes failed: {}", state.id, err)
-                }
-            }
-        }
-    }
-
-    /// Unmap a shared memory segment.
-    pub unsafe extern "C" fn shm_unmap<V, F: DatabaseHandle>(
-        p_file: *mut ffi::sqlite3_file,
-        delete_flags: i32,
-    ) -> i32 {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
-        };
-        log::trace!(
-            "[{}] shm_unmap delete={} ({})",
-            state.id,
-            delete_flags == 1,
-            state.db_name
-        );
-
-        state.wal_index_regions.clear();
-        state.wal_index_locks.clear();
-
-        if delete_flags == 1 {
-            if let Some((wal_index, readonly)) = state.wal_index.take() {
-                if !readonly {
-                    if let Err(err) = wal_index.delete() {
-                        return state.set_last_error(ffi::SQLITE_ERROR, err);
-                    }
-                }
-            }
-        }
-
-        ffi::SQLITE_OK
     }
 }
 

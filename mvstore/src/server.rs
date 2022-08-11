@@ -28,8 +28,8 @@ use crate::{
     lock::DistributedLock,
 };
 
-const MAX_MESSAGE_SIZE: usize = 10 * 1024; // 10 KiB
-const MAX_PAGE_SIZE: usize = 8192;
+const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
+const MAX_PAGE_SIZE: usize = 32768;
 const MAX_PAGES_PER_BATCH_READ: usize = 100;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;

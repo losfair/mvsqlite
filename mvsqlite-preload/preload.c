@@ -42,9 +42,6 @@ int sqlite3_open_v2(
     ret = real_sqlite3_open_v2(filename, ppDb, flags, zVfs);
     if(ret == SQLITE_OK) {
         init_mvsqlite_connection(*ppDb);
-        ret = sqlite3_exec(*ppDb, "PRAGMA journal_mode = memory", NULL, NULL, NULL);
-        assert(ret == SQLITE_OK);
-
         ret = sqlite3_exec(*ppDb, "PRAGMA cache_size = -50000", NULL, NULL, NULL);
         assert(ret == SQLITE_OK);
     }
