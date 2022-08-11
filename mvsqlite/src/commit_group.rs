@@ -11,6 +11,7 @@ pub struct CommitGroup {
     intents: Vec<NamespaceCommitIntent>,
     client: Option<Arc<MultiVersionClient>>,
     io: Option<Arc<IoEngine>>,
+    pub lock_disabled: bool,
 }
 
 impl Default for CommitGroup {
@@ -19,6 +20,7 @@ impl Default for CommitGroup {
             intents: Vec::new(),
             client: None,
             io: None,
+            lock_disabled: false,
         }
     }
 }
@@ -148,4 +150,34 @@ pub unsafe extern "C" fn mv_commitgroup_rollback(
             tracing::warn!("conflict during rollback (commit group)");
         }
     }
+}
+
+pub unsafe extern "C" fn mv_commitgroup_lock_disable(
+    _ctx: *mut sqlite3_context,
+    _argc: ::std::os::raw::c_int,
+    _argv: *mut *mut sqlite3_value,
+) {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        let mut cg = cg.borrow_mut();
+        let cg = cg
+            .as_mut()
+            .expect("mv_commitgroup_lock_disable called without a commit group open");
+
+        cg.lock_disabled = true;
+    });
+}
+
+pub unsafe extern "C" fn mv_commitgroup_lock_enable(
+    _ctx: *mut sqlite3_context,
+    _argc: ::std::os::raw::c_int,
+    _argv: *mut *mut sqlite3_value,
+) {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        let mut cg = cg.borrow_mut();
+        let cg = cg
+            .as_mut()
+            .expect("mv_commitgroup_lock_enable called without a commit group open");
+
+        cg.lock_disabled = false;
+    });
 }

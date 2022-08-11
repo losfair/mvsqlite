@@ -83,7 +83,6 @@ impl Vfs for MultiVersionVfs {
             history: TransitionHistory::default(),
             txn_buffered_page: HashMap::new(),
             txn_metadata: None,
-            mvcc_aware: false,
             sector_size: self.sector_size,
             first_page,
         };
@@ -135,7 +134,6 @@ pub struct Connection {
     txn_buffered_page: HashMap<u32, Vec<u8>>,
     txn_metadata: Option<NsMetadata>,
 
-    mvcc_aware: bool,
     first_page: Vec<u8>,
 }
 
@@ -420,7 +418,16 @@ impl DatabaseHandle for Connection {
                 }
             };
 
-            if !self.mvcc_aware {
+            let lock_disabled = CURRENT_COMMIT_GROUP.with(|cg| {
+                let cg = cg.borrow();
+                if let Some(cg) = &*cg {
+                    cg.lock_disabled
+                } else {
+                    false
+                }
+            });
+
+            if !lock_disabled {
                 let txn = self.txn.as_ref().unwrap();
                 if txn.is_read_only() {
                     tracing::error!("cannot acquire reserved lock on read-only transaction");
@@ -491,13 +498,9 @@ impl DatabaseHandle for Connection {
 
         if lock_level(prev_lock) >= reserved_level && lock_level(lock) < reserved_level {
             // Write
-            let md = if !self.mvcc_aware {
-                if let Some(md) = self.txn_metadata.as_mut() {
-                    md.lock = None;
-                    Some(serde_json::to_string(md).expect("failed to serialize metadata"))
-                } else {
-                    None
-                }
+            let md = if let Some(md) = self.txn_metadata.as_mut() {
+                md.lock = None;
+                Some(serde_json::to_string(md).expect("failed to serialize metadata"))
             } else {
                 None
             };

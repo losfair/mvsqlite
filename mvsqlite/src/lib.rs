@@ -22,11 +22,13 @@ pub extern "C" fn init_mvsqlite() {
     if std::env::var("MVSQLITE_LOG_JSON").unwrap_or_default() == "1" {
         SubscriberBuilder::default()
             .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
             .json()
             .init();
     } else {
         SubscriberBuilder::default()
             .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
             .pretty()
             .init();
     }
@@ -65,6 +67,8 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
     let mv_commitgroup_begin_name = b"mv_commitgroup_begin\0";
     let mv_commitgroup_commit_name = b"mv_commitgroup_commit\0";
     let mv_commitgroup_rollback_name = b"mv_commitgroup_rollback\0";
+    let mv_commitgroup_lock_disable_name = b"mv_commitgroup_lock_disable\0";
+    let mv_commitgroup_lock_enable_name = b"mv_commitgroup_lock_enable\0";
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
         mv_commitgroup_begin_name.as_ptr() as *const i8,
@@ -96,6 +100,30 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
         Some(commit_group::mv_commitgroup_rollback),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_commitgroup_lock_disable_name.as_ptr() as *const i8,
+        0,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(commit_group::mv_commitgroup_lock_disable),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_commitgroup_lock_enable_name.as_ptr() as *const i8,
+        0,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(commit_group::mv_commitgroup_lock_enable),
         None,
         None,
         None,
