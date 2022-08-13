@@ -138,6 +138,12 @@ pub struct AdminDeleteNamespaceRequest {
 }
 
 #[derive(Deserialize)]
+pub struct AdminRenameNamespaceRequest {
+    pub old_key: String,
+    pub new_key: String,
+}
+
+#[derive(Deserialize)]
 pub struct AdminTruncateNamespaceRequest {
     pub key: String,
     pub before_version: String,
@@ -250,6 +256,49 @@ impl Server {
                         &nskey_atomic_op_value,
                         MutationType::SetVersionstampedValue,
                     );
+                    match txn.commit().await {
+                        Ok(_) => {
+                            res = Response::builder().status(200).body(Body::from("ok"))?;
+                            break;
+                        }
+                        Err(e) => {
+                            txn = match e.on_error().await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+
+            "/api/rename_namespace" => {
+                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body: AdminRenameNamespaceRequest = serde_json::from_slice(&body)?;
+                let old_nskey_key = self.construct_nskey_key(&body.old_key);
+                let new_nskey_key = self.construct_nskey_key(&body.new_key);
+
+                let mut txn = self.db.create_trx()?;
+
+                loop {
+                    if txn.get(&new_nskey_key, false).await?.is_some() {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("new key already exists"))?);
+                    }
+                    let ns_id = match txn.get(&old_nskey_key, false).await? {
+                        Some(v) => v,
+                        None => {
+                            return Ok(Response::builder()
+                                .status(400)
+                                .body(Body::from("old key does not exist"))?);
+                        }
+                    };
+                    txn.clear(&old_nskey_key);
+                    txn.set(&new_nskey_key, &ns_id);
                     match txn.commit().await {
                         Ok(_) => {
                             res = Response::builder().status(200).body(Body::from("ok"))?;
