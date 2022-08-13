@@ -32,7 +32,9 @@ static void bootstrap(void) {
         exit(1);
     }
 
-    init_mvsqlite();
+    if(mvsqlite_enabled) {
+        init_mvsqlite();
+    }
 }
 
 static pthread_once_t vfs_init = PTHREAD_ONCE_INIT;
@@ -47,7 +49,7 @@ int sqlite3_open_v2(
 
     pthread_once(&vfs_init, bootstrap);
     ret = real_sqlite3_open_v2(filename, ppDb, flags, zVfs);
-    if(ret == SQLITE_OK) {
+    if(ret == SQLITE_OK && mvsqlite_enabled) {
         init_mvsqlite_connection(*ppDb);
 
         // Return code ignored - this can fail if the database doesn't exist, and we can't really
