@@ -56,6 +56,7 @@ pub extern "C" fn init_mvsqlite() {
         data_plane,
         io: io_engine,
         sector_size,
+        http_client: reqwest::Client::new(),
     };
 
     sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");

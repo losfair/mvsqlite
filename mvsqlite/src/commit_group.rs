@@ -11,6 +11,7 @@ pub struct CommitGroup {
     intents: Vec<NamespaceCommitIntent>,
     client: Option<Arc<MultiVersionClient>>,
     io: Option<Arc<IoEngine>>,
+    pub current_version: Option<String>,
     pub lock_disabled: bool,
 }
 
@@ -20,6 +21,7 @@ impl Default for CommitGroup {
             intents: Vec::new(),
             client: None,
             io: None,
+            current_version: None,
             lock_disabled: false,
         }
     }

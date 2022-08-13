@@ -1082,6 +1082,7 @@ dependencies = [
  "moka",
  "mvclient",
  "rand",
+ "reqwest",
  "serde",
  "serde_json",
  "stackful",

@@ -70,10 +70,13 @@ async fn main() -> Result<()> {
         std::process::abort();
     }));
 
-    let client = MultiVersionClient::new(MultiVersionClientConfig {
-        data_plane: opt.data_plane.parse()?,
-        ns_key: opt.ns_key.clone(),
-    })?;
+    let client = MultiVersionClient::new(
+        MultiVersionClientConfig {
+            data_plane: opt.data_plane.parse()?,
+            ns_key: opt.ns_key.clone(),
+        },
+        reqwest::Client::new(),
+    )?;
     let t = Tester::new(
         client.clone(),
         TesterConfig {

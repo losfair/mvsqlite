@@ -114,13 +114,7 @@ pub struct NamespaceCommitIntent {
 }
 
 impl MultiVersionClient {
-    pub fn new(config: MultiVersionClientConfig) -> Result<Arc<Self>> {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-namespace-key", HeaderValue::from_str(&config.ns_key)?);
-
-        let client = reqwest::ClientBuilder::new()
-            .default_headers(headers)
-            .build()?;
+    pub fn new(config: MultiVersionClientConfig, client: reqwest::Client) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { client, config }))
     }
 
@@ -140,7 +134,11 @@ impl MultiVersionClient {
 
         let mut boff = RandomizedExponentialBackoff::default();
         let stat_res: StatResponse = loop {
-            let resp = request_and_check(self.client.get(url.clone())).await?;
+            let resp = request_and_check(self.client.get(url.clone()).header(
+                "x-namespace-key",
+                HeaderValue::from_str(&self.config.ns_key)?,
+            ))
+            .await?;
             match resp {
                 Some((_, body)) => break serde_json::from_slice(&body)?,
                 None => {
@@ -325,9 +323,17 @@ impl Transaction {
         let raw_request = Bytes::from(raw_request);
         let mut boff = RandomizedExponentialBackoff::default();
         loop {
-            let response =
-                request_and_check(self.c.client.post(url.clone()).body(raw_request.clone()))
-                    .await?;
+            let response = request_and_check(
+                self.c
+                    .client
+                    .post(url.clone())
+                    .header(
+                        "x-namespace-key",
+                        HeaderValue::from_str(&self.c.config.ns_key)?,
+                    )
+                    .body(raw_request.clone()),
+            )
+            .await?;
             let (_, raw_response) = match response {
                 Some(x) => x,
                 None => {
@@ -376,16 +382,24 @@ impl Transaction {
 
         let mut boff = RandomizedExponentialBackoff::default();
         loop {
-            let response =
-                match request_and_check(c.client.post(url.clone()).body(raw_request.clone())).await
-                {
-                    Ok(x) => x,
-                    Err(e) => {
-                        tracing::error!(error = %e, "background page write failed");
-                        async_ctx.has_error.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                };
+            let response = match request_and_check(
+                c.client
+                    .post(url.clone())
+                    .header(
+                        "x-namespace-key",
+                        HeaderValue::from_str(&c.config.ns_key).unwrap(),
+                    )
+                    .body(raw_request.clone()),
+            )
+            .await
+            {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!(error = %e, "background page write failed");
+                    async_ctx.has_error.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
             let (_, raw_response) = match response {
                 Some(x) => x,
                 None => {

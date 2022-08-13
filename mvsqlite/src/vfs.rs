@@ -24,6 +24,7 @@ pub struct MultiVersionVfs {
     pub data_plane: String,
     pub io: Arc<IoEngine>,
     pub sector_size: usize,
+    pub http_client: reqwest::Client,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -57,13 +58,16 @@ impl Vfs for MultiVersionVfs {
                 },
             )
         };
-        let client = MultiVersionClient::new(MultiVersionClientConfig {
-            data_plane: self
-                .data_plane
-                .parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-            ns_key: ns_key.to_string(),
-        })
+        let client = MultiVersionClient::new(
+            MultiVersionClientConfig {
+                data_plane: self
+                    .data_plane
+                    .parse()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                ns_key: ns_key.to_string(),
+            },
+            self.http_client.clone(),
+        )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let first_page = match self.sector_size {
@@ -399,10 +403,40 @@ impl DatabaseHandle for Connection {
                     None,
                 ))
             } else {
-                let client = self.client.clone();
-                self.io
-                    .run(async move { client.create_transaction_with_info().await })
-                    .map(|(txn, md)| (txn, Some(md)))
+                let res = CURRENT_COMMIT_GROUP.with(|cg| {
+                    let cg = cg.borrow();
+                    if let Some(cg) = &*cg {
+                        if cg.lock_disabled {
+                            if let Some(version) = &cg.current_version {
+                                return Some((
+                                    self.client.create_transaction_at_version(version, false),
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                    None
+                });
+                if let Some(res) = res {
+                    Ok(res)
+                } else {
+                    let client = self.client.clone();
+                    let res = self
+                        .io
+                        .run(async move { client.create_transaction_with_info().await })
+                        .map(|(txn, md)| (txn, Some(md)));
+                    if let Ok(res) = &res {
+                        CURRENT_COMMIT_GROUP.with(|cg| {
+                            let mut cg = cg.borrow_mut();
+                            if let Some(cg) = &mut *cg {
+                                if cg.lock_disabled {
+                                    cg.current_version.replace(res.0.version().to_string());
+                                }
+                            }
+                        })
+                    }
+                    res
+                }
             };
             let (txn, md) = match txn_info {
                 Ok(x) => x,
@@ -420,16 +454,6 @@ impl DatabaseHandle for Connection {
         let reserved_level = lock_level(LockKind::Reserved);
 
         if lock_level(self.lock) < reserved_level && lock_level(lock) >= reserved_level {
-            let md = match self.txn_metadata.as_mut() {
-                Some(x) => x,
-                None => {
-                    tracing::error!(
-                        "cannot promote the lock on a fixed-version transaction to exclusive"
-                    );
-                    return Ok(false);
-                }
-            };
-
             let lock_disabled = CURRENT_COMMIT_GROUP.with(|cg| {
                 let cg = cg.borrow();
                 if let Some(cg) = &*cg {
@@ -440,6 +464,16 @@ impl DatabaseHandle for Connection {
             });
 
             if !lock_disabled {
+                let md = match self.txn_metadata.as_mut() {
+                    Some(x) => x,
+                    None => {
+                        tracing::error!(
+                            "cannot promote the lock on a fixed-version transaction to exclusive"
+                        );
+                        return Ok(false);
+                    }
+                };
+
                 let txn = self.txn.as_ref().unwrap();
                 if txn.is_read_only() {
                     tracing::error!("cannot acquire reserved lock on read-only transaction");
