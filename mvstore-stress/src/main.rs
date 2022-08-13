@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         MultiVersionClientConfig {
             data_plane: opt.data_plane.parse()?,
             ns_key: opt.ns_key.clone(),
+            ns_key_hashproof: None,
         },
         reqwest::Client::new(),
     )?;
