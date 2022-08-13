@@ -103,6 +103,7 @@ pub struct CommitGlobalInit<'a> {
 pub struct CommitNamespaceInit<'a> {
     pub version: &'a str,
     pub ns_key: &'a str,
+    pub ns_key_hashproof: Option<&'a str>,
     pub metadata: Option<&'a str>,
     pub num_pages: u32,
 }
@@ -680,11 +681,40 @@ impl Server {
         }
     }
 
-    async fn lookup_nskey(&self, nskey: &str) -> Result<Option<[u8; 10]>> {
+    async fn lookup_nskey(&self, nskey: &str, hashproof: Option<&str>) -> Result<Option<[u8; 10]>> {
         enum GetError {
             NotFound,
             Other(anyhow::Error),
         }
+
+        let hashproof_hash = {
+            let segs = nskey.split(":").collect::<Vec<_>>();
+            if segs.len() < 2 {
+                None
+            } else {
+                Some(segs[1])
+            }
+        };
+        if let Some(hashproof_hash) = hashproof_hash {
+            let mut hash: [u8; 32] = [0u8; 32];
+            if hex::decode_to_slice(hashproof_hash, &mut hash).is_err() {
+                tracing::error!(nskey, "hashproof_hash hex decode failed");
+                return Ok(None);
+            }
+            let proof = match hex::decode(hashproof.unwrap_or("")) {
+                Ok(x) => x,
+                Err(_) => {
+                    tracing::error!(nskey, "hashproof hex decode failed");
+                    return Ok(None);
+                }
+            };
+            let hashed_proof = blake3::hash(&proof);
+            if !constant_time_eq::constant_time_eq_n(hashed_proof.as_bytes(), &hash) {
+                tracing::error!(nskey, "hashproof mismatch");
+                return Ok(None);
+            }
+        }
+
         let res = self
             .nskey_cache
             .try_get_with(nskey.to_string(), async {
@@ -731,7 +761,11 @@ impl Server {
                         .unwrap())
                 }
             };
-            let ns_id = self.lookup_nskey(ns_key).await?;
+            let hashproof = req
+                .headers()
+                .get("x-namespace-hashproof")
+                .map(|x| x.to_str().unwrap_or_default());
+            let ns_id = self.lookup_nskey(ns_key, hashproof).await?;
             let ns_id = match ns_id {
                 Some(x) => x,
                 None => {
@@ -1232,7 +1266,10 @@ impl Server {
                     }
                     total_page_count += init.num_pages as usize;
 
-                    let ns_id = match self.lookup_nskey(init.ns_key).await? {
+                    let ns_id = match self
+                        .lookup_nskey(init.ns_key, init.ns_key_hashproof)
+                        .await?
+                    {
                         Some(x) => x,
                         None => {
                             return Ok(Response::builder()

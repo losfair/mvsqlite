@@ -39,6 +39,8 @@ pub struct MultiVersionClientConfig {
 
     /// Namespace key.
     pub ns_key: String,
+
+    pub ns_key_hashproof: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +92,7 @@ pub struct CommitGlobalInit<'a> {
 #[derive(Serialize)]
 pub struct CommitNamespaceInit {
     pub ns_key: String,
+    pub ns_key_hashproof: Option<String>,
     pub version: String,
     pub metadata: Option<String>,
     pub num_pages: u32,
@@ -134,11 +137,7 @@ impl MultiVersionClient {
 
         let mut boff = RandomizedExponentialBackoff::default();
         let stat_res: StatResponse = loop {
-            let resp = request_and_check(self.client.get(url.clone()).header(
-                "x-namespace-key",
-                HeaderValue::from_str(&self.config.ns_key)?,
-            ))
-            .await?;
+            let resp = request_and_check(self.client.get(url.clone()).decorate(self)).await?;
             match resp {
                 Some((_, body)) => break serde_json::from_slice(&body)?,
                 None => {
@@ -327,10 +326,7 @@ impl Transaction {
                 self.c
                     .client
                     .post(url.clone())
-                    .header(
-                        "x-namespace-key",
-                        HeaderValue::from_str(&self.c.config.ns_key)?,
-                    )
+                    .decorate(&self.c)
                     .body(raw_request.clone()),
             )
             .await?;
@@ -385,10 +381,7 @@ impl Transaction {
             let response = match request_and_check(
                 c.client
                     .post(url.clone())
-                    .header(
-                        "x-namespace-key",
-                        HeaderValue::from_str(&c.config.ns_key).unwrap(),
-                    )
+                    .decorate(&c)
                     .body(raw_request.clone()),
             )
             .await
@@ -507,6 +500,7 @@ impl Transaction {
                 metadata,
                 num_pages: self.page_buffer.len() as u32,
                 ns_key: self.c.config.ns_key.clone(),
+                ns_key_hashproof: self.c.config.ns_key_hashproof.clone(),
             },
             requests: Vec::with_capacity(self.page_buffer.len()),
         };
@@ -573,5 +567,23 @@ async fn request_and_check_returning_status(
         let text = res.text().await.unwrap_or_default();
         tracing::warn!(status = %status, text = %text, "client error");
         Err(status)
+    }
+}
+
+trait DecorateRequest {
+    fn decorate(self, c: &MultiVersionClient) -> RequestBuilder;
+}
+
+impl DecorateRequest for RequestBuilder {
+    fn decorate(self, c: &MultiVersionClient) -> RequestBuilder {
+        let mut me = self.header(
+            "x-namespace-key",
+            HeaderValue::from_str(&c.config.ns_key).unwrap(),
+        );
+
+        if let Some(x) = &c.config.ns_key_hashproof {
+            me = me.header("x-namespace-hashproof", HeaderValue::from_str(x).unwrap())
+        }
+        me
     }
 }

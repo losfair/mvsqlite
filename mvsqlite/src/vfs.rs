@@ -40,11 +40,6 @@ impl Vfs for MultiVersionVfs {
         db: &str,
         opts: crate::sqlite_vfs::OpenOptions,
     ) -> Result<Self::Handle, std::io::Error> {
-        tracing::info!(kind = ?opts.kind, access = ?opts.access, db = db, "open db");
-        if !matches!(opts.kind, OpenKind::MainDb) {
-            return Ok(Box::new(TempFile::new()));
-        }
-
         let db_str_segs = db.split("@").collect::<Vec<_>>();
         let (ns_key, fixed_version) = if db_str_segs.len() < 2 {
             (db_str_segs[0], None)
@@ -58,6 +53,29 @@ impl Vfs for MultiVersionVfs {
                 },
             )
         };
+        let (ns_key, ns_key_hashproof) = {
+            let segs = ns_key.split(":").collect::<Vec<_>>();
+            if segs.len() < 2 {
+                (ns_key.to_string(), None)
+            } else {
+                let first_part = segs[0];
+                let segs = segs[1].split(".").collect::<Vec<_>>();
+                if segs.len() < 2 {
+                    (ns_key.to_string(), None)
+                } else {
+                    (
+                        format!("{}:{}", first_part, segs[0]),
+                        Some(segs[1].to_string()),
+                    )
+                }
+            }
+        };
+
+        tracing::info!(kind = ?opts.kind, access = ?opts.access, ns_key = ns_key, "open file");
+        if !matches!(opts.kind, OpenKind::MainDb) {
+            return Ok(Box::new(TempFile::new()));
+        }
+
         let client = MultiVersionClient::new(
             MultiVersionClientConfig {
                 data_plane: self
@@ -65,6 +83,7 @@ impl Vfs for MultiVersionVfs {
                     .parse()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                 ns_key: ns_key.to_string(),
+                ns_key_hashproof,
             },
             self.http_client.clone(),
         )
