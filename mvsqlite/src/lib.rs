@@ -10,35 +10,29 @@ pub mod vfs;
 
 use std::sync::Arc;
 
-use backtrace::Backtrace;
-use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
-
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
 
 pub static VFS_NAME: &'static str = "mv-vfs";
 
-#[no_mangle]
-pub extern "C" fn init_mvsqlite() {
-    if std::env::var("MVSQLITE_LOG_JSON").unwrap_or_default() == "1" {
-        SubscriberBuilder::default()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_writer(std::io::stderr)
-            .json()
-            .init();
-    } else {
-        SubscriberBuilder::default()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_writer(std::io::stderr)
-            .pretty()
-            .init();
-    }
+static GLOBAL_INIT_DONE: std::sync::Once = std::sync::Once::new();
 
-    std::panic::set_hook(Box::new(|info| {
-        let bt = Backtrace::new();
-        tracing::error!(backtrace = ?bt, "{}", info);
+pub struct InitOptions {
+    pub coroutine: bool,
+}
+
+pub fn init_with_options(opts: InitOptions) {
+    let mut ok = false;
+    GLOBAL_INIT_DONE.call_once(|| {
+        init_with_options_impl(opts);
+        ok = true;
+    });
+    if !ok {
+        eprintln!("mvsqlite: already initialized");
         std::process::abort();
-    }));
+    }
+}
 
+fn init_with_options_impl(opts: InitOptions) {
     let mut sector_size: usize = 8192;
     if let Ok(s) = std::env::var("MVSQLITE_SECTOR_SIZE") {
         let requested_ss = s
@@ -51,7 +45,7 @@ pub extern "C" fn init_mvsqlite() {
     }
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
-    let io_engine = Arc::new(IoEngine::new(false));
+    let io_engine = Arc::new(IoEngine::new(opts.coroutine));
     let vfs = MultiVersionVfs {
         data_plane,
         io: io_engine,
@@ -61,6 +55,46 @@ pub extern "C" fn init_mvsqlite() {
 
     sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");
     tracing::info!(sector_size = sector_size, "mvsqlite initialized");
+}
+
+#[no_mangle]
+#[cfg(not(feature = "global-init"))]
+pub extern "C" fn init_mvsqlite() {
+    GLOBAL_INIT_DONE.call_once(|| {
+        eprintln!("mvsqlite: global init not enabled");
+        std::process::abort();
+    });
+}
+
+#[no_mangle]
+#[cfg(feature = "global-init")]
+pub extern "C" fn init_mvsqlite() {
+    use backtrace::Backtrace;
+    use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
+
+    GLOBAL_INIT_DONE.call_once(|| {
+        if std::env::var("MVSQLITE_LOG_JSON").unwrap_or_default() == "1" {
+            SubscriberBuilder::default()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .json()
+                .init();
+        } else {
+            SubscriberBuilder::default()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .pretty()
+                .init();
+        }
+
+        std::panic::set_hook(Box::new(|info| {
+            let bt = Backtrace::new();
+            tracing::error!(backtrace = ?bt, "{}", info);
+            std::process::abort();
+        }));
+
+        init_with_options_impl(InitOptions { coroutine: false });
+    });
 }
 
 #[no_mangle]

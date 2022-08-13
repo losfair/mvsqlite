@@ -8,7 +8,7 @@ description = "mvsqlite"
 repository = "https://github.com/losfair/mvsqlite"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 anyhow = "1"
@@ -29,9 +29,12 @@ moka = "0.9.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lazy_static = "1.4.0"
-reqwest = { version = "0.11.11", features = ["json"] }
+reqwest = { version = "0.11.11", default-features = false }
 
 [features]
-default = ["loadext", "syscall"]
+default = ["loadext", "syscall", "default-tls", "global-init"]
 loadext = []
 syscall = []
+default-tls = ["reqwest/default-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
+global-init = []

@@ -19,13 +19,20 @@ typedef int (*sqlite3_open_v2_fn)(
 );
 
 static sqlite3_open_v2_fn real_sqlite3_open_v2 = NULL;
+static int mvsqlite_enabled = 0;
 
 void mvsqlite_global_init(void) {
+    mvsqlite_enabled = 1;
+}
+
+static void bootstrap(void) {
     real_sqlite3_open_v2 = dlsym(RTLD_NEXT, "sqlite3_open_v2");
     if (real_sqlite3_open_v2 == NULL) {
         fprintf(stderr, "Failed to find real sqlite3_open_v2\n");
         exit(1);
     }
+
+    init_mvsqlite();
 }
 
 static pthread_once_t vfs_init = PTHREAD_ONCE_INIT;
@@ -38,7 +45,7 @@ int sqlite3_open_v2(
 ) {
     int ret;
 
-    pthread_once(&vfs_init, init_mvsqlite);
+    pthread_once(&vfs_init, bootstrap);
     ret = real_sqlite3_open_v2(filename, ppDb, flags, zVfs);
     if(ret == SQLITE_OK) {
         init_mvsqlite_connection(*ppDb);
