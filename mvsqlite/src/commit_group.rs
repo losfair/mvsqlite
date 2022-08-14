@@ -4,7 +4,10 @@ use mvclient::{MultiVersionClient, NamespaceCommitIntent};
 
 use crate::{
     io_engine::IoEngine,
-    sqlite_c::{sqlite3_context, sqlite3_result_null, sqlite3_result_text, sqlite3_value},
+    sqlite_c::{
+        sqlite3_context, sqlite3_result_error, sqlite3_result_null, sqlite3_result_text,
+        sqlite3_value,
+    },
 };
 
 pub struct CommitGroup {
@@ -47,17 +50,20 @@ thread_local! {
 }
 
 pub unsafe extern "C" fn mv_commitgroup_begin(
-    _ctx: *mut sqlite3_context,
+    ctx: *mut sqlite3_context,
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
     CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
-        assert!(
-            cg.is_none(),
-            "mv_commitgroup_begin called while another commit group is open"
-        );
-        *cg = Some(CommitGroup::default());
+        if cg.is_some() {
+            throw(
+                ctx,
+                "mv_commitgroup_begin called recursively in a commit group",
+            );
+        } else {
+            *cg = Some(CommitGroup::default());
+        }
     })
 }
 
@@ -66,11 +72,21 @@ pub unsafe extern "C" fn mv_commitgroup_commit(
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
-    let mut cg = CURRENT_COMMIT_GROUP.with(|cg| {
+    let cg = CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
         cg.take()
-            .expect("mv_commitgroup_commit called without a commit group open")
     });
+
+    let mut cg = match cg {
+        Some(x) => x,
+        None => {
+            throw(
+                ctx,
+                "mv_commitgroup_commit called without a commit group open",
+            );
+            return;
+        }
+    };
 
     if cg.intents.is_empty() {
         sqlite3_result_null(ctx);
@@ -113,15 +129,25 @@ pub unsafe extern "C" fn mv_commitgroup_commit(
 }
 
 pub unsafe extern "C" fn mv_commitgroup_rollback(
-    _ctx: *mut sqlite3_context,
+    ctx: *mut sqlite3_context,
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
-    let mut cg = CURRENT_COMMIT_GROUP.with(|cg| {
+    let cg = CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
         cg.take()
-            .expect("mv_commitgroup_rollback called without a commit group open")
     });
+
+    let mut cg = match cg {
+        Some(x) => x,
+        None => {
+            throw(
+                ctx,
+                "mv_commitgroup_rollback called without a commit group open",
+            );
+            return;
+        }
+    };
 
     if cg.intents.is_empty() {
         return;
@@ -155,31 +181,50 @@ pub unsafe extern "C" fn mv_commitgroup_rollback(
 }
 
 pub unsafe extern "C" fn mv_commitgroup_lock_disable(
-    _ctx: *mut sqlite3_context,
+    ctx: *mut sqlite3_context,
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
     CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
-        let cg = cg
-            .as_mut()
-            .expect("mv_commitgroup_lock_disable called without a commit group open");
-
-        cg.lock_disabled = true;
+        match &mut *cg {
+            Some(cg) => {
+                cg.lock_disabled = true;
+            }
+            None => {
+                throw(
+                    ctx,
+                    "mv_commitgroup_lock_disable called outside a commit group",
+                );
+            }
+        }
     });
 }
 
 pub unsafe extern "C" fn mv_commitgroup_lock_enable(
-    _ctx: *mut sqlite3_context,
+    ctx: *mut sqlite3_context,
     _argc: ::std::os::raw::c_int,
     _argv: *mut *mut sqlite3_value,
 ) {
     CURRENT_COMMIT_GROUP.with(|cg| {
         let mut cg = cg.borrow_mut();
-        let cg = cg
-            .as_mut()
-            .expect("mv_commitgroup_lock_enable called without a commit group open");
-
-        cg.lock_disabled = false;
+        match &mut *cg {
+            Some(cg) => {
+                cg.lock_disabled = false;
+            }
+            None => {
+                throw(
+                    ctx,
+                    "mv_commitgroup_lock_enable called outside a commit group",
+                );
+            }
+        }
     });
+}
+
+fn throw(ctx: *mut sqlite3_context, msg: &str) {
+    let msg = msg.as_bytes();
+    unsafe {
+        sqlite3_result_error(ctx, msg.as_ptr() as *const _, msg.len() as i32);
+    }
 }
