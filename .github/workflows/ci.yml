@@ -28,8 +28,8 @@ jobs:
         run: cargo build --release -p mvstore
       - name: Build (mvsqlite)
         run: cargo build --release -p mvsqlite
-      - name: Build (mvsqlite-preload)
-        run: make -C ./mvsqlite-preload
+      - name: Build (shared libraries)
+        run: make -C ./mvsqlite-preload build-preload && make -C ./mvsqlite-preload build-lib
       - name: Build (mvstore-stress)
         run: cargo build --release -p mvstore-stress
       - name: Collect binaries
@@ -40,6 +40,7 @@ jobs:
           cp ../target/release/mvstore ./
           cp ../target/release/mvstore-stress ./
           cp ../mvsqlite-preload/libmvsqlite_preload.so ./
+          cp ../mvsqlite-preload/libmvsqlite.a ./
           find . -type f -exec sha256sum '{}' ';'
       - name: Push binaries
         uses: actions/upload-artifact@v3
@@ -320,5 +321,6 @@ jobs:
         files: |
           build/mvstore
           build/libmvsqlite_preload.so
+          build/libmvsqlite.a
           deb/*.deb
         prerelease: true

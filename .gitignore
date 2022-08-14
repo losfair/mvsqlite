@@ -1,3 +1,4 @@
 target/
 *.so
 *.o
+*.a
