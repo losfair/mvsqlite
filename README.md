@@ -8,8 +8,10 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - [mvsqlite](#mvsqlite)
   - [Features](#features)
+  - [Releases](#releases)
   - [Demo](#demo)
   - [Try it](#try-it)
+  - [Contributing](#contributing)
 
 ## Features
 
@@ -18,6 +20,10 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 - **Zero-overhead multi-database transactions**: While each SQLite database remains single-writer, you can horizontally scale your application with multi-database strictly serializable transactions without additional overhead. [How to use](https://github.com/losfair/mvsqlite/wiki/Commit-group)
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
 - **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
+
+## Releases
+
+Grab the latest binaries from the [Releases](https://github.com/losfair/mvsqlite/releases) page. You can also [build your own binaries](#contributing) to run on a platform other than x86-64.
 
 ## Demo
 
@@ -38,11 +44,18 @@ wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb
 sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 ```
 
-Build and run `mvstore`, the server-side half that should be colocated with the FoundationDB cluster in production:
+Download the binaries:
 
 ```bash
-cargo build --release -p mvstore
-RUST_LOG=info ./target/release/mvstore \
+curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.10/libmvsqlite_preload.so
+curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.10/mvstore
+chmod +x ./mvstore
+```
+
+Run `mvstore`, the server-side half that should be colocated with the FoundationDB cluster in production:
+
+```bash
+RUST_LOG=info ./mvstore \
   --data-plane 127.0.0.1:7000 \
   --admin-api 127.0.0.1:7001 \
   --metadata-prefix mvstore-test \
@@ -53,13 +66,6 @@ Create a namespace with the admin API:
 
 ```bash
 curl http://localhost:7001/api/create_namespace -i -d '{"key":"test","metadata":""}'
-```
-
-Build the client library:
-
-```bash
-cargo build --release -p mvsqlite
-make -C ./mvsqlite-preload
 ```
 
 Build `libsqlite3` and the `sqlite3` CLI: (note that a custom build is only needed here because the `sqlite3` binary shipped on most systems are statically linked to `libsqlite3` and `LD_PRELOAD` don't work)
@@ -78,7 +84,19 @@ Set environment variables, and run the shell:
 export RUST_LOG=info MVSQLITE_DATA_PLANE="http://localhost:7000"
 
 # "test" is the key of the namespace we created earlier
-LD_PRELOAD=../mvsqlite-preload/libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite3 test
+LD_PRELOAD=../libmvsqlite_preload.so LD_LIBRARY_PATH=. ./sqlite3 test
 ```
 
 You should see the sqlite shell now :) Try creating a table and play with it.
+
+## Contributing
+
+mvsqlite can be built with the standard Rust toolchain:
+
+```bash
+cargo build --release -p mvstore
+cargo build --release -p mvsqlite
+make -C mvsqlite-preload
+```
+
+Internals are documented in the [wiki](https://github.com/losfair/mvsqlite/wiki).
