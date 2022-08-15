@@ -21,6 +21,7 @@ pub enum CommitResult {
     Committed { versionstamp: [u8; 10] },
     Conflict,
     BadPageReference,
+    NamespaceNotDistinct,
 }
 
 pub struct CommitContext<'a> {
@@ -45,7 +46,7 @@ impl Server {
             .len();
         if num_distinct_ns_id != ctx.namespaces.len() {
             // conflict with itself
-            return Ok(CommitResult::Conflict);
+            return Ok(CommitResult::NamespaceNotDistinct);
         }
 
         // Begin the writes.

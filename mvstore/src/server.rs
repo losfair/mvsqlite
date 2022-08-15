@@ -1328,6 +1328,11 @@ impl Server {
                     CommitResult::Conflict => {
                         res = Response::builder().status(409).body(Body::empty())?;
                     }
+                    CommitResult::NamespaceNotDistinct => {
+                        res = Response::builder()
+                            .status(400)
+                            .body(Body::from("namespace not distinct"))?;
+                    }
                 }
             }
             "/time2version" => {
