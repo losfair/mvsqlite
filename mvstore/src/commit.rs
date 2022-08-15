@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::atomic::{AtomicUsize, Ordering},
     time::SystemTime,
 };
@@ -36,6 +37,17 @@ pub struct CommitNamespaceContext {
 
 impl Server {
     pub async fn commit<'a>(&self, ctx: CommitContext<'a>) -> Result<CommitResult> {
+        let num_distinct_ns_id = ctx
+            .namespaces
+            .iter()
+            .map(|x| x.ns_id)
+            .collect::<HashSet<_>>()
+            .len();
+        if num_distinct_ns_id != ctx.namespaces.len() {
+            // conflict with itself
+            return Ok(CommitResult::Conflict);
+        }
+
         // Begin the writes.
         // We do two-phase commit (not that 2PC!) for large transactions here.
         let num_total_writes = ctx

@@ -422,9 +422,15 @@ impl DatabaseHandle for Connection {
                     None,
                 ))
             } else {
+                let mut early_fail = false;
                 let res = CURRENT_COMMIT_GROUP.with(|cg| {
                     let cg = cg.borrow();
                     if let Some(cg) = &*cg {
+                        if !cg.is_empty() {
+                            tracing::error!("no new transaction can begin after the first commit in a commit group");
+                            early_fail = true;
+                            return None;
+                        }
                         if cg.lock_disabled {
                             if let Some(version) = &cg.current_version {
                                 return Some((
@@ -436,6 +442,9 @@ impl DatabaseHandle for Connection {
                     }
                     None
                 });
+                if early_fail {
+                    return Ok(false);
+                }
                 if let Some(res) = res {
                     Ok(res)
                 } else {

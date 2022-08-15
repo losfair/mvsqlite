@@ -43,6 +43,9 @@ impl CommitGroup {
     pub fn append(&mut self, intent: NamespaceCommitIntent) {
         self.intents.push(intent);
     }
+    pub fn is_empty(&self) -> bool {
+        self.intents.is_empty()
+    }
 }
 
 thread_local! {
