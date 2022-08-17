@@ -96,9 +96,13 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_KNOB_GC_FRESH_PAGE_TTL_SECS")]
     knob_gc_fresh_page_ttl_secs: Option<u64>,
 
-    /// ADVANCED. Configure the threshold (in number of pages) to enable multi-phase commit.
+    /// ADVANCED. Configure the threshold (in number of pages) above which multi-phase commit is enabled (inclusive).
     #[structopt(long, env = "MVSTORE_KNOB_COMMIT_MULTI_PHASE_THRESHOLD")]
     knob_commit_multi_phase_threshold: Option<usize>,
+
+    /// ADVANCED. Configure the threshold (in number of pages) below which page-level conflict check is enabled (inclusive).
+    #[structopt(long, env = "MVSTORE_KNOB_PLCC_READ_SET_SIZE_THRESHOLD")]
+    knob_plcc_read_set_size_threshold: Option<usize>,
 }
 
 async fn async_main(opt: Opt) -> Result<()> {
@@ -115,6 +119,11 @@ async fn async_main(opt: Opt) -> Result<()> {
     if let Some(x) = opt.knob_commit_multi_phase_threshold {
         commit::COMMIT_MULTI_PHASE_THRESHOLD.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured commit multi-phase threshold");
+    }
+
+    if let Some(x) = opt.knob_plcc_read_set_size_threshold {
+        commit::PLCC_READ_SET_SIZE_THRESHOLD.store(x, Ordering::Relaxed);
+        tracing::info!(value = x, "configured plcc read set size threshold");
     }
 
     let server = Server::open(ServerConfig {

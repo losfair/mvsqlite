@@ -11,7 +11,7 @@ use hyper::{Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     pin::Pin,
     sync::Arc,
@@ -34,6 +34,7 @@ const MAX_PAGES_PER_BATCH_READ: usize = 100;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
+const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 
 pub struct Server {
     pub db: Database,
@@ -106,6 +107,7 @@ pub struct CommitNamespaceInit<'a> {
     pub ns_key_hashproof: Option<&'a str>,
     pub metadata: Option<&'a str>,
     pub num_pages: u32,
+    pub read_set: Option<HashSet<u32>>,
 }
 
 #[derive(Deserialize)]
@@ -844,7 +846,15 @@ impl Server {
                 if self.read_only {
                     txn.set_option(TransactionOption::ReadLockAware).unwrap();
                 }
-                let buf = self.get_read_version_as_versionstamp(&txn).await?;
+
+                let mut version = [0u8; 10];
+                let last_write_version_key = self.construct_last_write_version_key(ns_id);
+                if let Some(t) = txn.get(&last_write_version_key, false).await? {
+                    if t.len() == 16 + 10 {
+                        version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
+                    }
+                }
+
                 let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
                 let nsmd = nsmd
                     .as_ref()
@@ -852,7 +862,7 @@ impl Server {
                     .unwrap_or_default();
 
                 let stat = StatResponse {
-                    version: hex::encode(&buf),
+                    version: hex::encode(&version),
                     metadata: nsmd,
                     read_only: self.read_only,
                 };
@@ -1255,7 +1265,7 @@ impl Server {
                         .await
                         .with_context(|| "missing commit init")?
                         .with_context(|| "invalid commit init")?;
-                    let init: CommitNamespaceInit = rmp_serde::from_slice(&init)
+                    let mut init: CommitNamespaceInit = rmp_serde::from_slice(&init)
                         .with_context(|| "error deserializing commit init")?;
                     if total_page_count.saturating_add(init.num_pages as usize)
                         > MAX_PAGES_PER_COMMIT
@@ -1285,6 +1295,8 @@ impl Server {
                         client_assumed_version,
                         index_writes: Vec::new(),
                         metadata: init.metadata.map(|x| x.to_string()),
+                        use_read_set: init.read_set.is_some(),
+                        read_set: init.read_set.take().unwrap_or_default(),
                     };
 
                     for _ in 0..init.num_pages {
@@ -1320,9 +1332,13 @@ impl Server {
                             .status(410)
                             .body(Body::from("bad page reference"))?;
                     }
-                    CommitResult::Committed { versionstamp } => {
+                    CommitResult::Committed {
+                        versionstamp,
+                        last_write_version,
+                    } => {
                         res = Response::builder()
                             .header(COMMITTED_VERSION_HDR_NAME, hex::encode(&versionstamp))
+                            .header(LAST_VERSION_HDR_NAME, hex::encode(&last_write_version))
                             .body(Body::empty())?;
                     }
                     CommitResult::Conflict => {
@@ -1421,15 +1437,18 @@ impl Server {
         Ok(res)
     }
 
-    async fn read_page_hash(
+    pub async fn read_page_hash(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
         page_index: u32,
-        page_version_hex: &str,
+        page_version_hex: Option<&str>,
     ) -> Result<Option<(String, [u8; 32])>> {
-        let page_version = decode_version(&page_version_hex)?;
-        if self.read_only {
+        let page_version = match page_version_hex {
+            Some(x) => decode_version(x)?,
+            None => [0xffu8; 10],
+        };
+        if self.read_only && page_version != [0xffu8; 10] {
             let current_rv = txn.get_read_version().await?;
             let requested_rv = i64::from_be_bytes(page_version[0..8].try_into().unwrap());
             if current_rv < requested_rv {
@@ -1471,7 +1490,7 @@ impl Server {
         page_version_hex: &str,
     ) -> Result<Option<Page>> {
         let (version, hash) = match self
-            .read_page_hash(txn, ns_id, page_index, page_version_hex)
+            .read_page_hash(txn, ns_id, page_index, Some(page_version_hex))
             .await?
         {
             Some(x) => x,
@@ -1609,7 +1628,7 @@ impl Server {
         let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
 
         let (_, delta_base_hash) = match self
-            .read_page_hash(&txn, ns_id, base_page_index, &version_hex)
+            .read_page_hash(&txn, ns_id, base_page_index, Some(version_hex.as_str()))
             .await?
         {
             Some(x) => x,
@@ -1778,7 +1797,7 @@ fn prepend_length(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn decode_version(version: &str) -> Result<[u8; 10]> {
+pub fn decode_version(version: &str) -> Result<[u8; 10]> {
     let mut bytes = [0u8; 10];
     hex::decode_to_slice(version, &mut bytes).with_context(|| "cannot decode version")?;
     Ok(bytes)
