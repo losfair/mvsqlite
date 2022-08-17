@@ -54,8 +54,8 @@ sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 Download the binaries:
 
 ```bash
-curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.10/libmvsqlite_preload.so
-curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.10/mvstore
+curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.11/libmvsqlite_preload.so
+curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.11/mvstore
 chmod +x ./mvstore
 ```
 
