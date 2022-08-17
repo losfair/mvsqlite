@@ -322,11 +322,12 @@ impl Transaction {
         self.read_set = None;
     }
 
-    pub fn read_set_size(&self) -> usize {
+    pub fn read_write_set_total_size(&self) -> usize {
         self.read_set
             .as_ref()
             .map(|x| x.lock().unwrap().len())
             .unwrap_or(0)
+            + self.page_buffer.len()
     }
 
     pub fn is_read_set_enabled(&self) -> bool {

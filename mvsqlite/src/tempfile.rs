@@ -25,7 +25,7 @@ impl TempFile {
 impl DatabaseHandle for TempFile {
     type WalIndex = WalDisabled;
 
-    fn size(&self) -> Result<u64, std::io::Error> {
+    fn size(&mut self) -> Result<u64, std::io::Error> {
         Ok(self.state.lock().unwrap().data.len() as u64)
     }
 

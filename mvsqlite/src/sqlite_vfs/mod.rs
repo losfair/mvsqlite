@@ -24,7 +24,7 @@ pub trait DatabaseHandle: Sync {
     type WalIndex: wip::WalIndex;
 
     /// Return the current size in bytes of the database.
-    fn size(&self) -> Result<u64, std::io::Error>;
+    fn size(&mut self) -> Result<u64, std::io::Error>;
 
     /// Reads the exact number of byte required to fill `buf` from the given `offset`.
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error>;
