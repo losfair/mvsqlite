@@ -96,6 +96,7 @@ pub struct CommitNamespaceInit {
     pub version: String,
     pub metadata: Option<String>,
     pub num_pages: u32,
+    pub read_set: Option<HashSet<u32>>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +110,13 @@ pub struct CommitResult {
     pub version: String,
     pub duration: Duration,
     pub num_pages: u64,
+    pub last_version: String,
+}
+
+pub enum CommitOutput {
+    Committed(CommitResult),
+    Conflict,
+    Empty,
 }
 
 pub struct NamespaceCommitIntent {
@@ -175,8 +183,8 @@ impl MultiVersionClient {
                 has_error: AtomicBool::new(false),
             }),
             seen_hashes: Mutex::new(HashSet::new()),
-            start_time: Instant::now(),
             read_only,
+            read_set: None,
         };
 
         txn
@@ -248,11 +256,16 @@ impl MultiVersionClient {
                 .get("x-committed-version")
                 .with_context(|| format!("missing committed version header"))?
                 .to_str()?;
+            let last_version = headers
+                .get("x-last-version")
+                .with_context(|| format!("missing last version header"))?
+                .to_str()?;
             tracing::debug!(version = committed_version, "committed transaction");
             return Ok(Some(CommitResult {
                 version: committed_version.into(),
                 duration: start_time.elapsed(),
                 num_pages: total_num_pages as u64,
+                last_version: last_version.into(),
             }));
         }
     }
@@ -264,8 +277,8 @@ pub struct Transaction {
     page_buffer: HashMap<u32, [u8; 32]>,
     async_ctx: Arc<TxnAsyncCtx>,
     seen_hashes: Mutex<HashSet<[u8; 32]>>,
-    start_time: Instant,
     read_only: bool,
+    read_set: Option<Mutex<HashSet<u32>>>,
 }
 
 pub struct TransactionInfo {
@@ -298,10 +311,37 @@ impl Transaction {
             Ok(())
         }
     }
+
+    pub fn enable_read_set(&mut self) {
+        if self.read_set.is_none() {
+            self.read_set = Some(Mutex::new(HashSet::new()));
+        }
+    }
+
+    pub fn disable_read_set(&mut self) {
+        self.read_set = None;
+    }
+
+    pub fn read_set_size(&self) -> usize {
+        self.read_set
+            .as_ref()
+            .map(|x| x.lock().unwrap().len())
+            .unwrap_or(0)
+    }
+
+    pub fn is_read_set_enabled(&self) -> bool {
+        self.read_set.is_some()
+    }
+
     pub async fn read_many(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
+
+        if let Some(rs) = &self.read_set {
+            let mut rs = rs.lock().unwrap();
+            rs.extend(page_id_list.iter().cloned());
+        }
 
         let mut raw_request: Vec<u8> = Vec::new();
 
@@ -501,6 +541,7 @@ impl Transaction {
                 num_pages: self.page_buffer.len() as u32,
                 ns_key: self.c.config.ns_key.clone(),
                 ns_key_hashproof: self.c.config.ns_key_hashproof.clone(),
+                read_set: self.read_set.as_ref().map(|x| x.lock().unwrap().clone()),
             },
             requests: Vec::with_capacity(self.page_buffer.len()),
         };
@@ -516,18 +557,15 @@ impl Transaction {
         Ok(Some(out))
     }
 
-    pub async fn commit(self, metadata: Option<&str>) -> Result<Option<CommitResult>> {
+    pub async fn commit(self, metadata: Option<&str>) -> Result<CommitOutput> {
         let intent = match self.commit_intent(metadata.map(|x| x.to_string())).await? {
             Some(x) => x,
-            None => {
-                return Ok(Some(CommitResult {
-                    version: self.version,
-                    duration: self.start_time.elapsed(),
-                    num_pages: 0,
-                }))
-            }
+            None => return Ok(CommitOutput::Empty),
         };
-        self.c.apply_commit_intents(&[intent]).await
+        Ok(match self.c.apply_commit_intents(&[intent]).await? {
+            Some(x) => CommitOutput::Committed(x),
+            None => CommitOutput::Conflict,
+        })
     }
 }
 
