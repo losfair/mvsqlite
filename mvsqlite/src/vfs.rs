@@ -558,7 +558,7 @@ impl DatabaseHandle for Connection {
 
                 // If it is unlikely that a plcc commit can succeed, disable it locally first to save
                 // bandwidth and prevent message-too-large errors.
-                if txn.read_write_set_total_size() > 500 {
+                if txn.read_write_set_total_size() > 2000 {
                     txn.disable_read_set();
                 }
 

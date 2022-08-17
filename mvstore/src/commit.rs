@@ -16,7 +16,7 @@ use rand::RngCore;
 use crate::server::{decode_version, generate_suffix_versionstamp_atomic_op, ContentIndex, Server};
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
-pub static PLCC_READ_SET_SIZE_THRESHOLD: AtomicUsize = AtomicUsize::new(500);
+pub static PLCC_READ_SET_SIZE_THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 
 pub enum CommitResult {
     Committed {
