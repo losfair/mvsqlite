@@ -1094,6 +1094,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "backtrace",
+ "base64",
  "ctor",
  "lazy_static",
  "libc",
