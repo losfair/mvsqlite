@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
@@ -449,14 +448,12 @@ impl DatabaseHandle for Connection {
                             early_fail = true;
                             return None;
                         }
-                        if cg.lock_disabled {
                             if let Some(version) = &cg.current_version {
                                 return Some((
                                     self.client.create_transaction_at_version(version, false),
                                     None,
                                 ));
                             }
-                        }
                     }
                     None
                 });
@@ -475,9 +472,7 @@ impl DatabaseHandle for Connection {
                         CURRENT_COMMIT_GROUP.with(|cg| {
                             let mut cg = cg.borrow_mut();
                             if let Some(cg) = &mut *cg {
-                                if cg.lock_disabled {
-                                    cg.current_version.replace(res.0.version().to_string());
-                                }
+                                cg.current_version.replace(res.0.version().to_string());
                             }
                         })
                     }
@@ -510,88 +505,7 @@ impl DatabaseHandle for Connection {
             self.txn = Some(txn);
             self.txn_metadata = md;
         }
-
-        let reserved_level = lock_level(LockKind::Reserved);
-
-        if lock_level(self.lock) < reserved_level && lock_level(lock) >= reserved_level {
-            let lock_disabled = true
-                || CURRENT_COMMIT_GROUP.with(|cg| {
-                    let cg = cg.borrow();
-                    if let Some(cg) = &*cg {
-                        cg.lock_disabled
-                    } else {
-                        false
-                    }
-                });
-
-            if !lock_disabled {
-                let md = match self.txn_metadata.as_mut() {
-                    Some(x) => x,
-                    None => {
-                        tracing::error!(
-                            "cannot promote the lock on a fixed-version transaction to exclusive"
-                        );
-                        return Ok(false);
-                    }
-                };
-
-                let txn = self.txn.as_ref().unwrap();
-                if txn.is_read_only() {
-                    tracing::error!("cannot acquire reserved lock on read-only transaction");
-                    return Ok(false);
-                }
-
-                // Acquire a one-minute lock.
-                // TODO: Lock renew
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if let Some(lock) = md.lock {
-                    if now < lock {
-                        tracing::error!("failed to acquire lock: hold by another connection");
-                        return Ok(false);
-                    }
-                }
-
-                let mut new_md = md.clone();
-                new_md.lock = Some(now + 60);
-                let metadata =
-                    serde_json::to_string(&new_md).expect("failed to serialize metadata");
-                let lock_res = self.io.run(async {
-                    let lock_txn = self
-                        .client
-                        .create_transaction_at_version(txn.version(), false);
-                    lock_txn
-                        .commit(Some(metadata.as_str()))
-                        .await
-                        .expect("lock txn commit failed")
-                });
-                match lock_res {
-                    CommitOutput::Committed(info) => {
-                        self.txn = Some(
-                            self.client
-                                .create_transaction_at_version(&info.version, false),
-                        );
-                        self.lock = lock;
-                        *md = new_md;
-                        return Ok(true);
-                    }
-                    CommitOutput::Empty => {
-                        tracing::error!("failed to acquire lock: got empty commit output");
-                        return Ok(false);
-                    }
-                    CommitOutput::Conflict => {
-                        tracing::error!("failed to acquire lock: conflict");
-                        return Ok(false);
-                    }
-                }
-            } else {
-                self.lock = lock;
-            }
-        } else {
-            self.lock = lock;
-        }
+        self.lock = lock;
 
         Ok(true)
     }
