@@ -100,6 +100,35 @@ jobs:
           sleep 1
           curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
+  stress-disable-read-set:
+    name: mvstore stress test (disable read set)
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Fetch binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: build
+          path: ./build
+      - name: Run it
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvstore-stress
+          export RUST_LOG=info
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000 --disable-read-set
   stress-small-gc-batch:
     name: mvstore stress test (small gc batch)
     runs-on: ubuntu-20.04
@@ -304,6 +333,7 @@ jobs:
     - stress-small-gc-batch
     - stress-gc-nofresh
     - stress-commit-multi-phase
+    - stress-disable-read-set
     - build-deb
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-20.04

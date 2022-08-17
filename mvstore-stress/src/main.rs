@@ -46,6 +46,10 @@ struct Opt {
     /// Permit HTTP 410 commit responses.
     #[structopt(long)]
     permit_410: bool,
+
+    /// Disable read sets.
+    #[structopt(long)]
+    disable_read_set: bool,
 }
 
 #[tokio::main]
@@ -85,6 +89,7 @@ async fn main() -> Result<()> {
             num_pages: opt.pages,
             disable_ryw: opt.disable_ryw,
             permit_410: opt.permit_410,
+            disable_read_set: opt.disable_read_set,
         },
     );
     t.run(opt.concurrency as _, opt.iterations as _).await;

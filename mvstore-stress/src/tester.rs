@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::RwLock;
 
 use anyhow::Result;
-use mvclient::{CommitError, MultiVersionClient, Transaction};
+use mvclient::{CommitError, CommitOutput, MultiVersionClient, Transaction};
 use rand::{thread_rng, Rng, RngCore};
 
 use crate::inmem::Inmem;
@@ -23,6 +23,7 @@ pub struct TesterConfig {
     pub admin_api: String,
     pub num_pages: u32,
     pub permit_410: bool,
+    pub disable_read_set: bool,
 }
 
 impl Tester {
@@ -171,7 +172,7 @@ impl Tester {
         }
     }
 
-    async fn task(self: Arc<Self>, _task_id: usize, iterations: usize) -> Result<()> {
+    async fn task(self: Arc<Self>, task_id: usize, iterations: usize) -> Result<()> {
         let mut mem = self.mem.write().await;
         let mut txn = self.client.create_transaction().await?;
         let mut txn_id = mem.start_transaction(txn.version());
@@ -179,9 +180,9 @@ impl Tester {
         drop(mem);
 
         let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.config.num_pages as usize];
-        for _ in 0..iterations {
+        for it in 0..iterations {
             let mode = rand::thread_rng().gen_range(0..11);
-            //tracing::info!(task = task_id, iteration = it, mode = mode, "iteration");
+            tracing::debug!(task = task_id, iteration = it, mode = mode, "iteration");
             match mode {
                 0..=5 => {
                     let num_reads_requested = rand::thread_rng().gen_range(1..=10);
@@ -193,9 +194,16 @@ impl Tester {
                         continue;
                     }
                     let pages = txn.read_many(&reads).await?;
-                    let mem = self.mem.read().await;
+                    let mut mem = self.mem.write().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
-                        //tracing::info!(task = task_id, iteration = it, index = index, "read");
+                        tracing::debug!(
+                            task = task_id,
+                            txn_id,
+                            iteration = it,
+                            index = index,
+                            version = txn.version(),
+                            "read"
+                        );
                         mem.verify_page(txn_id, index, page, txn.version());
                     }
                 }
@@ -225,7 +233,14 @@ impl Tester {
                                 last_writes[index as usize] = Some(data.clone());
                             }
 
-                            //tracing::info!(task = task_id, iteration = it, index = index, "write");
+                            tracing::debug!(
+                                task = task_id,
+                                txn_id,
+                                iteration = it,
+                                index = index,
+                                version = txn.version(),
+                                "write"
+                            );
 
                             (index, data)
                         })
@@ -243,11 +258,13 @@ impl Tester {
                 8 => {
                     let mut mem = self.mem.write().await;
                     let version = txn.version().to_string();
+                    let txn_version = txn.version().to_string();
                     match txn.commit(None).await {
-                        Ok(Some(info)) => {
-                            mem.commit_transaction(txn_id, &info.version);
+                        Ok(CommitOutput::Committed(info)) => {
+                            mem.commit_transaction(txn_id, &info.version, txn_version.as_str());
                         }
-                        Ok(None) => mem.drop_transaction(txn_id),
+                        Ok(CommitOutput::Conflict) => mem.drop_transaction(txn_id),
+                        Ok(CommitOutput::Empty) => mem.drop_transaction(txn_id),
                         Err(e) => {
                             let mut ignore = false;
                             if let Some(x) = e.downcast_ref::<CommitError>() {
@@ -272,7 +289,7 @@ impl Tester {
                     drop(mem);
                     tokio::task::yield_now().await;
                     (txn, txn_id) = self.create_transaction_random_base().await?;
-                    //tracing::info!(version = txn.version(), "created txn");
+                    tracing::debug!(version = txn.version(), "created txn");
                 }
                 9 => {
                     let mut mem = self.mem.write().await;
@@ -281,7 +298,7 @@ impl Tester {
                     drop(mem);
                     tokio::task::yield_now().await;
                     (txn, txn_id) = self.create_transaction_random_base().await?;
-                    //tracing::info!(version = txn.version(), "created txn");
+                    tracing::debug!(version = txn.version(), "created txn");
                 }
                 10 => {
                     let dur_millis = rand::thread_rng().gen_range(1..100);
@@ -299,16 +316,22 @@ impl Tester {
 
         if thread_rng().gen_bool(0.5) {
             if let Some(version) = mem.pick_random_version() {
-                let txn = self.client.create_transaction_at_version(version, false);
+                let mut txn = self.client.create_transaction_at_version(version, false);
                 let txn_id = mem.start_transaction(txn.version());
                 self.acquire_version(txn.version());
+                if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
+                    txn.enable_read_set();
+                }
                 return Ok((txn, txn_id));
             }
         }
 
-        let txn = self.client.create_transaction().await?;
+        let mut txn = self.client.create_transaction().await?;
         let txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
+        if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
+            txn.enable_read_set();
+        }
         Ok((txn, txn_id))
     }
 }

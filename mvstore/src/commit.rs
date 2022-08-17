@@ -13,12 +13,16 @@ use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use rand::RngCore;
 
-use crate::server::{generate_suffix_versionstamp_atomic_op, ContentIndex, Server};
+use crate::server::{decode_version, generate_suffix_versionstamp_atomic_op, ContentIndex, Server};
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
+pub static PLCC_READ_SET_SIZE_THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 
 pub enum CommitResult {
-    Committed { versionstamp: [u8; 10] },
+    Committed {
+        versionstamp: [u8; 10],
+        last_write_version: [u8; 10],
+    },
     Conflict,
     BadPageReference,
     NamespaceNotDistinct,
@@ -32,6 +36,8 @@ pub struct CommitContext<'a> {
 pub struct CommitNamespaceContext {
     pub ns_id: [u8; 10],
     pub client_assumed_version: [u8; 10],
+    pub use_read_set: bool,
+    pub read_set: HashSet<u32>,
     pub index_writes: Vec<(u32, [u8; 32])>,
     pub metadata: Option<String>,
 }
@@ -49,6 +55,8 @@ impl Server {
             return Ok(CommitResult::NamespaceNotDistinct);
         }
 
+        let mut last_write_version: [u8; 10] = [0u8; 10];
+
         // Begin the writes.
         // We do two-phase commit (not that 2PC!) for large transactions here.
         let num_total_writes = ctx
@@ -57,6 +65,13 @@ impl Server {
             .map(|x| x.index_writes.len())
             .sum::<usize>();
         let multi_phase = num_total_writes >= COMMIT_MULTI_PHASE_THRESHOLD.load(Ordering::Relaxed);
+        let plcc_enable = !multi_phase
+            && ctx
+                .namespaces
+                .iter()
+                .map(|x| x.read_set.len() + x.index_writes.len())
+                .sum::<usize>()
+                <= PLCC_READ_SET_SIZE_THRESHOLD.load(Ordering::Relaxed);
         let mut commit_token = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut commit_token);
         tracing::debug!(
@@ -67,33 +82,10 @@ impl Server {
             "entering commit"
         );
 
-        // Phase 1 - Idempotency && Check page existence
+        // Phase 1 - Check page existence
         let mut txn = self.db.create_trx()?;
         let mut phase_1_ci_get_futures = FuturesOrdered::new();
         for ns in ctx.namespaces.iter() {
-            let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
-            let last_write_version = txn.get(&last_write_version_key, false).await?;
-            match &last_write_version {
-                Some(x) if x.len() != 16 + 10 => {
-                    anyhow::bail!("invalid last write version");
-                }
-                Some(x) => {
-                    let actual_idempotency_key = <[u8; 16]>::try_from(&x[0..16]).unwrap();
-                    let actual_last_write_version = <[u8; 10]>::try_from(&x[16..26]).unwrap();
-
-                    if actual_idempotency_key == ctx.idempotency_key {
-                        return Ok(CommitResult::Committed {
-                            versionstamp: actual_last_write_version,
-                        });
-                    }
-
-                    if ns.client_assumed_version < actual_last_write_version {
-                        return Ok(CommitResult::Conflict);
-                    }
-                }
-                None => {}
-            }
-
             for (_, page_hash) in &ns.index_writes {
                 let content_index_key = self.construct_contentindex_key(ns.ns_id, *page_hash);
                 phase_1_ci_get_futures.push(txn.get(&content_index_key, false));
@@ -140,6 +132,74 @@ impl Server {
                 txn.set(&metadata_key, md.as_bytes());
             }
 
+            let plcc_enable_ns = plcc_enable && ns.use_read_set;
+
+            // Idempotency & non-plcc conflict check
+            {
+                let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
+                let actual_lwv_value = txn.get(&last_write_version_key, false).await?;
+
+                if let Some(t) = actual_lwv_value {
+                    if t.len() == 16 + 10 {
+                        let actual_idempotency_token = <[u8; 16]>::try_from(&t[0..16]).unwrap();
+                        let actual_last_write_version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
+                        if actual_idempotency_token == ctx.idempotency_key {
+                            return Ok(CommitResult::Committed {
+                                versionstamp: actual_last_write_version,
+                                last_write_version: [0xff; 10],
+                            });
+                        }
+
+                        if ns.client_assumed_version < actual_last_write_version {
+                            if !plcc_enable_ns {
+                                return Ok(CommitResult::Conflict);
+                            }
+                        }
+
+                        last_write_version = last_write_version.max(actual_last_write_version);
+                    }
+                }
+                let mut new_lwv_value = [0u8; 16 + 10 + 4];
+                new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
+                new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
+                txn.atomic_op(
+                    &last_write_version_key,
+                    &new_lwv_value,
+                    MutationType::SetVersionstampedValue,
+                );
+            }
+
+            // Fine-grained conflict check
+            if plcc_enable_ns {
+                let mut fut_list = FuturesOrdered::new();
+                let check_set: HashSet<u32> = ns
+                    .read_set
+                    .iter()
+                    .copied()
+                    .chain(ns.index_writes.iter().map(|x| x.0))
+                    .collect();
+                for &page in &check_set {
+                    let read_page_hash_fut = self.read_page_hash(&txn, ns.ns_id, page, None);
+                    fut_list.push(async move { (page, read_page_hash_fut.await) });
+                }
+
+                while let Some((page, data)) = fut_list.next().await {
+                    let data = data?;
+                    if let Some((version, _)) = data {
+                        let version = decode_version(&version)?;
+                        if version > ns.client_assumed_version {
+                            tracing::warn!(
+                                page,
+                                page_version = hex::encode(&version),
+                                client_assumed_version = hex::encode(&ns.client_assumed_version),
+                                "page-level conflict check failed"
+                            );
+                            return Ok(CommitResult::Conflict);
+                        }
+                    }
+                }
+            }
+
             for (page_index, page_hash) in &ns.index_writes {
                 let page_key_template = self.construct_page_key(ns.ns_id, *page_index, [0u8; 10]);
                 let page_key_atomic_op = generate_suffix_versionstamp_atomic_op(&page_key_template);
@@ -170,16 +230,6 @@ impl Server {
                     ConflictRangeType::Write,
                 )?;
             }
-            let mut last_write_version_atomic_op_value = [0u8; 16 + 10 + 4];
-            last_write_version_atomic_op_value[0..16].copy_from_slice(&ctx.idempotency_key);
-            last_write_version_atomic_op_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
-
-            let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
-            txn.atomic_op(
-                &last_write_version_key,
-                &last_write_version_atomic_op_value,
-                MutationType::SetVersionstampedValue,
-            );
         }
 
         let versionstamp_fut = txn.get_versionstamp();
@@ -187,6 +237,7 @@ impl Server {
         let versionstamp = versionstamp_fut.await?;
         Ok(CommitResult::Committed {
             versionstamp: <[u8; 10]>::try_from(&versionstamp[..]).unwrap(),
+            last_write_version,
         })
     }
 }

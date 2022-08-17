@@ -1,11 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
 };
 
-use mvclient::{MultiVersionClient, MultiVersionClientConfig, Transaction};
+use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
     commit_group::CURRENT_COMMIT_GROUP,
@@ -108,7 +107,9 @@ impl Vfs for MultiVersionVfs {
             txn_metadata: None,
             sector_size: self.sector_size,
             first_page,
-            size_cache_in_bytes: Mutex::new(None),
+            file_change_counter: 0,
+            page_0_cache: None,
+            last_known_write_version: None,
         };
         let conn = Box::new(conn);
 
@@ -159,7 +160,11 @@ pub struct Connection {
     txn_metadata: Option<NsMetadata>,
 
     first_page: Vec<u8>,
-    size_cache_in_bytes: Mutex<Option<u64>>,
+
+    file_change_counter: u32,
+    page_0_cache: Option<Vec<u8>>,
+
+    last_known_write_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -219,9 +224,17 @@ impl TransitionHistory {
 }
 
 impl Connection {
-    fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+    fn do_read_raw(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
+
+        if offset == 0 {
+            if let Some(x) = &self.page_0_cache {
+                buf.copy_from_slice(x);
+                tracing::debug!("page 0 cache reuse");
+                return Ok(());
+            }
+        }
 
         let txn = self.txn.as_mut().unwrap();
         let num_pages = buf.len() / self.sector_size;
@@ -268,7 +281,7 @@ impl Connection {
             if offset == 0 {
                 buf.copy_from_slice(&self.first_page);
             } else {
-                buf.iter_mut().for_each(|b| *b = 0);
+                panic!("read on non-existing page: offset={}", offset);
             }
         } else {
             if offset == 0 {
@@ -280,6 +293,20 @@ impl Connection {
             }
             buf.copy_from_slice(&page);
         }
+
+        if offset == 0 {
+            self.page_0_cache = Some(buf.to_vec());
+            tracing::info!(header = base64::encode(&buf[0..100]), "page 0 read");
+        }
+        Ok(())
+    }
+
+    fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        self.do_read_raw(buf, offset)?;
+        if offset == 0 {
+            buf[24..28].copy_from_slice(&self.file_change_counter.to_be_bytes());
+            buf[92..96].copy_from_slice(&self.file_change_counter.to_be_bytes());
+        }
         Ok(())
     }
 }
@@ -287,34 +314,16 @@ impl Connection {
 impl DatabaseHandle for Connection {
     type WalIndex = WalDisabled;
 
-    fn size(&self) -> Result<u64, std::io::Error> {
-        if let Some(x) = self.size_cache_in_bytes.lock().unwrap().as_ref() {
-            return Ok(*x);
+    fn size(&mut self) -> Result<u64, std::io::Error> {
+        if self.txn.is_none() {
+            tracing::warn!("file_size called without a transaction");
+            return Ok(self.sector_size as u64 * u32::MAX as u64);
         }
-
-        let txn = match &self.txn {
-            Some(x) => x,
-            None => {
-                tracing::warn!("file_size called without a transaction");
-                return Ok(self.sector_size as u64 * u32::MAX as u64);
-            }
-        };
-
-        let mut pzero = self
-            .io
-            .run(txn.read_many(&[0]))
-            .expect("unrecoverable read failure")
-            .into_iter()
-            .next()
-            .unwrap();
-        if pzero.is_empty() {
-            pzero = self.first_page.clone();
-        }
-
+        let mut pzero = vec![0u8; self.sector_size];
+        self.read_exact_at(&mut pzero, 0)?;
         let num_pages = u32::from_be_bytes(pzero[28..32].try_into().unwrap());
         tracing::debug!(num_pages, "db size");
         let size = self.sector_size as u64 * num_pages as u64;
-        self.size_cache_in_bytes.lock().unwrap().replace(size);
         Ok(size)
     }
 
@@ -349,8 +358,9 @@ impl DatabaseHandle for Connection {
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
-        assert!(buf.len() % self.sector_size == 0);
+        assert!(buf.len() == self.sector_size);
 
+        let mut buf = buf.to_vec();
         self.txn_buffered_page = HashMap::new();
         self.history.prev_index = 0;
 
@@ -372,9 +382,16 @@ impl DatabaseHandle for Connection {
                 panic!("attempting to enable wal mode");
             }
 
-            let num_pages = u32::from_be_bytes(buf[28..32].try_into().unwrap());
-            let size = self.sector_size as u64 * num_pages as u64;
-            self.size_cache_in_bytes.lock().unwrap().replace(size);
+            self.file_change_counter = u32::from_be_bytes(buf[24..28].try_into().unwrap());
+            buf[24..28].copy_from_slice(&[0u8; 4]);
+            buf[92..96].copy_from_slice(&[0u8; 4]);
+            if self.page_0_cache.is_some() && self.page_0_cache.as_ref().unwrap() == &buf {
+                tracing::info!("page 0 identity write ignored");
+                return Ok(());
+            }
+
+            self.page_0_cache = Some(buf.clone());
+            tracing::info!(header = base64::encode(&buf[0..100]), "page 0 write");
         }
 
         tracing::debug!(
@@ -431,14 +448,12 @@ impl DatabaseHandle for Connection {
                             early_fail = true;
                             return None;
                         }
-                        if cg.lock_disabled {
                             if let Some(version) = &cg.current_version {
                                 return Some((
                                     self.client.create_transaction_at_version(version, false),
                                     None,
                                 ));
                             }
-                        }
                     }
                     None
                 });
@@ -457,16 +472,14 @@ impl DatabaseHandle for Connection {
                         CURRENT_COMMIT_GROUP.with(|cg| {
                             let mut cg = cg.borrow_mut();
                             if let Some(cg) = &mut *cg {
-                                if cg.lock_disabled {
-                                    cg.current_version.replace(res.0.version().to_string());
-                                }
+                                cg.current_version.replace(res.0.version().to_string());
                             }
                         })
                     }
                     res
                 }
             };
-            let (txn, md) = match txn_info {
+            let (mut txn, md) = match txn_info {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::error!(ns_key = self.client.config().ns_key, error = %e, "transaction initialization failed");
@@ -475,86 +488,24 @@ impl DatabaseHandle for Connection {
             };
             let md: Option<NsMetadata> =
                 md.map(|x| serde_json::from_str(&x.metadata).unwrap_or_default());
+
+            // Flush SQLite page cache
+            if self.last_known_write_version.is_none()
+                || self.last_known_write_version.as_ref().unwrap() != txn.version()
+            {
+                if self.last_known_write_version.is_some() {
+                    tracing::warn!("non-local change detected, invalidating cache");
+                }
+                self.last_known_write_version = Some(txn.version().to_string());
+                self.file_change_counter = self.file_change_counter.wrapping_add(1);
+                self.page_0_cache = None;
+            }
+
+            txn.enable_read_set();
             self.txn = Some(txn);
             self.txn_metadata = md;
         }
-
-        let reserved_level = lock_level(LockKind::Reserved);
-
-        if lock_level(self.lock) < reserved_level && lock_level(lock) >= reserved_level {
-            let lock_disabled = CURRENT_COMMIT_GROUP.with(|cg| {
-                let cg = cg.borrow();
-                if let Some(cg) = &*cg {
-                    cg.lock_disabled
-                } else {
-                    false
-                }
-            });
-
-            if !lock_disabled {
-                let md = match self.txn_metadata.as_mut() {
-                    Some(x) => x,
-                    None => {
-                        tracing::error!(
-                            "cannot promote the lock on a fixed-version transaction to exclusive"
-                        );
-                        return Ok(false);
-                    }
-                };
-
-                let txn = self.txn.as_ref().unwrap();
-                if txn.is_read_only() {
-                    tracing::error!("cannot acquire reserved lock on read-only transaction");
-                    return Ok(false);
-                }
-
-                // Acquire a one-minute lock.
-                // TODO: Lock renew
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if let Some(lock) = md.lock {
-                    if now < lock {
-                        tracing::error!("failed to acquire lock: hold by another connection");
-                        return Ok(false);
-                    }
-                }
-
-                let mut new_md = md.clone();
-                new_md.lock = Some(now + 60);
-                let metadata =
-                    serde_json::to_string(&new_md).expect("failed to serialize metadata");
-                let lock_res = self.io.run(async {
-                    let lock_txn = self
-                        .client
-                        .create_transaction_at_version(txn.version(), false);
-                    lock_txn
-                        .commit(Some(metadata.as_str()))
-                        .await
-                        .expect("lock txn commit failed")
-                });
-                match lock_res {
-                    Some(info) => {
-                        self.txn = Some(
-                            self.client
-                                .create_transaction_at_version(&info.version, false),
-                        );
-                        self.lock = lock;
-                        *md = new_md;
-                        return Ok(true);
-                    }
-                    None => {
-                        tracing::error!("failed to acquire lock: conflict");
-                        return Ok(false);
-                    }
-                }
-            } else {
-                self.lock = lock;
-            }
-        } else {
-            self.lock = lock;
-        }
+        self.lock = lock;
 
         Ok(true)
     }
@@ -569,6 +520,7 @@ impl DatabaseHandle for Connection {
         self.lock = lock;
 
         let reserved_level = lock_level(LockKind::Reserved);
+        let mut commit_ok = true;
 
         if lock_level(prev_lock) >= reserved_level && lock_level(lock) < reserved_level {
             // Write
@@ -578,7 +530,7 @@ impl DatabaseHandle for Connection {
             } else {
                 None
             };
-            let txn = self
+            let mut txn = self
                 .txn
                 .take()
                 .expect("did not find transaction for commit");
@@ -602,15 +554,47 @@ impl DatabaseHandle for Connection {
                 .expect("failed to append to commit group");
 
             if !cg_ok {
+                let read_version = txn.version().to_string();
+
+                // If it is unlikely that a plcc commit can succeed, disable it locally first to save
+                // bandwidth and prevent message-too-large errors.
+                if txn.read_write_set_total_size() > 2000 {
+                    txn.disable_read_set();
+                }
+
                 let result = self
                     .io
                     .run(async { txn.commit(md.as_ref().map(|x| x.as_str())).await });
 
-                // At this point we don't have a reliable way to propagate the error. So, we have
-                // to abort the process.
                 let result = result.expect("transaction commit failed");
-                let result = result.expect("transaction conflict");
-                tracing::info!(version = result.version, duration = ?result.duration, num_pages = result.num_pages, "transaction committed");
+                match result {
+                    CommitOutput::Committed(result) => {
+                        self.last_known_write_version = Some(result.version.clone());
+                        if result.last_version > read_version {
+                            // Invalidate page cache
+                            self.file_change_counter = self.file_change_counter.wrapping_add(1);
+                            self.page_0_cache = None;
+                            tracing::warn!(
+                                "non-local concurrent transaction detected, invalidating cache"
+                            );
+                        }
+                        tracing::info!(
+                            version = result.version,
+                            duration = ?result.duration,
+                            num_pages = result.num_pages,
+                            read_version,
+                            last_version = result.last_version,
+                            new_file_change_counter = self.file_change_counter,
+                            "transaction committed");
+                    }
+                    CommitOutput::Conflict => {
+                        tracing::warn!("transaction conflict");
+                        commit_ok = false;
+                    }
+                    CommitOutput::Empty => {
+                        tracing::info!("transaction is empty");
+                    }
+                }
             }
         }
 
@@ -620,10 +604,9 @@ impl DatabaseHandle for Connection {
             self.txn_buffered_page = HashMap::new();
             self.txn_metadata = None;
             self.history.prev_index = 0;
-            self.size_cache_in_bytes.lock().unwrap().take();
         }
 
-        Ok(true)
+        Ok(commit_ok)
     }
 
     fn reserved(&mut self) -> Result<bool, std::io::Error> {
@@ -642,7 +625,7 @@ impl DatabaseHandle for Connection {
 impl<W: WalIndex> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
     type WalIndex = W;
 
-    fn size(&self) -> Result<u64, std::io::Error> {
+    fn size(&mut self) -> Result<u64, std::io::Error> {
         (**self).size()
     }
 
