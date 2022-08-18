@@ -107,6 +107,7 @@ impl Vfs for MultiVersionVfs {
             first_page,
             page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
             write_buffer: HashMap::new(),
+            virtual_version_counter: 0,
             last_known_write_version: None,
         };
         let conn = Box::new(conn);
@@ -160,6 +161,7 @@ pub struct Connection {
 
     page_cache: Cache<u32, Arc<[u8]>>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
+    virtual_version_counter: u32,
 
     last_known_write_version: Option<String>,
 }
@@ -300,8 +302,8 @@ impl Connection {
     fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         self.do_read_raw(buf, offset)?;
         if offset == 0 {
-            buf[24..28].copy_from_slice(&[0u8; 4]);
-            buf[92..96].copy_from_slice(&[0u8; 4]);
+            buf[24..28].copy_from_slice(&self.virtual_version_counter.to_be_bytes());
+            buf[92..96].copy_from_slice(&self.virtual_version_counter.to_be_bytes());
         }
         Ok(())
     }
@@ -508,6 +510,9 @@ impl DatabaseHandle for Connection {
 
             txn.enable_read_set();
             self.txn = Some(txn);
+
+            // Ensure that SQLite's own cache is invalidated
+            self.virtual_version_counter = self.virtual_version_counter.wrapping_add(2);
         }
         self.lock = lock;
 
