@@ -8,7 +8,7 @@ pub mod sqlite_vfs;
 pub mod tempfile;
 pub mod vfs;
 
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
 
@@ -42,6 +42,12 @@ fn init_with_options_impl(opts: InitOptions) {
             panic!("MVSQLITE_SECTOR_SIZE must be one of 4096, 8192, 16384, 32768");
         }
         sector_size = requested_ss;
+    }
+    if let Ok(s) = std::env::var("MVSQLITE_PAGE_CACHE_SIZE") {
+        let requested = s
+            .parse::<usize>()
+            .expect("MVSQLITE_PAGE_CACHE_SIZE must be a usize");
+        vfs::PAGE_CACHE_SIZE.store(requested, Ordering::Relaxed);
     }
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");

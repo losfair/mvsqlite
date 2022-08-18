@@ -322,27 +322,27 @@ impl Transaction {
         self.read_set = None;
     }
 
-    pub fn read_write_set_total_size(&self) -> usize {
+    pub fn read_set_size(&self) -> usize {
         self.read_set
             .as_ref()
             .map(|x| x.lock().unwrap().len())
             .unwrap_or(0)
-            + self.page_buffer.len()
     }
 
     pub fn is_read_set_enabled(&self) -> bool {
         self.read_set.is_some()
     }
 
-    pub async fn read_many(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+    pub fn mark_read(&self, page_id: u32) {
+        if let Some(read_set) = &self.read_set {
+            read_set.lock().unwrap().insert(page_id);
+        }
+    }
+
+    pub async fn read_many_nomark(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
-
-        if let Some(rs) = &self.read_set {
-            let mut rs = rs.lock().unwrap();
-            rs.extend(page_id_list.iter().cloned());
-        }
 
         let mut raw_request: Vec<u8> = Vec::new();
 

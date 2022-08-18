@@ -63,21 +63,14 @@ impl Inmem {
             num_prev_versions += 1;
         }
 
-        let this_rw_set: HashSet<u32> = this
-            .read_set
-            .iter()
-            .copied()
-            .chain(this.write_set.iter().copied())
-            .collect();
-
         // Ensure no intersection
         if write_set
             .iter()
             .copied()
-            .chain(this_rw_set.iter().copied())
+            .chain(this.read_set.iter().copied())
             .collect::<HashSet<_>>()
             .len()
-            != write_set.len() + this_rw_set.len()
+            != write_set.len() + this.read_set.len()
         {
             panic!("conflict detected");
         }

@@ -193,7 +193,10 @@ impl Tester {
                     if reads.len() == 0 {
                         continue;
                     }
-                    let pages = txn.read_many(&reads).await?;
+                    for &id in &reads {
+                        txn.mark_read(id);
+                    }
+                    let pages = txn.read_many_nomark(&reads).await?;
                     let mut mem = self.mem.write().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
                         tracing::debug!(

@@ -1,7 +1,11 @@
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
@@ -18,6 +22,7 @@ static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template
 static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
 static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../template_16k.db");
 static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
+pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
@@ -107,8 +112,8 @@ impl Vfs for MultiVersionVfs {
             txn_metadata: None,
             sector_size: self.sector_size,
             first_page,
-            file_change_counter: 0,
-            page_0_cache: None,
+            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            write_buffer: HashMap::new(),
             last_known_write_version: None,
         };
         let conn = Box::new(conn);
@@ -161,8 +166,8 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    file_change_counter: u32,
-    page_0_cache: Option<Vec<u8>>,
+    page_cache: Cache<u32, Arc<[u8]>>,
+    write_buffer: HashMap<u32, Arc<[u8]>>,
 
     last_known_write_version: Option<String>,
 }
@@ -228,17 +233,19 @@ impl Connection {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
 
-        if offset == 0 {
-            if let Some(x) = &self.page_0_cache {
-                buf.copy_from_slice(x);
-                tracing::debug!("page 0 cache reuse");
-                return Ok(());
-            }
-        }
-
-        let txn = self.txn.as_mut().unwrap();
         let num_pages = buf.len() / self.sector_size;
         let page_offset = u32::try_from(offset as usize / self.sector_size).unwrap();
+        self.txn.as_mut().unwrap().mark_read(page_offset);
+
+        if let Some(x) = &self.page_cache.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("page cache hit");
+            return Ok(());
+        }
+
+        // Ensure we see the latest data
+        self.force_flush_write_buffer();
+        let txn = self.txn.as_mut().unwrap();
 
         tracing::debug!(
             num_pages = num_pages,
@@ -265,7 +272,7 @@ impl Connection {
                 }
 
                 let pages = self.io.run(async {
-                    txn.read_many(&read_vec)
+                    txn.read_many_nomark(&read_vec)
                         .await
                         .expect("unrecoverable read failure")
                 });
@@ -294,20 +301,43 @@ impl Connection {
             buf.copy_from_slice(&page);
         }
 
-        if offset == 0 {
-            self.page_0_cache = Some(buf.to_vec());
-            tracing::info!(header = base64::encode(&buf[0..100]), "page 0 read");
-        }
+        self.page_cache.insert(page_offset, Arc::from(&*buf));
         Ok(())
     }
 
     fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         self.do_read_raw(buf, offset)?;
         if offset == 0 {
-            buf[24..28].copy_from_slice(&self.file_change_counter.to_be_bytes());
-            buf[92..96].copy_from_slice(&self.file_change_counter.to_be_bytes());
+            buf[24..28].copy_from_slice(&[0u8; 4]);
+            buf[92..96].copy_from_slice(&[0u8; 4]);
         }
         Ok(())
+    }
+
+    fn force_flush_write_buffer(&mut self) {
+        let txn = self.txn.as_mut().unwrap();
+
+        if self.write_buffer.is_empty() {
+            return;
+        }
+
+        let entries: Vec<(u32, &[u8])> =
+            self.write_buffer.iter().map(|x| (*x.0, &x.1[..])).collect();
+
+        self.io.run(async {
+            for chunk in entries.chunks(100) {
+                txn.write_many(chunk)
+                    .await
+                    .expect("unrecoverable write failure")
+            }
+        });
+        self.write_buffer.clear();
+    }
+
+    fn maybe_flush_write_buffer(&mut self) {
+        if self.write_buffer.len() >= 1000 {
+            self.force_flush_write_buffer();
+        }
     }
 }
 
@@ -360,11 +390,11 @@ impl DatabaseHandle for Connection {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
 
-        let mut buf = buf.to_vec();
+        let mut buf_arc: Arc<[u8]> = Arc::from(buf);
+        let buf = Arc::get_mut(&mut buf_arc).unwrap();
         self.txn_buffered_page = HashMap::new();
         self.history.prev_index = 0;
 
-        let num_pages = buf.len() / self.sector_size;
         let page_offset = offset as usize / self.sector_size;
         let txn = self
             .txn
@@ -382,38 +412,29 @@ impl DatabaseHandle for Connection {
                 panic!("attempting to enable wal mode");
             }
 
-            self.file_change_counter = u32::from_be_bytes(buf[24..28].try_into().unwrap());
             buf[24..28].copy_from_slice(&[0u8; 4]);
             buf[92..96].copy_from_slice(&[0u8; 4]);
-            if self.page_0_cache.is_some() && self.page_0_cache.as_ref().unwrap() == &buf {
-                tracing::info!("page 0 identity write ignored");
-                return Ok(());
-            }
-
-            self.page_0_cache = Some(buf.clone());
-            tracing::info!(header = base64::encode(&buf[0..100]), "page 0 write");
         }
 
-        tracing::debug!(
-            num_pages = num_pages,
+        if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
+            if &*x == &*buf {
+                tracing::info!(page = page_offset, "identity write ignored");
+                return Ok(());
+            }
+        }
+
+        self.page_cache
+            .insert(page_offset as u32, Arc::clone(&buf_arc));
+        self.write_buffer
+            .insert(page_offset as u32, Arc::clone(&buf_arc));
+
+        tracing::trace!(
             page_offset = page_offset,
             txn_version = txn.version(),
             "write_all_at"
         );
-        let pages = (0..num_pages)
-            .map(|i| {
-                (
-                    (page_offset + i) as u32,
-                    &buf[i * self.sector_size..(i + 1) * self.sector_size],
-                )
-            })
-            .collect::<Vec<_>>();
+        self.maybe_flush_write_buffer();
 
-        self.io.run(async {
-            txn.write_many(&pages)
-                .await
-                .expect("unrecoverable write failure")
-        });
         Ok(())
     }
 
@@ -497,8 +518,7 @@ impl DatabaseHandle for Connection {
                     tracing::warn!("non-local change detected, invalidating cache");
                 }
                 self.last_known_write_version = Some(txn.version().to_string());
-                self.file_change_counter = self.file_change_counter.wrapping_add(1);
-                self.page_0_cache = None;
+                self.page_cache.invalidate_all();
             }
 
             txn.enable_read_set();
@@ -524,6 +544,8 @@ impl DatabaseHandle for Connection {
 
         if lock_level(prev_lock) >= reserved_level && lock_level(lock) < reserved_level {
             // Write
+            self.force_flush_write_buffer();
+
             let md = if let Some(md) = self.txn_metadata.as_mut() {
                 md.lock = None;
                 Some(serde_json::to_string(md).expect("failed to serialize metadata"))
@@ -558,7 +580,7 @@ impl DatabaseHandle for Connection {
 
                 // If it is unlikely that a plcc commit can succeed, disable it locally first to save
                 // bandwidth and prevent message-too-large errors.
-                if txn.read_write_set_total_size() > 2000 {
+                if txn.read_set_size() > 2000 {
                     txn.disable_read_set();
                 }
 
@@ -572,8 +594,7 @@ impl DatabaseHandle for Connection {
                         self.last_known_write_version = Some(result.version.clone());
                         if result.last_version > read_version {
                             // Invalidate page cache
-                            self.file_change_counter = self.file_change_counter.wrapping_add(1);
-                            self.page_0_cache = None;
+                            self.page_cache.invalidate_all();
                             tracing::warn!(
                                 "non-local concurrent transaction detected, invalidating cache"
                             );
@@ -584,7 +605,6 @@ impl DatabaseHandle for Connection {
                             num_pages = result.num_pages,
                             read_version,
                             last_version = result.last_version,
-                            new_file_change_counter = self.file_change_counter,
                             "transaction committed");
                     }
                     CommitOutput::Conflict => {
