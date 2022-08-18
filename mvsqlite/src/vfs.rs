@@ -1,5 +1,4 @@
 use moka::sync::Cache;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -29,11 +28,6 @@ pub struct MultiVersionVfs {
     pub io: Arc<IoEngine>,
     pub sector_size: usize,
     pub http_client: reqwest::Client,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone)]
-pub struct NsMetadata {
-    pub lock: Option<u64>,
 }
 
 impl Vfs for MultiVersionVfs {
@@ -109,7 +103,6 @@ impl Vfs for MultiVersionVfs {
             lock: LockKind::None,
             history: TransitionHistory::default(),
             txn_buffered_page: HashMap::new(),
-            txn_metadata: None,
             sector_size: self.sector_size,
             first_page,
             page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
@@ -162,7 +155,6 @@ pub struct Connection {
 
     /// Clear this when writing or dropping txn!
     txn_buffered_page: HashMap<u32, Vec<u8>>,
-    txn_metadata: Option<NsMetadata>,
 
     first_page: Vec<u8>,
 
@@ -455,10 +447,7 @@ impl DatabaseHandle for Connection {
 
         if self.txn.is_none() {
             let txn_info = if let Some(version) = &self.fixed_version {
-                Ok((
-                    self.client.create_transaction_at_version(version, true),
-                    None,
-                ))
+                Ok(self.client.create_transaction_at_version(version, true))
             } else {
                 let mut early_fail = false;
                 let res = CURRENT_COMMIT_GROUP.with(|cg| {
@@ -470,10 +459,9 @@ impl DatabaseHandle for Connection {
                             return None;
                         }
                             if let Some(version) = &cg.current_version {
-                                return Some((
+                                return Some(
                                     self.client.create_transaction_at_version(version, false),
-                                    None,
-                                ));
+                                );
                             }
                     }
                     None
@@ -487,28 +475,25 @@ impl DatabaseHandle for Connection {
                     let client = self.client.clone();
                     let res = self
                         .io
-                        .run(async move { client.create_transaction_with_info().await })
-                        .map(|(txn, md)| (txn, Some(md)));
+                        .run(async move { client.create_transaction().await });
                     if let Ok(res) = &res {
                         CURRENT_COMMIT_GROUP.with(|cg| {
                             let mut cg = cg.borrow_mut();
                             if let Some(cg) = &mut *cg {
-                                cg.current_version.replace(res.0.version().to_string());
+                                cg.current_version.replace(res.version().to_string());
                             }
                         })
                     }
                     res
                 }
             };
-            let (mut txn, md) = match txn_info {
+            let mut txn = match txn_info {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::error!(ns_key = self.client.config().ns_key, error = %e, "transaction initialization failed");
                     return Ok(false);
                 }
             };
-            let md: Option<NsMetadata> =
-                md.map(|x| serde_json::from_str(&x.metadata).unwrap_or_default());
 
             // Flush SQLite page cache
             if self.last_known_write_version.is_none()
@@ -523,7 +508,6 @@ impl DatabaseHandle for Connection {
 
             txn.enable_read_set();
             self.txn = Some(txn);
-            self.txn_metadata = md;
         }
         self.lock = lock;
 
@@ -546,12 +530,6 @@ impl DatabaseHandle for Connection {
             // Write
             self.force_flush_write_buffer();
 
-            let md = if let Some(md) = self.txn_metadata.as_mut() {
-                md.lock = None;
-                Some(serde_json::to_string(md).expect("failed to serialize metadata"))
-            } else {
-                None
-            };
             let mut txn = self
                 .txn
                 .take()
@@ -564,7 +542,7 @@ impl DatabaseHandle for Connection {
                     let mut cg = cg.borrow_mut();
                     if let Some(cg) = &mut *cg {
                         cg_ok = true;
-                        let intent = self.io.run(async { txn.commit_intent(md.clone()).await })?;
+                        let intent = self.io.run(async { txn.commit_intent(None).await })?;
                         if let Some(intent) = intent {
                             cg.set_client_and_io(&self.client, &self.io);
                             cg.append(intent);
@@ -584,9 +562,7 @@ impl DatabaseHandle for Connection {
                     txn.disable_read_set();
                 }
 
-                let result = self
-                    .io
-                    .run(async { txn.commit(md.as_ref().map(|x| x.as_str())).await });
+                let result = self.io.run(async { txn.commit(None).await });
 
                 let result = result.expect("transaction commit failed");
                 match result {
@@ -622,7 +598,6 @@ impl DatabaseHandle for Connection {
             // All locks dropped
             self.txn = None;
             self.txn_buffered_page = HashMap::new();
-            self.txn_metadata = None;
             self.history.prev_index = 0;
         }
 
