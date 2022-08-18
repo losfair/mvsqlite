@@ -51,10 +51,6 @@ int sqlite3_open_v2(
     ret = real_sqlite3_open_v2(filename, ppDb, flags, zVfs);
     if(ret == SQLITE_OK && mvsqlite_enabled) {
         init_mvsqlite_connection(*ppDb);
-
-        // Return code ignored - this can fail if the database doesn't exist, and we can't really
-        // do anything about it.
-        sqlite3_exec(*ppDb, "PRAGMA cache_size = -50000", NULL, NULL, NULL);
     }
     return ret;
 }

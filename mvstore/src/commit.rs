@@ -69,7 +69,7 @@ impl Server {
             && ctx
                 .namespaces
                 .iter()
-                .map(|x| x.read_set.len() + x.index_writes.len())
+                .map(|x| x.read_set.len())
                 .sum::<usize>()
                 <= PLCC_READ_SET_SIZE_THRESHOLD.load(Ordering::Relaxed);
         let mut commit_token = [0u8; 16];
@@ -172,13 +172,7 @@ impl Server {
             // Fine-grained conflict check
             if plcc_enable_ns {
                 let mut fut_list = FuturesOrdered::new();
-                let check_set: HashSet<u32> = ns
-                    .read_set
-                    .iter()
-                    .copied()
-                    .chain(ns.index_writes.iter().map(|x| x.0))
-                    .collect();
-                for &page in &check_set {
+                for &page in &ns.read_set {
                     let read_page_hash_fut = self.read_page_hash(&txn, ns.ns_id, page, None);
                     fut_list.push(async move { (page, read_page_hash_fut.await) });
                 }
