@@ -317,7 +317,7 @@ impl Connection {
             self.write_buffer.iter().map(|x| (*x.0, &x.1[..])).collect();
 
         self.io.run(async {
-            for chunk in entries.chunks(100) {
+            for chunk in entries.chunks(20) {
                 txn.write_many(chunk)
                     .await
                     .expect("unrecoverable write failure")
