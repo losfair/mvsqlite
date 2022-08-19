@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::atomic::{AtomicUsize, Ordering},
     time::SystemTime,
 };
@@ -17,11 +17,13 @@ use crate::server::{decode_version, generate_suffix_versionstamp_atomic_op, Cont
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
 pub static PLCC_READ_SET_SIZE_THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
+pub static INTERVAL_ENTRY_MAX_SIZE: AtomicUsize = AtomicUsize::new(500);
 
 pub enum CommitResult {
     Committed {
         versionstamp: [u8; 10],
         last_write_version: [u8; 10],
+        changelog: HashMap<String, Vec<u32>>,
     },
     Conflict,
     BadPageReference,
@@ -34,6 +36,7 @@ pub struct CommitContext<'a> {
 }
 
 pub struct CommitNamespaceContext {
+    pub ns_key: String,
     pub ns_id: [u8; 10],
     pub client_assumed_version: [u8; 10],
     pub use_read_set: bool,
@@ -132,6 +135,8 @@ impl Server {
                 txn.set(&metadata_key, md.as_bytes());
             }
 
+            let mut written_pages: BTreeSet<u32> = BTreeSet::new();
+
             let plcc_enable_ns = plcc_enable && ns.use_read_set;
 
             // Idempotency & non-plcc conflict check
@@ -144,9 +149,11 @@ impl Server {
                         let actual_idempotency_token = <[u8; 16]>::try_from(&t[0..16]).unwrap();
                         let actual_last_write_version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
                         if actual_idempotency_token == ctx.idempotency_key {
+                            // This is an idempotent retry - return conservative values
                             return Ok(CommitResult::Committed {
                                 versionstamp: actual_last_write_version,
                                 last_write_version: [0xff; 10],
+                                changelog: HashMap::new(),
                             });
                         }
 
@@ -211,6 +218,7 @@ impl Server {
                     txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
                 }
                 txn.atomic_op(&ci_key, &ci_atomic_op, MutationType::SetVersionstampedValue);
+                written_pages.insert(*page_index);
             }
             if multi_phase {
                 txn.add_conflict_range(
@@ -224,14 +232,56 @@ impl Server {
                     ConflictRangeType::Write,
                 )?;
             }
+
+            let mut changelog: Vec<u8> = vec![];
+
+            if written_pages.len() >= INTERVAL_ENTRY_MAX_SIZE.load(Ordering::Relaxed) {
+                changelog.push(1); // infinite
+            } else {
+                changelog.reserve(1 + written_pages.len() * 4);
+                changelog.push(0);
+                for index in written_pages {
+                    changelog.extend_from_slice(&index.to_be_bytes());
+                }
+            }
+
+            let changelog_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                &self.construct_changelog_key(ns.ns_id, [0u8; 10]),
+            );
+            txn.atomic_op(
+                &changelog_atomic_op_key,
+                &changelog,
+                MutationType::SetVersionstampedKey,
+            );
         }
 
         let versionstamp_fut = txn.get_versionstamp();
         txn.commit().await.map_err(|e| FdbError::from(e))?;
         let versionstamp = versionstamp_fut.await?;
+
+        // Read changelog
+        let mut changelog: HashMap<String, Vec<u32>> = HashMap::new();
+        {
+            let txn = self.db.create_trx()?;
+            for ns in ctx.namespaces {
+                let interval = self
+                    .read_interval(
+                        &txn,
+                        ns.ns_id,
+                        ns.client_assumed_version,
+                        versionstamp[..].try_into().unwrap(),
+                        false,
+                    )
+                    .await?;
+                if let Some(interval) = interval {
+                    changelog.insert(ns.ns_key.clone(), interval);
+                }
+            }
+        }
         Ok(CommitResult::Committed {
             versionstamp: <[u8; 10]>::try_from(&versionstamp[..]).unwrap(),
             last_write_version,
+            changelog,
         })
     }
 }

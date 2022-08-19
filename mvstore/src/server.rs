@@ -44,20 +44,13 @@ pub struct Server {
     nskey_cache: Cache<String, [u8; 10]>,
     read_version_cache: Cache<[u8; 10], i64>,
 
-    read_only: bool,
+    pub read_only: bool,
 }
 
 pub struct ServerConfig {
     pub cluster: String,
     pub raw_data_prefix: String,
     pub metadata_prefix: String,
-    pub read_only: bool,
-}
-
-#[derive(Serialize)]
-pub struct StatResponse<'a> {
-    pub version: String,
-    pub metadata: &'a str,
     pub read_only: bool,
 }
 
@@ -115,6 +108,11 @@ pub struct CommitRequest<'a> {
     pub page_index: u32,
     #[serde(with = "serde_bytes")]
     pub hash: &'a [u8],
+}
+
+#[derive(Serialize)]
+pub struct CommitResponse {
+    pub changelog: HashMap<String, Vec<u32>>,
 }
 
 #[derive(Serialize)]
@@ -838,34 +836,24 @@ impl Server {
         let res: Response<Body>;
         match uri.path() {
             "/stat" => {
+                let query: HashMap<String, String> = uri
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+
                 let (ns_id, _) = match require_ns_id() {
                     Ok(x) => x,
                     Err(x) => return Ok(x),
                 };
-                let txn = self.db.create_trx()?;
-                if self.read_only {
-                    txn.set_option(TransactionOption::ReadLockAware).unwrap();
-                }
-
-                let mut version = [0u8; 10];
-                let last_write_version_key = self.construct_last_write_version_key(ns_id);
-                if let Some(t) = txn.get(&last_write_version_key, false).await? {
-                    if t.len() == 16 + 10 {
-                        version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
-                    }
-                }
-
-                let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
-                let nsmd = nsmd
-                    .as_ref()
-                    .map(|x| std::str::from_utf8(&x[..]).unwrap_or_default())
+                let from_version = query
+                    .get("from_version")
+                    .map(|x| x.as_str())
                     .unwrap_or_default();
-
-                let stat = StatResponse {
-                    version: hex::encode(&version),
-                    metadata: nsmd,
-                    read_only: self.read_only,
-                };
+                let stat = self.stat(ns_id, from_version).await?;
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
 
@@ -1292,6 +1280,7 @@ impl Server {
 
                     let mut ns_ctx = CommitNamespaceContext {
                         ns_id,
+                        ns_key: init.ns_key.to_string(),
                         client_assumed_version,
                         index_writes: Vec::new(),
                         metadata: init.metadata.map(|x| x.to_string()),
@@ -1335,11 +1324,15 @@ impl Server {
                     CommitResult::Committed {
                         versionstamp,
                         last_write_version,
+                        changelog,
                     } => {
+                        let data: CommitResponse = CommitResponse { changelog };
+                        let body = rmp_serde::to_vec_named(&data)
+                            .with_context(|| "cannot serialize commit response")?;
                         res = Response::builder()
                             .header(COMMITTED_VERSION_HDR_NAME, hex::encode(&versionstamp))
                             .header(LAST_VERSION_HDR_NAME, hex::encode(&last_write_version))
-                            .body(Body::empty())?;
+                            .body(Body::from(body))?;
                     }
                     CommitResult::Conflict => {
                         res = Response::builder().status(409).body(Body::empty())?;
@@ -1615,6 +1608,16 @@ impl Server {
         buf.extend_from_slice(&ns_id);
         buf.push(b'r');
         buf.extend_from_slice(&from_hash);
+        buf
+    }
+
+    pub fn construct_changelog_key(&self, ns_id: [u8; 10], version: [u8; 10]) -> Vec<u8> {
+        let mut buf: Vec<u8> =
+            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + version.len());
+        buf.extend_from_slice(&self.raw_data_prefix);
+        buf.extend_from_slice(&ns_id);
+        buf.push(b'l');
+        buf.extend_from_slice(&version);
         buf
     }
 

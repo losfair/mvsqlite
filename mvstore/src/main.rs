@@ -2,6 +2,7 @@ mod commit;
 mod gc;
 mod lock;
 mod server;
+mod stat;
 
 use std::{net::SocketAddr, sync::atomic::Ordering};
 
