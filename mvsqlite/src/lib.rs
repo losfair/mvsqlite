@@ -49,6 +49,12 @@ fn init_with_options_impl(opts: InitOptions) {
             .expect("MVSQLITE_PAGE_CACHE_SIZE must be a usize");
         vfs::PAGE_CACHE_SIZE.store(requested, Ordering::Relaxed);
     }
+    if let Ok(s) = std::env::var("MVSQLITE_WRITE_CHUNK_SIZE") {
+        let requested = s
+            .parse::<usize>()
+            .expect("MVSQLITE_WRITE_CHUNK_SIZE must be a usize");
+        vfs::WRITE_CHUNK_SIZE.store(requested, Ordering::Relaxed);
+    }
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
     let io_engine = Arc::new(IoEngine::new(opts.coroutine));

@@ -22,6 +22,7 @@ static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template
 static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../template_16k.db");
 static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
 pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
+pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
@@ -319,7 +320,7 @@ impl Connection {
             self.write_buffer.iter().map(|x| (*x.0, &x.1[..])).collect();
 
         self.io.run(async {
-            for chunk in entries.chunks(20) {
+            for chunk in entries.chunks(WRITE_CHUNK_SIZE.load(Ordering::Relaxed)) {
                 txn.write_many(chunk)
                     .await
                     .expect("unrecoverable write failure")
