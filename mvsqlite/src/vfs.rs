@@ -448,6 +448,8 @@ impl DatabaseHandle for Connection {
         }
 
         if self.txn.is_none() {
+            let mut interval: Option<Vec<u32>> = None;
+
             let txn_info = if let Some(version) = &self.fixed_version {
                 Ok(self.client.create_transaction_at_version(version, true))
             } else {
@@ -475,18 +477,26 @@ impl DatabaseHandle for Connection {
                     Ok(res)
                 } else {
                     let client = self.client.clone();
-                    let res = self
-                        .io
-                        .run(async move { client.create_transaction().await });
-                    if let Ok(res) = &res {
-                        CURRENT_COMMIT_GROUP.with(|cg| {
-                            let mut cg = cg.borrow_mut();
-                            if let Some(cg) = &mut *cg {
-                                cg.current_version.replace(res.version().to_string());
-                            }
-                        })
+                    let res = self.io.run(async {
+                        client
+                            .create_transaction_with_info(
+                                self.last_known_write_version.as_ref().map(|x| x.as_str()),
+                            )
+                            .await
+                    });
+                    match res {
+                        Ok((txn, info)) => {
+                            CURRENT_COMMIT_GROUP.with(|cg| {
+                                let mut cg = cg.borrow_mut();
+                                if let Some(cg) = &mut *cg {
+                                    cg.current_version.replace(txn.version().to_string());
+                                }
+                            });
+                            interval = info.interval;
+                            Ok(txn)
+                        }
+                        Err(e) => Err(e),
                     }
-                    res
                 }
             };
             let mut txn = match txn_info {
@@ -501,11 +511,24 @@ impl DatabaseHandle for Connection {
             if self.last_known_write_version.is_none()
                 || self.last_known_write_version.as_ref().unwrap() != txn.version()
             {
-                if self.last_known_write_version.is_some() {
-                    tracing::warn!("non-local change detected, invalidating cache");
+                match interval {
+                    Some(interval) => {
+                        for index in &interval {
+                            self.page_cache.invalidate(index);
+                        }
+                        tracing::info!(
+                            count = interval.len(),
+                            "non-local change detected, performed partial cache flush"
+                        );
+                    }
+                    None => {
+                        self.page_cache.invalidate_all();
+                        if self.last_known_write_version.is_some() {
+                            tracing::warn!("non-local change detected, invalidating cache");
+                        }
+                    }
                 }
                 self.last_known_write_version = Some(txn.version().to_string());
-                self.page_cache.invalidate_all();
             }
 
             txn.enable_read_set();
@@ -560,6 +583,7 @@ impl DatabaseHandle for Connection {
 
             if !cg_ok {
                 let read_version = txn.version().to_string();
+                let ns_key = self.client.config().ns_key.as_str();
 
                 // If it is unlikely that a plcc commit can succeed, disable it locally first to save
                 // bandwidth and prevent message-too-large errors.
@@ -573,12 +597,24 @@ impl DatabaseHandle for Connection {
                 match result {
                     CommitOutput::Committed(result) => {
                         self.last_known_write_version = Some(result.version.clone());
+                        let changelog = result.changelog.get(ns_key);
                         if result.last_version > read_version {
                             // Invalidate page cache
-                            self.page_cache.invalidate_all();
-                            tracing::warn!(
-                                "non-local concurrent transaction detected, invalidating cache"
-                            );
+                            if let Some(changelog) = changelog {
+                                for &index in changelog {
+                                    self.page_cache.invalidate(&index);
+                                }
+                                tracing::info!(
+                                    count = changelog.len(),
+                                    "non-local concurrent transaction detected, performed partial cache flush"
+                                );
+                            } else {
+                                // Changelog is not available - do a full flush
+                                self.page_cache.invalidate_all();
+                                tracing::warn!(
+                                    "non-local concurrent transaction detected, invalidating cache"
+                                );
+                            }
                         }
                         tracing::info!(
                             version = result.version,

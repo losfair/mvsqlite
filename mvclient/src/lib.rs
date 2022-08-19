@@ -48,6 +48,7 @@ pub struct StatResponse {
     pub version: String,
     pub metadata: String,
     pub read_only: bool,
+    pub interval: Option<Vec<u32>>,
 }
 
 #[derive(Serialize)]
@@ -106,11 +107,17 @@ pub struct CommitRequest {
     pub hash: Vec<u8>,
 }
 
+#[derive(Deserialize)]
+pub struct CommitResponse {
+    pub changelog: HashMap<String, Vec<u32>>,
+}
+
 pub struct CommitResult {
     pub version: String,
     pub duration: Duration,
     pub num_pages: u64,
     pub last_version: String,
+    pub changelog: HashMap<String, Vec<u32>>,
 }
 
 pub enum CommitOutput {
@@ -134,14 +141,20 @@ impl MultiVersionClient {
     }
 
     pub async fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
-        self.create_transaction_with_info().await.map(|x| x.0)
+        self.create_transaction_with_info(None).await.map(|x| x.0)
     }
 
     pub async fn create_transaction_with_info(
         self: &Arc<Self>,
+        from_version: Option<&str>,
     ) -> Result<(Transaction, TransactionInfo)> {
         let mut url = self.config.data_plane.clone();
         url.set_path("/stat");
+
+        if let Some(from_version) = from_version {
+            url.query_pairs_mut()
+                .append_pair("from_version", from_version);
+        }
 
         let mut boff = RandomizedExponentialBackoff::default();
         let stat_res: StatResponse = loop {
@@ -164,6 +177,7 @@ impl MultiVersionClient {
             self.create_transaction_at_version(&stat_res.version, stat_res.read_only),
             TransactionInfo {
                 metadata: stat_res.metadata,
+                interval: stat_res.interval,
             },
         ))
     }
@@ -239,7 +253,7 @@ impl MultiVersionClient {
                 self.client.post(url.clone()).body(raw_request.clone()),
             )
             .await;
-            let (headers, _) = match response {
+            let (headers, body) = match response {
                 Ok(Some(x)) => x,
                 Ok(None) => {
                     boff.wait().await;
@@ -252,6 +266,7 @@ impl MultiVersionClient {
                     return Err(CommitError::Status(status).into());
                 }
             };
+            let body: CommitResponse = rmp_serde::from_slice(&body)?;
             let committed_version = headers
                 .get("x-committed-version")
                 .with_context(|| format!("missing committed version header"))?
@@ -266,6 +281,7 @@ impl MultiVersionClient {
                 duration: start_time.elapsed(),
                 num_pages: total_num_pages as u64,
                 last_version: last_version.into(),
+                changelog: body.changelog,
             }));
         }
     }
@@ -283,6 +299,7 @@ pub struct Transaction {
 
 pub struct TransactionInfo {
     pub metadata: String,
+    pub interval: Option<Vec<u32>>,
 }
 
 struct TxnAsyncCtx {
