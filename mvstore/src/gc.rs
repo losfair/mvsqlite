@@ -137,6 +137,21 @@ impl Server {
             }
         }
 
+        // Delete changelog
+        loop {
+            let txn = lock.create_txn_and_check_sync(&self.db).await?;
+            let start = self.construct_changelog_key(ns_id, [0u8; 10]);
+            let end = self.construct_changelog_key(ns_id, before_version);
+            // End is exclusive - `before_version` itself should not be deleted
+            txn.clear_range(start.as_slice(), end.as_slice());
+            match txn.commit().await {
+                Ok(_) => break,
+                Err(e) => {
+                    e.on_error().await?;
+                }
+            }
+        }
+
         progress_callback(None);
         Ok(())
     }
