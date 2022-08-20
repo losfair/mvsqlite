@@ -8,7 +8,6 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - [mvsqlite](#mvsqlite)
   - [Features](#features)
-    - [Experimental features](#experimental-features)
   - [Releases](#releases)
   - [Demo](#demo)
   - [Try it](#try-it)
@@ -21,12 +20,6 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 - **Scalabla reads and writes**: Optimistic, fine-grained concurrency with [BEGIN CONCURRENT](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)-like semantics. See [this page](https://github.com/losfair/mvsqlite/wiki/Concurrency-and-conflict-check) for details.
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
 - **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
-
-### Experimental features
-
-These features are not tested thoroughly, may cause data corruption, and the API may change at any time - do not use in production!
-
-- **Zero-overhead multi-database transactions**: Strictly serializable transactions across multiple databases, without additional overhead. [Details](https://github.com/losfair/mvsqlite/wiki/Commit-group)
 
 ## Releases
 

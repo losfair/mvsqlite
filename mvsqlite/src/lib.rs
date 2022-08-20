@@ -1,4 +1,3 @@
-pub mod commit_group;
 pub mod io_engine;
 #[allow(non_snake_case, non_camel_case_types)]
 pub mod sqlite_c;
@@ -110,75 +109,5 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
-    if std::env::var("MVSQLITE_EXPERIMENTAL_COMMIT_GROUP")
-        .map(|x| x == "1")
-        .unwrap_or(false)
-    {
-        let mv_commitgroup_begin_name = b"mv_commitgroup_begin\0";
-        let mv_commitgroup_commit_name = b"mv_commitgroup_commit\0";
-        let mv_commitgroup_rollback_name = b"mv_commitgroup_rollback\0";
-        let mv_commitgroup_lock_disable_name = b"mv_commitgroup_lock_disable\0";
-        let mv_commitgroup_lock_enable_name = b"mv_commitgroup_lock_enable\0";
-        let ret = sqlite_c::sqlite3_create_function_v2(
-            db,
-            mv_commitgroup_begin_name.as_ptr() as *const i8,
-            0,
-            sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
-            std::ptr::null_mut(),
-            Some(commit_group::mv_commitgroup_begin),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(ret, sqlite_c::SQLITE_OK);
-        let ret = sqlite_c::sqlite3_create_function_v2(
-            db,
-            mv_commitgroup_commit_name.as_ptr() as *const i8,
-            0,
-            sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
-            std::ptr::null_mut(),
-            Some(commit_group::mv_commitgroup_commit),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(ret, sqlite_c::SQLITE_OK);
-        let ret = sqlite_c::sqlite3_create_function_v2(
-            db,
-            mv_commitgroup_rollback_name.as_ptr() as *const i8,
-            0,
-            sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
-            std::ptr::null_mut(),
-            Some(commit_group::mv_commitgroup_rollback),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(ret, sqlite_c::SQLITE_OK);
-        let ret = sqlite_c::sqlite3_create_function_v2(
-            db,
-            mv_commitgroup_lock_disable_name.as_ptr() as *const i8,
-            0,
-            sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
-            std::ptr::null_mut(),
-            Some(commit_group::mv_commitgroup_lock_disable),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(ret, sqlite_c::SQLITE_OK);
-        let ret = sqlite_c::sqlite3_create_function_v2(
-            db,
-            mv_commitgroup_lock_enable_name.as_ptr() as *const i8,
-            0,
-            sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
-            std::ptr::null_mut(),
-            Some(commit_group::mv_commitgroup_lock_enable),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(ret, sqlite_c::SQLITE_OK);
-    }
+pub unsafe extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {
 }

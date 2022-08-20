@@ -10,7 +10,6 @@ use std::{
 use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
 
 use crate::{
-    commit_group::CURRENT_COMMIT_GROUP,
     io_engine::IoEngine,
     sqlite_vfs::{wip::WalIndex, DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
     tempfile::TempFile,
@@ -454,50 +453,20 @@ impl DatabaseHandle for Connection {
             let txn_info = if let Some(version) = &self.fixed_version {
                 Ok(self.client.create_transaction_at_version(version, true))
             } else {
-                let mut early_fail = false;
-                let res = CURRENT_COMMIT_GROUP.with(|cg| {
-                    let cg = cg.borrow();
-                    if let Some(cg) = &*cg {
-                        if !cg.is_empty() {
-                            tracing::error!("no new transaction can begin after the first commit in a commit group");
-                            early_fail = true;
-                            return None;
-                        }
-                            if let Some(version) = &cg.current_version {
-                                return Some(
-                                    self.client.create_transaction_at_version(version, false),
-                                );
-                            }
-                    }
-                    None
+                let client = self.client.clone();
+                let res = self.io.run(async {
+                    client
+                        .create_transaction_with_info(
+                            self.last_known_write_version.as_ref().map(|x| x.as_str()),
+                        )
+                        .await
                 });
-                if early_fail {
-                    return Ok(false);
-                }
-                if let Some(res) = res {
-                    Ok(res)
-                } else {
-                    let client = self.client.clone();
-                    let res = self.io.run(async {
-                        client
-                            .create_transaction_with_info(
-                                self.last_known_write_version.as_ref().map(|x| x.as_str()),
-                            )
-                            .await
-                    });
-                    match res {
-                        Ok((txn, info)) => {
-                            CURRENT_COMMIT_GROUP.with(|cg| {
-                                let mut cg = cg.borrow_mut();
-                                if let Some(cg) = &mut *cg {
-                                    cg.current_version.replace(txn.version().to_string());
-                                }
-                            });
-                            interval = info.interval;
-                            Ok(txn)
-                        }
-                        Err(e) => Err(e),
+                match res {
+                    Ok((txn, info)) => {
+                        interval = info.interval;
+                        Ok(txn)
                     }
+                    Err(e) => Err(e),
                 }
             };
             let mut txn = match txn_info {
@@ -564,74 +533,54 @@ impl DatabaseHandle for Connection {
                 .take()
                 .expect("did not find transaction for commit");
 
-            let mut cg_ok = false;
+            let read_version = txn.version().to_string();
+            let ns_key = self.client.config().ns_key.as_str();
 
-            CURRENT_COMMIT_GROUP
-                .with(|cg| {
-                    let mut cg = cg.borrow_mut();
-                    if let Some(cg) = &mut *cg {
-                        cg_ok = true;
-                        let intent = self.io.run(async { txn.commit_intent(None).await })?;
-                        if let Some(intent) = intent {
-                            cg.set_client_and_io(&self.client, &self.io);
-                            cg.append(intent);
-                            tracing::info!("added intent to commit group");
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
-                })
-                .expect("failed to append to commit group");
+            // If it is unlikely that a plcc commit can succeed, disable it locally first to save
+            // bandwidth and prevent message-too-large errors.
+            if txn.read_set_size() > 2000 {
+                txn.disable_read_set();
+            }
 
-            if !cg_ok {
-                let read_version = txn.version().to_string();
-                let ns_key = self.client.config().ns_key.as_str();
+            let result = self.io.run(async { txn.commit(None).await });
 
-                // If it is unlikely that a plcc commit can succeed, disable it locally first to save
-                // bandwidth and prevent message-too-large errors.
-                if txn.read_set_size() > 2000 {
-                    txn.disable_read_set();
-                }
-
-                let result = self.io.run(async { txn.commit(None).await });
-
-                let result = result.expect("transaction commit failed");
-                match result {
-                    CommitOutput::Committed(result) => {
-                        self.last_known_write_version = Some(result.version.clone());
-                        let changelog = result.changelog.get(ns_key);
-                        if result.last_version > read_version {
-                            // Invalidate page cache
-                            if let Some(changelog) = changelog {
-                                for &index in changelog {
-                                    self.page_cache.invalidate(&index);
-                                }
-                                tracing::info!(
+            let result = result.expect("transaction commit failed");
+            match result {
+                CommitOutput::Committed(result) => {
+                    self.last_known_write_version = Some(result.version.clone());
+                    let changelog = result.changelog.get(ns_key);
+                    if result.last_version > read_version {
+                        // Invalidate page cache
+                        if let Some(changelog) = changelog {
+                            for &index in changelog {
+                                self.page_cache.invalidate(&index);
+                            }
+                            tracing::info!(
                                     count = changelog.len(),
                                     "non-local concurrent transaction detected, performed partial cache flush"
                                 );
-                            } else {
-                                // Changelog is not available - do a full flush
-                                self.page_cache.invalidate_all();
-                                tracing::warn!(
-                                    "non-local concurrent transaction detected, invalidating cache"
-                                );
-                            }
+                        } else {
+                            // Changelog is not available - do a full flush
+                            self.page_cache.invalidate_all();
+                            tracing::warn!(
+                                "non-local concurrent transaction detected, invalidating cache"
+                            );
                         }
-                        tracing::info!(
+                    }
+                    tracing::info!(
                             version = result.version,
                             duration = ?result.duration,
                             num_pages = result.num_pages,
                             read_version,
                             last_version = result.last_version,
                             "transaction committed");
-                    }
-                    CommitOutput::Conflict => {
-                        tracing::warn!("transaction conflict");
-                        commit_ok = false;
-                    }
-                    CommitOutput::Empty => {
-                        tracing::info!("transaction is empty");
-                    }
+                }
+                CommitOutput::Conflict => {
+                    tracing::warn!("transaction conflict");
+                    commit_ok = false;
+                }
+                CommitOutput::Empty => {
+                    tracing::info!("transaction is empty");
                 }
             }
         }
