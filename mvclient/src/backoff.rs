@@ -8,7 +8,7 @@ pub struct RandomizedExponentialBackoff {
     random_factor: f64,
 }
 
-const DEFAULT_MIN_DELAY: Duration = Duration::from_millis(100);
+const DEFAULT_MIN_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(10);
 const DEFAULT_RANDOM_FACTOR: f64 = 0.2;
 
@@ -33,7 +33,7 @@ impl RandomizedExponentialBackoff {
             (self.delay.as_millis() as i64 + rng.gen_range(-random_delay..=random_delay)) as u64,
         );
 
-        self.delay = self.delay * 2;
+        self.delay = self.delay * 3 / 2;
         if self.delay > self.max_delay {
             self.delay = self.max_delay;
         }
