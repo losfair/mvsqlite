@@ -58,10 +58,12 @@ fn init_with_options_impl(opts: InitOptions) {
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
     let io_engine = Arc::new(IoEngine::new(opts.coroutine));
     let vfs = MultiVersionVfs {
-        data_plane,
         io: io_engine,
-        sector_size,
-        http_client: reqwest::Client::new(),
+        inner: mvfs::MultiVersionVfs {
+            data_plane,
+            sector_size,
+            http_client: reqwest::Client::new(),
+        },
     };
 
     sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");
@@ -109,5 +111,4 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {
-}
+pub unsafe extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {}
