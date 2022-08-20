@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
 
     std::panic::set_hook(Box::new(|info| {
         let bt = Backtrace::new();
-        tracing::error!(backtrace = ?bt, "{}", info);
+        tracing::error!(backtrace = ?bt, info = %info, "panic");
         std::process::abort();
     }));
 

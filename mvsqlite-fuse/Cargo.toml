@@ -1,0 +1,26 @@
+[package]
+name = "mvsqlite-fuse"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+rand = "0.8.5"
+mvclient = { path = "../mvclient" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "tracing-log", "json"] }
+libc = "0.2"
+backtrace = "0.3.66"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lazy_static = "1.4.0"
+reqwest = { version = "0.11.11", default-features = false, features = ["rustls-tls"] }
+mvfs = { path = "../mvfs" }
+fuser = "0.11.0"
+structopt = "0.3.26"
+indexmap = "1.9.1"
