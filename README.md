@@ -1,12 +1,12 @@
-# mvsqlite
+# mvSQLite
 
 Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/apple/foundationdb).
 
 [Documentation](https://github.com/losfair/mvsqlite/wiki/)
 
-**This is alpha software and has not received enough testing. On-disk format may change in future versions. Please do not use it in production.**
+**mvSQLite needs your help**: I consider mvSQLite to be *early-stage beta* software. Known high-severity bugs are fixed, I've been running this for a while without problems, but there are not enough tests under more diverse contexts. Testing under different use cases is appreciated, and please open an issue or contact me with the email in my profile if you want to file bug reports or have any kind of suggestions!
 
-- [mvsqlite](#mvsqlite)
+- [mvSQLite](#mvsqlite)
   - [Features](#features)
   - [Releases](#releases)
   - [Demo](#demo)
@@ -47,8 +47,8 @@ sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 Download the binaries:
 
 ```bash
-curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.11/libmvsqlite_preload.so
-curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.11/mvstore
+curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.13/libmvsqlite_preload.so
+curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.13/mvstore
 chmod +x ./mvstore
 ```
 
