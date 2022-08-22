@@ -17,6 +17,7 @@ static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../templa
 static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
 pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
+pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(10);
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
@@ -84,7 +85,6 @@ impl MultiVersionVfs {
             txn: None,
             lock: LockKind::None,
             history: TransitionHistory::default(),
-            txn_buffered_page: HashMap::new(),
             sector_size: self.sector_size,
             first_page,
             page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
@@ -107,9 +107,6 @@ pub struct Connection {
     lock: LockKind,
     history: TransitionHistory,
     sector_size: usize,
-
-    /// Clear this when writing or dropping txn!
-    txn_buffered_page: HashMap<u32, Vec<u8>>,
 
     first_page: Vec<u8>,
 
@@ -158,9 +155,7 @@ impl TransitionHistory {
         self.prev_index = current_index;
     }
 
-    fn record_and_predict(&mut self, current_index: u32, depth: usize) -> HashSet<u32> {
-        self.record(current_index);
-
+    fn multi_predict(&self, current_index: u32, depth: usize) -> HashSet<u32> {
         let mut predictions: HashSet<u32> = HashSet::with_capacity(depth * 2);
         let mut last = current_index;
         for _ in 0..depth {
@@ -172,6 +167,7 @@ impl TransitionHistory {
                 predictions.extend(local_pred);
             }
         }
+        predictions.remove(&current_index);
         predictions
     }
 }
@@ -184,6 +180,7 @@ impl Connection {
         let num_pages = buf.len() / self.sector_size;
         let page_offset = u32::try_from(offset as usize / self.sector_size).unwrap();
         self.txn.as_mut().unwrap().mark_read(page_offset);
+        self.history.record(page_offset);
 
         if let Some(x) = &self.page_cache.get(&page_offset) {
             buf.copy_from_slice(x);
@@ -202,34 +199,37 @@ impl Connection {
             "read_exact_at"
         );
 
-        let page: Vec<u8>;
+        let predict_depth: usize = 10;
+        let prefetch_depth: usize = PREFETCH_DEPTH.load(Ordering::Relaxed);
+        let mut predicted_next = self
+            .history
+            .multi_predict(page_offset, predict_depth)
+            .iter()
+            .filter(|x| !self.page_cache.contains_key(x))
+            .copied()
+            .collect::<HashSet<_>>();
 
-        match self.txn_buffered_page.get(&page_offset) {
-            Some(buffered_page) => {
-                self.history.record(page_offset);
-                tracing::debug!(index = page_offset, "prefetch hit");
-                page = buffered_page.clone();
-            }
-            None => {
-                let predicted_next = self.history.record_and_predict(page_offset, 10);
-                tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
-                let mut read_vec: Vec<u32> = Vec::with_capacity(1 + predicted_next.len());
-                read_vec.push(page_offset);
-                for &predicted_next_page in &predicted_next {
-                    read_vec.push(predicted_next_page);
-                }
-
-                let pages = txn
-                    .read_many_nomark(&read_vec)
-                    .await
-                    .expect("unrecoverable read failure");
-                assert_eq!(pages.len(), 1 + predicted_next.len());
-
-                let mut pages = pages.into_iter();
-                page = pages.next().expect("missing page from read response");
-                self.txn_buffered_page = predicted_next.into_iter().zip(pages).collect();
+        // Prefetch until the target depth
+        {
+            let mut i: u32 = 1;
+            while predicted_next.len() < prefetch_depth {
+                predicted_next.insert(page_offset + i);
+                i += 1;
             }
         }
+        tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
+        let mut read_vec: Vec<u32> = Vec::with_capacity(1 + predicted_next.len());
+        read_vec.push(page_offset);
+        for &predicted_next_page in &predicted_next {
+            read_vec.push(predicted_next_page);
+        }
+
+        let pages = txn
+            .read_many_nomark(&read_vec)
+            .await
+            .expect("unrecoverable read failure");
+        assert_eq!(pages.len(), 1 + predicted_next.len());
+        let page = &pages[0];
 
         if page.is_empty() {
             if offset == 0 {
@@ -249,6 +249,13 @@ impl Connection {
         }
 
         self.page_cache.insert(page_offset, Arc::from(&*buf));
+
+        for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
+            if *their_index != 0 && !maybe_other_page.is_empty() {
+                self.page_cache
+                    .insert(*their_index, Arc::from(&maybe_other_page[..]));
+            }
+        }
         Ok(())
     }
 
@@ -339,7 +346,6 @@ impl Connection {
 
         let mut buf_arc: Arc<[u8]> = Arc::from(buf);
         let buf = Arc::get_mut(&mut buf_arc).unwrap();
-        self.txn_buffered_page = HashMap::new();
         self.history.prev_index = 0;
 
         let page_offset = offset as usize / self.sector_size;
@@ -531,7 +537,6 @@ impl Connection {
         if lock == LockKind::None {
             // All locks dropped
             self.txn = None;
-            self.txn_buffered_page = HashMap::new();
             self.history.prev_index = 0;
         }
 

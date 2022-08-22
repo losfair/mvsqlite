@@ -6,18 +6,21 @@ use foundationdb::{
     tuple::{pack, unpack},
     Database, RangeOption, Transaction,
 };
-use futures::{stream::FuturesOrdered, Future, StreamExt};
+use futures::StreamExt;
 use hyper::{Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::{io::AsyncRead, sync::oneshot};
+use tokio::{
+    io::AsyncRead,
+    sync::{oneshot, Semaphore},
+    task::{block_in_place, JoinHandle},
+};
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
     io::StreamReader,
@@ -30,7 +33,8 @@ use crate::{
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
 const MAX_PAGE_SIZE: usize = 32768;
-const MAX_PAGES_PER_BATCH_READ: usize = 100;
+const MAX_PAGES_PER_BATCH_READ: usize = 200;
+const MAX_READ_CONCURRENCY: usize = 50;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
@@ -889,7 +893,7 @@ impl Server {
                     .await?;
                 match page {
                     Some(page) => {
-                        let decoded = self.decode_page(&txn, ns_id, &page.data).await?;
+                        let decoded = self.decode_page(&txn, ns_id, page.data).await?;
                         res = Response::builder()
                             .header("x-page-version", page.version)
                             .body(Body::from(decoded.data))?;
@@ -910,9 +914,8 @@ impl Server {
                 res = Response::builder().body(res_body)?;
                 let me = self.clone();
                 tokio::spawn(async move {
-                    let mut read_futures: FuturesOrdered<
-                        Pin<Box<dyn Future<Output = Result<ReadResponse, ()>> + Send>>,
-                    > = FuturesOrdered::new();
+                    let sem = Arc::new(Semaphore::new(MAX_READ_CONCURRENCY));
+                    let mut read_futures: Vec<JoinHandle<Result<ReadResponse, ()>>> = Vec::new();
                     loop {
                         let ns_id_hex = ns_id_hex.clone();
                         let message = match body.next().await {
@@ -932,7 +935,9 @@ impl Server {
                             break;
                         }
                         let me = me.clone();
-                        read_futures.push(Box::pin(async move {
+                        let sem_permit = sem.clone().acquire_owned().await.unwrap();
+                        read_futures.push(tokio::spawn(async move {
+                            let _sem_permit = sem_permit;
                             loop {
                                 let read_req: ReadRequest = match rmp_serde::from_slice(&message) {
                                     Ok(x) => x,
@@ -1002,10 +1007,10 @@ impl Server {
                                         }
                                     }
                                 };
-                                let payload = match &page {
+                                let payload = match page {
                                     Some(x) => ReadResponse {
                                         version: x.version.clone(),
-                                        data: match me.decode_page(&txn, ns_id, &x.data).await {
+                                        data: match me.decode_page(&txn, ns_id, x.data).await {
                                             Ok(x) => x.data,
                                             Err(e) => {
                                                 tracing::warn!(ns = ns_id_hex, error = %e, "error decoding page");
@@ -1023,7 +1028,13 @@ impl Server {
                         }));
                     }
 
-                    while let Some(fut_output) = read_futures.next().await {
+                    for fut in read_futures {
+                        let fut_output = match fut.await {
+                            Ok(x) => x,
+                            Err(_) => {
+                                break;
+                            }
+                        };
                         let payload = match fut_output {
                             Ok(x) => x,
                             Err(()) => {
@@ -1667,7 +1678,7 @@ impl Server {
                 (base, delta_base_hash)
             }
         };
-        let base_page = self.decode_page_no_delta(&undecoded_base)?;
+        let base_page = self.decode_page_no_delta(undecoded_base).await?;
         if base_page.data.len() != this_page.len() || this_page.is_empty() {
             return Ok(None);
         }
@@ -1706,7 +1717,11 @@ impl Server {
         Ok(Some((output, delta_base_hash)))
     }
 
-    fn decode_page_no_delta(&self, data: &[u8]) -> Result<DecodedPage> {
+    async fn decode_page_no_delta<T: AsRef<[u8]> + Send + Sync + 'static>(
+        &self,
+        data_container: T,
+    ) -> Result<DecodedPage> {
+        let data = data_container.as_ref();
         if data.len() == 0 {
             return Ok(DecodedPage::default());
         }
@@ -1721,8 +1736,10 @@ impl Server {
             }
             PAGE_ENCODING_ZSTD => {
                 // zstd
-                let data = zstd::bulk::decompress(&data[1..], MAX_PAGE_SIZE)
-                    .with_context(|| "zstd decompress failed")?;
+                let data = block_in_place(|| {
+                    zstd::bulk::decompress(&data_container.as_ref()[1..], MAX_PAGE_SIZE)
+                })
+                .with_context(|| "zstd decompress failed")?;
                 Ok(DecodedPage { data })
             }
             _ => Err(anyhow::anyhow!(
@@ -1732,12 +1749,13 @@ impl Server {
         }
     }
 
-    async fn decode_page(
+    async fn decode_page<T: AsRef<[u8]> + Send + Sync + 'static>(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
-        data: &[u8],
+        data_container: T,
     ) -> Result<DecodedPage> {
+        let data = data_container.as_ref();
         if data.len() == 0 {
             return Ok(DecodedPage::default());
         }
@@ -1754,8 +1772,10 @@ impl Server {
                     Some(x) => x,
                     None => anyhow::bail!("base page not found"),
                 };
-                let base_page = self.decode_page_no_delta(&base_page)?;
-                let mut delta_data = zstd::bulk::decompress(&data[33..], MAX_PAGE_SIZE)?;
+                let base_page = self.decode_page_no_delta(base_page).await?;
+                let mut delta_data = block_in_place(|| {
+                    zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)
+                })?;
                 if delta_data.len() != base_page.data.len() {
                     anyhow::bail!("delta and base have different sizes");
                 }
@@ -1766,7 +1786,7 @@ impl Server {
 
                 Ok(DecodedPage { data: delta_data })
             }
-            _ => self.decode_page_no_delta(data),
+            _ => self.decode_page_no_delta(data_container).await,
         }
     }
 }

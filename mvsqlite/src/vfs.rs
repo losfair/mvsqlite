@@ -6,7 +6,7 @@ use crate::{
     tempfile::TempFile,
 };
 
-pub use mvfs::vfs::{PAGE_CACHE_SIZE, WRITE_CHUNK_SIZE};
+pub use mvfs::vfs::{PAGE_CACHE_SIZE, PREFETCH_DEPTH, WRITE_CHUNK_SIZE};
 
 pub struct MultiVersionVfs {
     pub io: Arc<IoEngine>,
