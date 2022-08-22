@@ -42,6 +42,7 @@ jobs:
           cd build
           cp ../target/release/mvstore ./
           cp ../target/release/mvstore-stress ./
+          cp ../target/release/mvsqlite-fuse ./
           cp ../mvsqlite-preload/libmvsqlite_preload.so ./
           cp ../mvsqlite-preload/libmvsqlite.a ./
           find . -type f -exec sha256sum '{}' ';'
@@ -354,6 +355,7 @@ jobs:
       with:
         files: |
           build/mvstore
+          build/mvsqlite-fuse
           build/libmvsqlite_preload.so
           build/libmvsqlite.a
           deb/*.deb
