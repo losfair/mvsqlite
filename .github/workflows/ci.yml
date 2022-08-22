@@ -24,10 +24,13 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
+          sudo apt update && sudo apt install -y libfuse3-dev
       - name: Build (mvstore)
         run: cargo build --release -p mvstore
       - name: Build (mvsqlite)
         run: cargo build --release -p mvsqlite
+      - name: Build (mvsqlite-fuse)
+        run: cargo build --release -p mvsqlite-fuse
       - name: Build (shared libraries)
         run: make -C ./mvsqlite-preload build-preload && make -C ./mvsqlite-preload build-lib
       - name: Build (mvstore-stress)
