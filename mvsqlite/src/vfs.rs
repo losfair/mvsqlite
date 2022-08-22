@@ -105,7 +105,7 @@ impl DatabaseHandle for Connection {
     }
 
     fn current_lock(&self) -> Result<crate::sqlite_vfs::LockKind, std::io::Error> {
-        self.inner.current_lock().map(|x| x.into())
+        Ok(self.inner.current_lock().into())
     }
 
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
