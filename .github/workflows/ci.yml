@@ -64,6 +64,7 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
           cargo install cargo-deb
+          sudo apt update && sudo apt install -y libfuse3-dev # stop cargo from complaining, not really needed
       - name: Build mvstore
         run: cd mvstore && cargo deb && cd .. && mkdir deb && cp ./target/debian/*.deb ./deb/
       - name: Push
