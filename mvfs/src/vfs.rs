@@ -518,6 +518,12 @@ impl Connection {
                             );
                         }
                     }
+
+                    self.txn = Some(
+                        self.client
+                            .create_transaction_at_version(&result.version, false),
+                    );
+
                     tracing::info!(
                             version = result.version,
                             duration = ?result.duration,
@@ -535,6 +541,10 @@ impl Connection {
                 }
                 CommitOutput::Empty => {
                     tracing::info!("transaction is empty");
+                    self.txn = Some(
+                        self.client
+                            .create_transaction_at_version(&read_version, false),
+                    );
                 }
             }
         }

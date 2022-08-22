@@ -117,12 +117,53 @@ struct EphemeralInode {
     refcount: u64,
     ns: usize,
     conn: Option<Arc<Mutex<Connection>>>,
+    locks: BTreeMap<(u64, u64), LockKind>,
 }
 
 struct TempInode {
     refcount: u64,
     ns: usize,
     data: Vec<u8>,
+}
+
+impl FuseFs {
+    fn lock_bookkeeping(&mut self, ino: u64, reply: fuser::ReplyEmpty) {
+        let rawino = (ino - DB_INODE_BASE) as usize;
+        let inode = self.ephemeral_inodes.get(rawino).unwrap();
+        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
+        let ns_name = ns_name.clone();
+        let desired = inode
+            .locks
+            .values()
+            .cloned()
+            .max()
+            .unwrap_or(LockKind::None);
+        let conn = inode.conn.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            let mut conn = conn.lock().await;
+            let current = conn.current_lock();
+            tracing::debug!(ns = ns_name, ?current, ?desired, "lock_bookkeeping");
+            let result = if desired.level() > current.level() {
+                conn.lock(desired).await
+            } else if desired.level() < current.level() {
+                conn.unlock(desired).await
+            } else {
+                Ok(true)
+            };
+            match result {
+                Ok(true) => {
+                    reply.ok();
+                }
+                Ok(false) => {
+                    reply.error(libc::EACCES);
+                }
+                Err(e) => {
+                    tracing::error!(ns = ns_name, error = %e, ?current, ?desired, "lock error");
+                    reply.error(libc::EIO);
+                }
+            }
+        });
+    }
 }
 
 impl fuser::Filesystem for FuseFs {
@@ -159,6 +200,7 @@ impl fuser::Filesystem for FuseFs {
                     refcount: 1,
                     ns: index,
                     conn: None,
+                    locks: BTreeMap::new(),
                 }) as u64;
                 let ino = rawino + DB_INODE_BASE;
                 assert!(ino < TEMP_INODE_BASE);
@@ -300,41 +342,23 @@ impl fuser::Filesystem for FuseFs {
             return;
         }
 
-        if start == end {
-            reply.ok();
-            return;
-        }
-
         let rawino = (ino - DB_INODE_BASE) as usize;
-        let inode = self.ephemeral_inodes.get(rawino).unwrap();
-        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
-        let ns_name = ns_name.clone();
-        let desired = lock_type_to_lockkind(typ);
-        let conn = inode.conn.as_ref().unwrap().clone();
-        tokio::spawn(async move {
-            let mut conn = conn.lock().await;
-            let current = conn.current_lock();
-            tracing::debug!(ns = ns_name, ?current, ?desired, start, end, "setlk");
-            let result = if desired.level() > current.level() {
-                conn.lock(desired).await
-            } else if desired.level() < current.level() {
-                conn.unlock(desired).await
-            } else {
-                Ok(true)
-            };
-            match result {
-                Ok(true) => {
-                    reply.ok();
-                }
-                Ok(false) => {
-                    reply.error(libc::EACCES);
-                }
-                Err(e) => {
-                    tracing::error!(ns = ns_name, error = %e, ?current, ?desired, "lock error");
-                    reply.error(libc::EIO);
-                }
-            }
-        });
+        let inode = self.ephemeral_inodes.get_mut(rawino).unwrap();
+        // Delete overlapping locks
+        let keys_to_delete = inode
+            .locks
+            .keys()
+            .filter(|k| k.0 >= start && k.1 <= end)
+            .copied()
+            .collect::<Vec<_>>();
+        for k in keys_to_delete {
+            inode.locks.remove(&k);
+        }
+        let kind = lock_type_to_lockkind(typ);
+        if kind != LockKind::None {
+            inode.locks.insert((start, end), kind);
+        }
+        self.lock_bookkeeping(ino, reply);
     }
 
     fn read(
