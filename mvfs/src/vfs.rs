@@ -491,6 +491,8 @@ impl Connection {
                 txn.disable_read_set();
             }
 
+            let dirty_pages = txn.written_pages();
+
             let result = txn.commit(None).await;
 
             let result = result.expect("transaction commit failed");
@@ -525,7 +527,10 @@ impl Connection {
                             "transaction committed");
                 }
                 CommitOutput::Conflict => {
-                    tracing::warn!("transaction conflict");
+                    for index in &dirty_pages {
+                        self.page_cache.invalidate(index);
+                    }
+                    tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                     commit_ok = false;
                 }
                 CommitOutput::Empty => {

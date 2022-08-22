@@ -321,6 +321,10 @@ impl Transaction {
         self.page_buffer.contains_key(&page_id)
     }
 
+    pub fn written_pages(&self) -> Vec<u32> {
+        self.page_buffer.keys().cloned().collect()
+    }
+
     fn check_async_error(&self) -> Result<()> {
         if self.async_ctx.has_error.load(Ordering::Relaxed) {
             Err(anyhow::anyhow!("async error"))
