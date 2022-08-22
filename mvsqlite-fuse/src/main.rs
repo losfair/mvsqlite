@@ -13,6 +13,7 @@ use indexmap::IndexMap;
 use anyhow::Result;
 use backtrace::Backtrace;
 use mvfs::{types::LockKind, Connection};
+use slab::Slab;
 use structopt::StructOpt;
 use tokio::sync::Mutex;
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
@@ -30,10 +31,6 @@ struct Opt {
     /// Comma-separated namespace mappings: file1=ns1,file2=ns2
     #[structopt(long, env = "MVSQLITE_FUSE_NAMESPACES")]
     namespaces: String,
-
-    /// Max concurrency.
-    #[structopt(long, default_value = "10", env = "MVSQLITE_FUSE_CONCURRENCY")]
-    concurrency: u32,
 
     /// Disk sector size.
     #[structopt(long, default_value = "8192", env = "MVSQLITE_FUSE_SECTOR_SIZE")]
@@ -83,16 +80,15 @@ async fn main() -> Result<()> {
     let fuse_fs = FuseFs {
         namespaces,
         vfs,
-        fh_table: BTreeMap::new(),
-        next_fh: 1,
-        next_ephemeral_inode: DB_INODE_BASE,
+        ephemeral_inodes: Slab::new(),
         ns_to_ephemeral_inode: BTreeMap::new(),
-        ephemeral_inode_to_ns: BTreeMap::new(),
-        inode2fh: BTreeMap::new(),
-        concurrency: opt.concurrency,
     };
 
-    let mut options = vec![MountOption::RO, MountOption::FSName("mvsqlite".to_string())];
+    let mut options = vec![
+        MountOption::RW,
+        MountOption::NoExec,
+        MountOption::FSName("mvsqlite".to_string()),
+    ];
     if opt.auto_unmount {
         options.push(MountOption::AutoUnmount);
     }
@@ -108,17 +104,14 @@ async fn main() -> Result<()> {
 struct FuseFs {
     namespaces: IndexMap<String, String>,
     vfs: mvfs::MultiVersionVfs,
-    fh_table: BTreeMap<u64, FhEntry>,
-    next_fh: u64,
-    next_ephemeral_inode: u64,
-    ns_to_ephemeral_inode: BTreeMap<u64, BTreeSet<u64>>,
-    ephemeral_inode_to_ns: BTreeMap<u64, u64>,
-    inode2fh: BTreeMap<u64, u64>,
-    concurrency: u32,
+    ephemeral_inodes: Slab<EphemeralInode>,
+    ns_to_ephemeral_inode: BTreeMap<usize, BTreeSet<u64>>,
 }
 
-struct FhEntry {
-    conn: Arc<Mutex<Connection>>,
+struct EphemeralInode {
+    refcount: u64,
+    ns: usize,
+    conn: Option<Arc<Mutex<Connection>>>,
 }
 
 impl fuser::Filesystem for FuseFs {
@@ -131,9 +124,7 @@ impl fuser::Filesystem for FuseFs {
             .set_max_readahead(self.vfs.sector_size as u32)
             .unwrap();
         config.set_max_write(self.vfs.sector_size as u32).unwrap();
-        config
-            .add_capabilities(FUSE_POSIX_LOCKS)
-            .unwrap();
+        config.add_capabilities(FUSE_POSIX_LOCKS).unwrap();
         Ok(())
     }
 
@@ -153,14 +144,17 @@ impl fuser::Filesystem for FuseFs {
         if name.ends_with(".db") {
             let name_prefix = name.trim_end_matches(".db");
             if let Some(index) = self.namespaces.get_index_of(name_prefix) {
-                let ino = self.next_ephemeral_inode;
+                let rawino = self.ephemeral_inodes.insert(EphemeralInode {
+                    refcount: 1,
+                    ns: index,
+                    conn: None,
+                }) as u64;
+                let ino = rawino + DB_INODE_BASE;
                 assert!(ino < TEMP_INODE_BASE);
-                self.next_ephemeral_inode += 1;
                 self.ns_to_ephemeral_inode
-                    .entry(index as u64)
+                    .entry(index)
                     .or_default()
                     .insert(ino);
-                self.ephemeral_inode_to_ns.insert(ino, index as u64);
 
                 let attr = FileAttr {
                     ino,
@@ -187,38 +181,54 @@ impl fuser::Filesystem for FuseFs {
         reply.error(libc::ENOENT);
     }
 
+    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, nlookup: u64) {
+        if ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE {
+            let rawino = (ino - DB_INODE_BASE) as usize;
+            let inode = self.ephemeral_inodes.get_mut(rawino).unwrap();
+            assert!(inode.refcount >= nlookup);
+            inode.refcount -= nlookup;
+            if inode.refcount == 0 {
+                self.ns_to_ephemeral_inode
+                    .get_mut(&inode.ns)
+                    .unwrap()
+                    .remove(&ino);
+                self.ephemeral_inodes.remove(rawino);
+                tracing::debug!(ino, "removed ephemeral inode");
+            }
+        }
+    }
+
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        if let Some(&index) = self.ephemeral_inode_to_ns.get(&ino) {
+        if ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE {
+            let rawino = (ino - DB_INODE_BASE) as usize;
+            let inode = self.ephemeral_inodes.get_mut(rawino).unwrap();
+            assert!(inode.conn.is_none());
             self.ns_to_ephemeral_inode
-                .get_mut(&index)
+                .get_mut(&inode.ns)
                 .unwrap()
                 .remove(&ino);
-            let index = index as usize;
-            let (_, namespace) = self.namespaces.get_index(index).unwrap();
+            let (ns_name, namespace) = self.namespaces.get_index(inode.ns).unwrap();
             let conn = match self.vfs.open(namespace) {
                 Ok(conn) => conn,
-                Err(_) => {
+                Err(e) => {
+                    tracing::error!(ns = ns_name, error = %e, "failed to open namespace");
                     reply.error(libc::EIO);
                     return;
                 }
             };
-            let fh = self.next_fh;
-            self.fh_table.insert(
-                fh,
-                FhEntry {
-                    conn: Arc::new(Mutex::new(conn)),
-                },
-            );
-            self.next_fh += 1;
-            self.inode2fh.insert(ino, fh);
-            reply.opened(fh, FOPEN_DIRECT_IO);
+            inode.conn = Some(Arc::new(Mutex::new(conn)));
+            reply.opened(0, FOPEN_DIRECT_IO);
+            return;
         }
+
+        reply.error(libc::ENOENT);
     }
+
     fn setlk(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         _lock_owner: u64,
         start: u64,
         end: u64,
@@ -229,17 +239,22 @@ impl fuser::Filesystem for FuseFs {
     ) {
         assert!(!sleep, "blocking locks are not supported");
 
+        if !(ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE) {
+            reply.ok();
+            return;
+        }
+
         if start == end {
             reply.ok();
             return;
         }
 
-        let index = *self.ephemeral_inode_to_ns.get(&ino).unwrap();
-
-        let conn = self.fh_table.get(&fh).unwrap().conn.clone();
-        let (ns_name, _) = self.namespaces.get_index(index as usize).unwrap();
+        let rawino = (ino - DB_INODE_BASE) as usize;
+        let inode = self.ephemeral_inodes.get(rawino).unwrap();
+        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
         let ns_name = ns_name.clone();
         let desired = lock_type_to_lockkind(typ);
+        let conn = inode.conn.as_ref().unwrap().clone();
         tokio::spawn(async move {
             let mut conn = conn.lock().await;
             let current = conn.current_lock();
@@ -256,7 +271,7 @@ impl fuser::Filesystem for FuseFs {
                     reply.ok();
                 }
                 Ok(false) => {
-                    reply.error(libc::EWOULDBLOCK);
+                    reply.error(libc::EACCES);
                 }
                 Err(e) => {
                     tracing::error!(ns = ns_name, error = %e, ?current, ?desired, "lock error");
@@ -266,43 +281,26 @@ impl fuser::Filesystem for FuseFs {
         });
     }
 
-    fn release(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        let removed = self.fh_table.remove(&fh);
-        assert!(removed.is_some());
-
-        let removed = self.inode2fh.remove(&ino);
-        assert!(removed.is_some());
-
-        let removed = self.ephemeral_inode_to_ns.remove(&ino);
-        assert!(removed.is_some());
-
-        reply.ok();
-    }
-
     fn read(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
+        if !(ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE) {
+            reply.error(libc::EIO);
+            return;
+        }
+        let rawino = (ino - DB_INODE_BASE) as usize;
         let sector_size = self.vfs.sector_size;
-        let index = *self.ephemeral_inode_to_ns.get(&ino).unwrap();
-        let conn = self.fh_table.get(&fh).unwrap().conn.clone();
-        let (ns_name, _) = self.namespaces.get_index(index as usize).unwrap();
+        let inode = self.ephemeral_inodes.get(rawino).unwrap();
+        let conn = inode.conn.as_ref().unwrap().clone();
+        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
         let ns_name = ns_name.clone();
         tracing::debug!(ns = ns_name, offset, size, "read");
         tokio::spawn(async move {
@@ -320,6 +318,43 @@ impl fuser::Filesystem for FuseFs {
                 }
                 Err(e) => {
                     tracing::error!(ns = ns_name, error = %e, "read error");
+                    reply.error(libc::EIO);
+                }
+            }
+        });
+    }
+
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        if !(ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE) {
+            reply.error(libc::EIO);
+            return;
+        }
+        let rawino = (ino - DB_INODE_BASE) as usize;
+        let inode = self.ephemeral_inodes.get(rawino).unwrap();
+        let conn = inode.conn.as_ref().unwrap().clone();
+        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
+        let ns_name = ns_name.clone();
+        tracing::debug!(ns = ns_name, offset, size = data.len(), "write");
+        let data = data.to_vec();
+        tokio::spawn(async move {
+            let mut conn = conn.lock().await;
+            match conn.write_all_at(&data, offset as u64).await {
+                Ok(()) => {
+                    reply.written(data.len() as _);
+                }
+                Err(e) => {
+                    tracing::error!(ns = ns_name, error = %e, "write error");
                     reply.error(libc::EIO);
                 }
             }
@@ -358,13 +393,18 @@ impl fuser::Filesystem for FuseFs {
             flags: 0,
             blksize: sector_size as u32,
         };
-        if let Some(fh) = self.inode2fh.get(&ino) {
-            let fh = *fh;
-            let index = *self.ephemeral_inode_to_ns.get(&ino).unwrap();
-            let (ns_name, _) = self.namespaces.get_index(index as usize).unwrap();
-            let ns_name = ns_name.clone();
-            tracing::debug!(ns = ns_name, fh, "getattr");
-            let conn = self.fh_table.get(&fh).unwrap().conn.clone();
+
+        if !(ino >= DB_INODE_BASE && ino < TEMP_INODE_BASE) {
+            reply.attr(&Duration::ZERO, &attr);
+            return;
+        }
+        let rawino = (ino - DB_INODE_BASE) as usize;
+        let inode = self.ephemeral_inodes.get(rawino).unwrap();
+        let (ns_name, _) = self.namespaces.get_index(inode.ns).unwrap();
+        let ns_name = ns_name.clone();
+        tracing::debug!(ns = ns_name, ino, "getattr");
+        if let Some(conn) = &inode.conn {
+            let conn = conn.clone();
             tokio::spawn(async move {
                 let mut conn = conn.lock().await;
                 match conn.size().await {
