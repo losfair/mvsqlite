@@ -365,6 +365,7 @@ jobs:
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
           ./speedtest1 ./test.db
           mkdir fusemnt
+          chmod +x ../build/mvsqlite-fuse
           RUST_LOG=info ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
             --mountpoint ./fusemnt \
             --namespaces "db:test" &
