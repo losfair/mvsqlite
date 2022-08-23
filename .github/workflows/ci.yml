@@ -368,7 +368,7 @@ jobs:
           chmod +x ../build/mvsqlite-fuse
           RUST_LOG=info ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
             --mountpoint ./fusemnt \
-            --namespaces "db:test" &
+            --namespaces "db=test" &
           sleep 1
           ./speedtest1 ./fusemnt/db
   release:
