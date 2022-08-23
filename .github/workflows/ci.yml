@@ -329,6 +329,48 @@ jobs:
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
           ./speedtest1 ./test.db
           LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 MVSQLITE_SECTOR_SIZE=16384 RUST_LOG=error ./speedtest1 test
+  sqlite-speedtest1-default-page-size-fuse:
+    name: SQLite benchmark (speedtest1), default page size, fuse
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+          sudo apt update && sudo apt install -y libfuse3-dev
+      - name: Fetch binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: build
+          path: ./build
+      - name: Run it
+        run: |
+          set -e
+          chmod +x ./build/mvstore
+          export RUST_LOG=info
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          curl http://localhost:7001/api/create_namespace -d '{"key":"test","metadata":""}'
+          git clone https://github.com/sqlite/sqlite
+          cd sqlite
+          git checkout version-3.31.1 # ubuntu 20.04
+          git apply ../res/ci/sqlite.patch
+          gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
+          ./speedtest1 ./test.db
+          mkdir fusemnt
+          chmod +x ../build/mvsqlite-fuse
+          RUST_LOG=error ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
+            --mountpoint ./fusemnt \
+            --namespaces "db=test" &
+          sleep 1
+          ./speedtest1 ./fusemnt/db
   release:
     name: Release
     needs:
