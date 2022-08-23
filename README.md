@@ -15,11 +15,11 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 ## Features
 
-- **Full feature-set from SQLite**: mvsqlite integrates with SQLite using a custom [VFS](https://www.sqlite.org/vfs.html) layer.
+- **Full feature-set from SQLite**: mvsqlite integrates with SQLite using either a custom [VFS](https://www.sqlite.org/vfs.html) layer or [FUSE](https://en.wikipedia.org/wiki/Filesystem_in_Userspace) at your choice. Since it is a layer "below" SQLite itself, all of SQLite's features are available.
 - **Time travel**: Checkout the snapshot of your database at any point of time in the past.
 - **Scalable reads and writes**: Optimistic, fine-grained concurrency with [BEGIN CONCURRENT](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)-like semantics. See [this page](https://github.com/losfair/mvsqlite/wiki/Concurrency-and-conflict-check) for details.
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
-- **Drop-in replacement**: Set the `LD_PRELOAD=libmvsqlite_preload.so` environment variable and your existing apps will work out of the box.
+- **Drop-in addition**: Use either `LD_PRELOAD` or FUSE to plug mvSQLite into your existing apps. [Read the docs](https://github.com/losfair/mvsqlite/wiki/Integration)
 
 ## Releases
 
@@ -47,8 +47,8 @@ sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 Download the binaries:
 
 ```bash
-curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.14/libmvsqlite_preload.so
-curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.14/mvstore
+curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.15/libmvsqlite_preload.so
+curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.15/mvstore
 chmod +x ./mvstore
 ```
 
