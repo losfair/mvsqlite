@@ -201,13 +201,7 @@ impl Connection {
 
         let predict_depth: usize = 10;
         let prefetch_depth: usize = PREFETCH_DEPTH.load(Ordering::Relaxed);
-        let mut predicted_next = self
-            .history
-            .multi_predict(page_offset, predict_depth)
-            .iter()
-            .filter(|x| !self.page_cache.contains_key(x))
-            .copied()
-            .collect::<HashSet<_>>();
+        let mut predicted_next = self.history.multi_predict(page_offset, predict_depth);
 
         // Prefetch until the target depth
         {
@@ -217,6 +211,12 @@ impl Connection {
                 i += 1;
             }
         }
+
+        let predicted_next = predicted_next
+            .iter()
+            .filter(|x| !self.page_cache.contains_key(x))
+            .copied()
+            .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
         let mut read_vec: Vec<u32> = Vec::with_capacity(1 + predicted_next.len());
         read_vec.push(page_offset);
@@ -518,6 +518,12 @@ impl Connection {
                             );
                         }
                     }
+
+                    self.txn = Some(
+                        self.client
+                            .create_transaction_at_version(&result.version, false),
+                    );
+
                     tracing::info!(
                             version = result.version,
                             duration = ?result.duration,
@@ -535,6 +541,10 @@ impl Connection {
                 }
                 CommitOutput::Empty => {
                     tracing::info!("transaction is empty");
+                    self.txn = Some(
+                        self.client
+                            .create_transaction_at_version(&read_version, false),
+                    );
                 }
             }
         }

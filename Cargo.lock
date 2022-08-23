@@ -1156,6 +1156,7 @@ dependencies = [
  "mvclient",
  "mvfs",
  "rand",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
