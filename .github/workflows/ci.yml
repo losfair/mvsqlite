@@ -366,7 +366,7 @@ jobs:
           ./speedtest1 ./test.db
           mkdir fusemnt
           chmod +x ../build/mvsqlite-fuse
-          RUST_LOG=info ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
+          RUST_LOG=error ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
             --mountpoint ./fusemnt \
             --namespaces "db=test" &
           sleep 1
