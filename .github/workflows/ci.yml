@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -83,7 +83,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -112,7 +112,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -141,7 +141,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -171,7 +171,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -202,7 +202,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -233,7 +233,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -266,7 +266,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -301,7 +301,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
@@ -336,7 +336,7 @@ jobs:
     - build
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install system dependencies
         run: |
           set -e
