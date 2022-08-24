@@ -24,9 +24,14 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
 
 grep -vzq "_ERROR" load.log
 
+RUN_SIZE=100000
+if [ "$1" == "workloada" ]; then
+  RUN_SIZE=10000 # workloada is slow
+fi
+
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
   -P workloads/$1 \
-  -p operationcount=100000 -p threadcount=64 -p recordcount=100000 \
+  -p operationcount=$RUN_SIZE -p threadcount=64 -p recordcount=100000 \
   -p sqlite.db=ycsb \
   -p sqlite.journalmode=delete \
   -p sqlite.maxopenconns=1000 \
