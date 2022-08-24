@@ -8,7 +8,7 @@ export RUST_LOG=off
 
 git clone https://github.com/losfair/go-ycsb
 cd go-ycsb
-git checkout 3e38695ae2a7cd318600faaa79c4191e7ed1efbf
+git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
 make
 
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
