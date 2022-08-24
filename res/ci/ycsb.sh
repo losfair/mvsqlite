@@ -2,10 +2,17 @@
 
 set -e
 
-LD_PRELOAD="$PRELOAD_PATH" ./go-ycsb/go-ycsb load sqlite \
-  -P workloads/$1 \
+DBNAME="$1"
+WORKLOAD="$2"
+
+git clone https://github.com/losfair/go-ycsb go-ycsb-src
+cd go-ycsb-src
+git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
+
+LD_PRELOAD="$PRELOAD_PATH" ../go-ycsb/go-ycsb load sqlite \
+  -P workloads/$WORKLOAD \
   -p operationcount=100000 -p threadcount=1 -p recordcount=100000 \
-  -p sqlite.db=ycsb \
+  -p sqlite.db=$DBNAME \
   -p sqlite.journalmode=delete \
   -p sqlite.maxopenconns=1000 \
   -p sqlite.maxidleconns=1000 \
@@ -16,14 +23,14 @@ LD_PRELOAD="$PRELOAD_PATH" ./go-ycsb/go-ycsb load sqlite \
 grep -vzq "_ERROR" load.log
 
 RUN_SIZE=100000
-if [ "$1" == "workloada" ]; then
+if [ "$WORKLOAD" == "workloada" ]; then
   RUN_SIZE=10000 # workloada is slow
 fi
 
 LD_PRELOAD="$PRELOAD_PATH" ./go-ycsb/go-ycsb run sqlite \
-  -P workloads/$1 \
+  -P workloads/$WORKLOAD \
   -p operationcount=$RUN_SIZE -p threadcount=64 -p recordcount=100000 \
-  -p sqlite.db=ycsb \
+  -p sqlite.db=$DBNAME \
   -p sqlite.journalmode=delete \
   -p sqlite.maxopenconns=1000 \
   -p sqlite.maxidleconns=1000 \
