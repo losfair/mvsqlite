@@ -371,6 +371,34 @@ jobs:
             --namespaces "db=test" &
           sleep 1
           ./speedtest1 ./fusemnt/db
+  ycsb:
+    name: ycsb
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Fetch binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: build
+          path: ./build
+      - name: Run it
+        run: |
+          set -e
+          chmod +x ./build/mvstore
+          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          PRELOAD_PATH=../build/libmvsqlite_preload.so ./res/ci/ycsb.sh
   release:
     name: Release
     needs:
