@@ -20,7 +20,9 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
   -p sqlite.maxidleconns=1000 \
   -p sqlite.cache=private \
   -p sqlite.optimistic=true \
-  -p batch.size=1000
+  -p batch.size=1000 | tee load.log
+
+grep -vzq "_ERROR" load.log
 
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
   -P workloads/$1 \
@@ -30,4 +32,6 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
   -p sqlite.maxopenconns=1000 \
   -p sqlite.maxidleconns=1000 \
   -p sqlite.optimistic=true \
-  -p sqlite.cache=private
+  -p sqlite.cache=private | tee run.log
+
+grep -vzq "_ERROR" run.log
