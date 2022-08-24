@@ -439,7 +439,7 @@ jobs:
           chmod +x ./build/mvsqlite-fuse
           sh -c 'RUST_LOG=error ./build/mvsqlite-fuse --data-plane http://localhost:7000 \
             --mountpoint ./fusemnt \
-            --namespaces "ycsb=ycsb" | grep -v "500 Internal Server Error"' &
+            --namespaces "ycsb=ycsb" 2>&1 | grep -v "500 Internal Server Error"' &
           sleep 1
           ./res/ci/ycsb.sh "$PWD/fusemnt/ycsb" "${{ matrix.workload }}"
   release:
