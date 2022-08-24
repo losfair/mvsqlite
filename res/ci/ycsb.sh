@@ -5,7 +5,10 @@ set -e
 DBNAME="$1"
 WORKLOAD="$2"
 
-git clone https://github.com/losfair/go-ycsb go-ycsb-src
+if [ ! -d "go-ycsb-src" ]; then
+  git clone https://github.com/losfair/go-ycsb go-ycsb-src
+fi
+
 cd go-ycsb-src
 git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
 
