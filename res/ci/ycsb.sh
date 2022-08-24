@@ -27,7 +27,7 @@ if [ "$WORKLOAD" == "workloada" ]; then
   RUN_SIZE=10000 # workloada is slow
 fi
 
-LD_PRELOAD="$PRELOAD_PATH" ./go-ycsb/go-ycsb run sqlite \
+LD_PRELOAD="$PRELOAD_PATH" ../go-ycsb/go-ycsb run sqlite \
   -P workloads/$WORKLOAD \
   -p operationcount=$RUN_SIZE -p threadcount=64 -p recordcount=100000 \
   -p sqlite.db=$DBNAME \
