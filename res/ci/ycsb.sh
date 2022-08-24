@@ -12,7 +12,7 @@ git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
 make
 
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
-  -P workloads/workloadb \
+  -P workloads/$1 \
   -p operationcount=100000 -p threadcount=1 -p recordcount=100000 \
   -p sqlite.db=ycsb \
   -p sqlite.journalmode=delete \
@@ -23,7 +23,7 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
   -p batch.size=1000
 
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
-  -P workloads/workloadb \
+  -P workloads/$1 \
   -p operationcount=100000 -p threadcount=64 -p recordcount=100000 \
   -p sqlite.db=ycsb \
   -p sqlite.journalmode=delete \

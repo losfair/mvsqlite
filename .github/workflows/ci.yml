@@ -376,6 +376,9 @@ jobs:
     runs-on: ubuntu-20.04
     needs:
     - build
+    strategy:
+      matrix:
+        workload: [workloada, workloadb, workloadc]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -398,7 +401,7 @@ jobs:
           RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
           sleep 1
           curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
-          PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" ./res/ci/ycsb.sh
+          PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" ./res/ci/ycsb.sh "${{ matrix.workload }}"
   release:
     name: Release
     needs:
