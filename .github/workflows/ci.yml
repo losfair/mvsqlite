@@ -398,7 +398,7 @@ jobs:
           RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
           sleep 1
           curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
-          PRELOAD_PATH=./build/libmvsqlite_preload.so ./res/ci/ycsb.sh
+          PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" ./res/ci/ycsb.sh
   release:
     name: Release
     needs:
