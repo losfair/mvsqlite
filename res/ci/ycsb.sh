@@ -19,6 +19,7 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb load sqlite \
   -p sqlite.maxopenconns=1000 \
   -p sqlite.maxidleconns=1000 \
   -p sqlite.cache=private \
+  -p sqlite.optimistic=true \
   -p batch.size=1000
 
 LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
@@ -28,4 +29,5 @@ LD_PRELOAD="$PRELOAD_PATH" ./bin/go-ycsb run sqlite \
   -p sqlite.journalmode=delete \
   -p sqlite.maxopenconns=1000 \
   -p sqlite.maxidleconns=1000 \
+  -p sqlite.optimistic=true \
   -p sqlite.cache=private
