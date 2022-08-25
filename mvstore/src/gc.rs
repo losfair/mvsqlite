@@ -15,6 +15,7 @@ use foundationdb::{
 };
 
 use crate::{
+    fixed_key_vec::FixedKeyVec,
     lock::DistributedLock,
     server::{ContentIndex, Server},
 };
@@ -64,7 +65,7 @@ impl Server {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
-                            ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
+                            ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
                         0,
                         true,
@@ -91,7 +92,7 @@ impl Server {
                 let scan_result = &scan_result[..];
 
                 // Yes, we do want to rescan the last item
-                scan_cursor = scan_result.last().unwrap().key().to_vec();
+                scan_cursor = FixedKeyVec::from_slice(scan_result.last().unwrap().key()).unwrap();
 
                 for (kv, next) in scan_result[..scan_result.len() - 1]
                     .iter()
@@ -159,8 +160,8 @@ impl Server {
     async fn scan_range_simple(
         self: &Arc<Self>,
         lock: &DistributedLock,
-        scan_start: Vec<u8>,
-        scan_end: Vec<u8>,
+        scan_start: FixedKeyVec,
+        scan_end: FixedKeyVec,
         mut cb: impl FnMut(&FdbKeyValue),
     ) -> Result<()> {
         let mut scan_cursor = scan_start.clone();
@@ -174,7 +175,7 @@ impl Server {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
-                            ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
+                            ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
                         0,
                         true,
@@ -195,8 +196,8 @@ impl Server {
             }
 
             let scan_result = &scan_result[..];
-            scan_cursor = scan_result.last().unwrap().key().to_vec();
-            scan_cursor.push(0x00);
+            scan_cursor = FixedKeyVec::from_slice(scan_result.last().unwrap().key()).unwrap();
+            scan_cursor.push(0x00).unwrap();
 
             for kv in scan_result {
                 cb(kv);
@@ -321,7 +322,7 @@ impl Server {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
-                            ..RangeOption::from(scan_cursor.clone()..=scan_end.clone())
+                            ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
                         0,
                         true,
@@ -339,8 +340,9 @@ impl Server {
                     break;
                 }
 
-                let mut next_scan_cursor = scan_result.last().unwrap().key().to_vec();
-                next_scan_cursor.push(0x00);
+                let mut next_scan_cursor =
+                    FixedKeyVec::from_slice(scan_result.last().unwrap().key()).unwrap();
+                next_scan_cursor.push(0x00).unwrap();
 
                 let mut delete_queue: Vec<[u8; 32]> = vec![];
                 let now = SystemTime::now()

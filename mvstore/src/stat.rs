@@ -1,13 +1,16 @@
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use crate::server::{decode_version, Server};
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
-    RangeOption, Transaction,
+    FdbError, RangeOption, Transaction,
 };
 use serde::Serialize;
 
@@ -29,19 +32,24 @@ impl Server {
             txn.set_option(TransactionOption::ReadLockAware).unwrap();
         }
 
-        let mut version = [0u8; 10];
-        let last_write_version_key = self.construct_last_write_version_key(ns_id);
-        if let Some(t) = txn.get(&last_write_version_key, false).await? {
-            if t.len() == 16 + 10 {
-                version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
-            }
-        }
-
-        let nsmd = txn.get(&self.construct_nsmd_key(ns_id), false).await?;
-        let nsmd = nsmd
-            .as_ref()
-            .map(|x| std::str::from_utf8(&x[..]).unwrap_or_default().to_string())
-            .unwrap_or_default();
+        let rv = txn.get_read_version().await?;
+        let version = self
+            .read_version_and_nsid_to_lwv_cache
+            .try_get_with((rv, ns_id), async {
+                let mut version = [0u8; 10];
+                let last_write_version_key = self.construct_last_write_version_key(ns_id);
+                if let Some(t) = txn
+                    .get(&last_write_version_key, false)
+                    .await
+                    .map_err(Arc::new)?
+                {
+                    if t.len() == 16 + 10 {
+                        version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
+                    }
+                }
+                Ok::<[u8; 10], Arc<FdbError>>(version)
+            })
+            .await?;
 
         let mut interval: Option<Vec<u32>> = None;
         if !from_version.is_empty() {
@@ -53,7 +61,7 @@ impl Server {
 
         let stat = StatResponse {
             version: hex::encode(&version),
-            metadata: nsmd,
+            metadata: "".into(),
             read_only: self.read_only,
             interval,
         };
@@ -85,7 +93,7 @@ impl Server {
                     limit: Some(INTERVAL_SCAN_SIZE.load(Ordering::Relaxed)),
                     reverse: false,
                     mode: StreamingMode::WantAll,
-                    ..RangeOption::from(start.clone()..=end.clone())
+                    ..RangeOption::from(start.as_slice()..=end.as_slice())
                 },
                 0,
                 true,
