@@ -1,5 +1,7 @@
 mod commit;
+mod fixed_key_vec;
 mod gc;
+mod keys;
 mod lock;
 mod server;
 mod stat;

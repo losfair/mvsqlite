@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
-    future::{FdbSlice, FdbValues},
+    future::FdbValues,
     options::{MutationType, StreamingMode, TransactionOption},
-    tuple::{pack, unpack},
+    tuple::unpack,
     Database, RangeOption, Transaction,
 };
 use futures::StreamExt;
@@ -40,13 +40,20 @@ const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 
+enum GetError {
+    NotFound,
+    Other(anyhow::Error),
+}
+
 pub struct Server {
     pub db: Database,
-    raw_data_prefix: Vec<u8>,
-    metadata_prefix: String,
+    pub raw_data_prefix: Vec<u8>,
+    pub metadata_prefix: String,
 
     nskey_cache: Cache<String, [u8; 10]>,
     read_version_cache: Cache<[u8; 10], i64>,
+    pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
+    content_cache: Cache<([u8; 10], [u8; 32]), Bytes>,
 
     pub read_only: bool,
 }
@@ -71,8 +78,7 @@ pub struct ReadRequest<'a> {
 #[derive(Serialize)]
 pub struct ReadResponse {
     pub version: String,
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +171,7 @@ pub struct AdminDeleteUnreferencedContentInNamespaceRequest {
 
 pub struct Page {
     pub version: String,
-    pub data: FdbSlice,
+    pub data: Bytes,
 }
 
 #[derive(Default)]
@@ -209,6 +215,13 @@ impl Server {
             read_version_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(2))
                 .max_capacity(1000)
+                .build(),
+            read_version_and_nsid_to_lwv_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(2))
+                .build(),
+            content_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(60))
+                .max_capacity(5000)
                 .build(),
             read_only: config.read_only,
         }))
@@ -343,7 +356,7 @@ impl Server {
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
                     let ns_data_start = self.construct_ns_data_prefix(ns_id);
                     let mut ns_data_end = ns_data_start.clone();
-                    ns_data_end.push(0xff);
+                    ns_data_end.push(0xff).unwrap();
 
                     txn.clear_range(&ns_data_start, &ns_data_end);
                     txn.clear(&nskey_key);
@@ -686,11 +699,6 @@ impl Server {
     }
 
     async fn lookup_nskey(&self, nskey: &str, hashproof: Option<&str>) -> Result<Option<[u8; 10]>> {
-        enum GetError {
-            NotFound,
-            Other(anyhow::Error),
-        }
-
         let hashproof_hash = {
             let segs = nskey.split(":").collect::<Vec<_>>();
             if segs.len() < 2 {
@@ -824,6 +832,74 @@ impl Server {
         Ok(txn)
     }
 
+    async fn get_page_content_decoded_snapshot(
+        &self,
+        txn: &Transaction,
+        ns_id: [u8; 10],
+        hash: [u8; 32],
+    ) -> Result<Option<Bytes>> {
+        let key = self.construct_content_key(ns_id, hash);
+        let res = self
+            .content_cache
+            .try_get_with((ns_id, hash), async {
+                let kv = txn.get(&key, true).await;
+
+                match kv {
+                    Ok(Some(x)) => {
+                        let page = self.decode_page_for_read_caching(txn, ns_id, x).await;
+                        match page {
+                            Ok(x) => Ok(x),
+                            Err(e) => Err(GetError::Other(e)),
+                        }
+                    }
+                    Ok(None) => Err(GetError::NotFound),
+                    Err(e) => Err(GetError::Other(e.into())),
+                }
+            })
+            .await;
+        match res {
+            Ok(x) => Ok(Some(x)),
+            Err(e) => match &*e {
+                GetError::NotFound => Ok(None),
+                GetError::Other(e) => Err(anyhow::anyhow!("content read failed: {}", e)),
+            },
+        }
+    }
+
+    async fn get_page_content_decoded_no_delta_snapshot(
+        &self,
+        txn: &Transaction,
+        ns_id: [u8; 10],
+        hash: [u8; 32],
+    ) -> Result<Option<Bytes>> {
+        let key = self.construct_content_key(ns_id, hash);
+        let res = self
+            .content_cache
+            .try_get_with((ns_id, hash), async {
+                let kv = txn.get(&key, true).await;
+
+                match kv {
+                    Ok(Some(x)) => {
+                        let page = self.decode_page_no_delta(x).await;
+                        match page {
+                            Ok(x) => Ok(x),
+                            Err(e) => Err(GetError::Other(e)),
+                        }
+                    }
+                    Ok(None) => Err(GetError::NotFound),
+                    Err(e) => Err(GetError::Other(e.into())),
+                }
+            })
+            .await;
+        match res {
+            Ok(x) => Ok(Some(x)),
+            Err(e) => match &*e {
+                GetError::NotFound => Ok(None),
+                GetError::Other(e) => Err(anyhow::anyhow!("content read failed: {}", e)),
+            },
+        }
+    }
+
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
         ns_id: Option<[u8; 10]>,
@@ -889,14 +965,13 @@ impl Server {
                     .with_context(|| "missing page_version")?;
                 let txn = self.create_versioned_read_txn(page_version_hex).await?;
                 let page = self
-                    .read_page(&txn, ns_id, page_index, &page_version_hex)
+                    .read_page_decoded_snapshot(&txn, ns_id, page_index, &page_version_hex)
                     .await?;
                 match page {
                     Some(page) => {
-                        let decoded = self.decode_page(&txn, ns_id, page.data).await?;
                         res = Response::builder()
                             .header("x-page-version", page.version)
-                            .body(Body::from(decoded.data))?;
+                            .body(Body::from(page.data))?;
                     }
                     None => {
                         res = Response::builder().body(Body::empty())?;
@@ -976,8 +1051,8 @@ impl Server {
                                             break Err(());
                                         }
                                     };
-                                    let content_key = me.construct_content_key(ns_id, hash);
-                                    match txn.get(&content_key, false).await {
+                                    let content = me.get_page_content_decoded_snapshot(&txn, ns_id, hash).await;
+                                    match content {
                                         Ok(Some(x)) => Some(Page {
                                             version: read_req.version.to_string(),
                                             data: x,
@@ -997,7 +1072,7 @@ impl Server {
                                         }
                                     };
                                     match me
-                                        .read_page(&txn, ns_id, read_req.page_index, read_req.version)
+                                        .read_page_decoded_snapshot(&txn, ns_id, read_req.page_index, read_req.version)
                                         .await
                                     {
                                         Ok(x) => x,
@@ -1010,17 +1085,11 @@ impl Server {
                                 let payload = match page {
                                     Some(x) => ReadResponse {
                                         version: x.version.clone(),
-                                        data: match me.decode_page(&txn, ns_id, x.data).await {
-                                            Ok(x) => x.data,
-                                            Err(e) => {
-                                                tracing::warn!(ns = ns_id_hex, error = %e, "error decoding page");
-                                                break Err(());
-                                            }
-                                        },
+                                        data: x.data,
                                     },
                                     None => ReadResponse {
                                         version: "".into(),
-                                        data: Vec::new(),
+                                        data: Bytes::new(),
                                     },
                                 };
                                 break Ok(payload);
@@ -1467,7 +1536,7 @@ impl Server {
                     limit: Some(1),
                     reverse: true,
                     mode: StreamingMode::Small,
-                    ..RangeOption::from(scan_start..=scan_end)
+                    ..RangeOption::from(scan_start.as_slice()..=scan_end.as_slice())
                 },
                 0,
                 true,
@@ -1486,7 +1555,7 @@ impl Server {
         }
     }
 
-    async fn read_page(
+    async fn read_page_decoded_snapshot(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
@@ -1500,136 +1569,11 @@ impl Server {
             Some(x) => x,
             None => return Ok(None),
         };
-        let content_key = self.construct_content_key(ns_id, hash);
-        let content = txn
-            .get(&content_key, false)
+        let data = self
+            .get_page_content_decoded_snapshot(txn, ns_id, hash)
             .await?
             .with_context(|| "cannot find content for the provided hash")?;
-        Ok(Some(Page {
-            version,
-            data: content,
-        }))
-    }
-
-    pub fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
-        let mut key = pack(&(self.metadata_prefix.as_str(), "nsmd"));
-        key.push(0x32);
-        key.extend_from_slice(&ns_id);
-        key
-    }
-
-    pub fn construct_nstask_key(&self, ns_id: [u8; 10], task: &str) -> Vec<u8> {
-        let mut key = pack(&(self.metadata_prefix.as_str(), "nstask"));
-        key.push(0x32);
-        key.extend_from_slice(&ns_id);
-        key.extend_from_slice(&pack(&(task,)));
-        key
-    }
-
-    pub fn construct_globaltask_key(&self, task: &str) -> Vec<u8> {
-        let key = pack(&(self.metadata_prefix.as_str(), "globaltask", task));
-        key
-    }
-
-    pub fn construct_time2version_prefix(&self) -> Vec<u8> {
-        let key = pack(&(self.metadata_prefix.as_str(), "time2version"));
-        key
-    }
-
-    pub fn construct_time2version_key(&self, time_secs: u64) -> Vec<u8> {
-        let key = pack(&(self.metadata_prefix.as_str(), "time2version", time_secs));
-        key
-    }
-
-    pub fn construct_nskey_prefix(&self) -> Vec<u8> {
-        pack(&(self.metadata_prefix.as_str(), "nskey"))
-    }
-
-    pub fn construct_nskey_key(&self, ns_key: &str) -> Vec<u8> {
-        pack(&(self.metadata_prefix.as_str(), "nskey", ns_key))
-    }
-
-    pub fn construct_ns_commit_token_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
-        let mut key = pack(&(self.metadata_prefix.as_str(), "ns_commit_token"));
-        key.push(0x32);
-        key.extend_from_slice(&ns_id);
-        key
-    }
-
-    pub fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1);
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'v');
-        buf
-    }
-
-    pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len());
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf
-    }
-
-    pub fn construct_page_key(
-        &self,
-        ns_id: [u8; 10],
-        page_index: u32,
-        page_version: [u8; 10],
-    ) -> Vec<u8> {
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            self.raw_data_prefix.len()
-                + ns_id.len()
-                + 1
-                + std::mem::size_of::<u32>()
-                + page_version.len(),
-        );
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'p');
-        buf.extend_from_slice(&page_index.to_be_bytes());
-        buf.extend_from_slice(&page_version);
-        buf
-    }
-
-    pub fn construct_content_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
-        let mut buf: Vec<u8> =
-            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + hash.len());
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'c');
-        buf.extend_from_slice(&hash);
-        buf
-    }
-
-    pub fn construct_contentindex_key(&self, ns_id: [u8; 10], hash: [u8; 32]) -> Vec<u8> {
-        let mut buf: Vec<u8> =
-            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + hash.len());
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'd');
-        buf.extend_from_slice(&hash);
-        buf
-    }
-
-    pub fn construct_delta_referrer_key(&self, ns_id: [u8; 10], from_hash: [u8; 32]) -> Vec<u8> {
-        let mut buf: Vec<u8> =
-            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + from_hash.len());
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'r');
-        buf.extend_from_slice(&from_hash);
-        buf
-    }
-
-    pub fn construct_changelog_key(&self, ns_id: [u8; 10], version: [u8; 10]) -> Vec<u8> {
-        let mut buf: Vec<u8> =
-            Vec::with_capacity(self.raw_data_prefix.len() + ns_id.len() + 1 + version.len());
-        buf.extend_from_slice(&self.raw_data_prefix);
-        buf.extend_from_slice(&ns_id);
-        buf.push(b'l');
-        buf.extend_from_slice(&version);
-        buf
+        Ok(Some(Page { version, data }))
     }
 
     async fn delta_encode(
@@ -1679,12 +1623,11 @@ impl Server {
             }
         };
         let base_page = self.decode_page_no_delta(undecoded_base).await?;
-        if base_page.data.len() != this_page.len() || this_page.is_empty() {
+        if base_page.len() != this_page.len() || this_page.is_empty() {
             return Ok(None);
         }
 
         let num_diff_bytes = base_page
-            .data
             .iter()
             .zip(this_page.iter())
             .filter(|(b, t)| b != t)
@@ -1694,7 +1637,6 @@ impl Server {
         }
 
         let xor_image = base_page
-            .data
             .iter()
             .zip(this_page.iter())
             .map(|(b, t)| b ^ t)
@@ -1720,19 +1662,17 @@ impl Server {
     async fn decode_page_no_delta<T: AsRef<[u8]> + Send + Sync + 'static>(
         &self,
         data_container: T,
-    ) -> Result<DecodedPage> {
+    ) -> Result<Bytes> {
         let data = data_container.as_ref();
         if data.len() == 0 {
-            return Ok(DecodedPage::default());
+            return Ok(Bytes::new());
         }
 
         let encode_type = data[0];
         match encode_type {
             PAGE_ENCODING_NONE => {
                 // not compressed
-                Ok(DecodedPage {
-                    data: data[1..].to_vec(),
-                })
+                Ok(Bytes::from(data[1..].to_vec()))
             }
             PAGE_ENCODING_ZSTD => {
                 // zstd
@@ -1740,7 +1680,7 @@ impl Server {
                     zstd::bulk::decompress(&data_container.as_ref()[1..], MAX_PAGE_SIZE)
                 })
                 .with_context(|| "zstd decompress failed")?;
-                Ok(DecodedPage { data })
+                Ok(Bytes::from(data))
             }
             _ => Err(anyhow::anyhow!(
                 "decode_page_no_delta: unknown page encoding: {}",
@@ -1749,15 +1689,15 @@ impl Server {
         }
     }
 
-    async fn decode_page<T: AsRef<[u8]> + Send + Sync + 'static>(
+    async fn decode_page_for_read_caching<T: AsRef<[u8]> + Send + Sync + 'static>(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
         data_container: T,
-    ) -> Result<DecodedPage> {
+    ) -> Result<Bytes> {
         let data = data_container.as_ref();
         if data.len() == 0 {
-            return Ok(DecodedPage::default());
+            return Ok(Bytes::new());
         }
 
         let encode_type = data[0];
@@ -1767,24 +1707,25 @@ impl Server {
                     anyhow::bail!("invalid delta encoding");
                 }
                 let base_page_hash = <[u8; 32]>::try_from(&data[1..33]).unwrap();
-                let base_page_key = self.construct_content_key(ns_id, base_page_hash);
-                let base_page = match txn.get(&base_page_key, false).await? {
+                let base_page = self
+                    .get_page_content_decoded_no_delta_snapshot(txn, ns_id, base_page_hash)
+                    .await?;
+                let base_page = match base_page {
                     Some(x) => x,
                     None => anyhow::bail!("base page not found"),
                 };
-                let base_page = self.decode_page_no_delta(base_page).await?;
                 let mut delta_data = block_in_place(|| {
                     zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)
                 })?;
-                if delta_data.len() != base_page.data.len() {
+                if delta_data.len() != base_page.len() {
                     anyhow::bail!("delta and base have different sizes");
                 }
 
                 for (i, b) in delta_data.iter_mut().enumerate() {
-                    *b ^= base_page.data[i];
+                    *b ^= base_page[i];
                 }
 
-                Ok(DecodedPage { data: delta_data })
+                Ok(Bytes::from(delta_data))
             }
             _ => self.decode_page_no_delta(data_container).await,
         }
