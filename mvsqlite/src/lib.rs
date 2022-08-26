@@ -33,6 +33,8 @@ pub fn init_with_options(opts: InitOptions) {
 
 fn init_with_options_impl(opts: InitOptions) {
     let mut sector_size: usize = 8192;
+    let mut force_http2 = false;
+
     if let Ok(s) = std::env::var("MVSQLITE_SECTOR_SIZE") {
         let requested_ss = s
             .parse::<usize>()
@@ -41,24 +43,39 @@ fn init_with_options_impl(opts: InitOptions) {
             panic!("MVSQLITE_SECTOR_SIZE must be one of 4096, 8192, 16384, 32768");
         }
         sector_size = requested_ss;
+        tracing::debug!(requested = requested_ss, "setting sector size",);
     }
     if let Ok(s) = std::env::var("MVSQLITE_PAGE_CACHE_SIZE") {
         let requested = s
             .parse::<usize>()
             .expect("MVSQLITE_PAGE_CACHE_SIZE must be a usize");
         vfs::PAGE_CACHE_SIZE.store(requested, Ordering::Relaxed);
+        tracing::debug!(requested, "setting page cache size",);
     }
     if let Ok(s) = std::env::var("MVSQLITE_WRITE_CHUNK_SIZE") {
         let requested = s
             .parse::<usize>()
             .expect("MVSQLITE_WRITE_CHUNK_SIZE must be a usize");
         vfs::WRITE_CHUNK_SIZE.store(requested, Ordering::Relaxed);
+        tracing::debug!(requested, "setting write chunk size",);
     }
     if let Ok(s) = std::env::var("MVSQLITE_PREFETCH_DEPTH") {
         let requested = s
             .parse::<usize>()
             .expect("MVSQLITE_PREFETCH_DEPTH must be a usize");
         vfs::PREFETCH_DEPTH.store(requested, Ordering::Relaxed);
+        tracing::debug!(requested, "setting prefetch depth",);
+    }
+    if let Ok(s) = std::env::var("MVSQLITE_FORCE_HTTP2") {
+        if s.as_str() == "1" {
+            force_http2 = true;
+            tracing::debug!("enabling forced http2");
+        }
+    }
+
+    let mut builder = reqwest::ClientBuilder::new();
+    if force_http2 {
+        builder = builder.http2_prior_knowledge();
     }
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
@@ -68,7 +85,7 @@ fn init_with_options_impl(opts: InitOptions) {
         inner: mvfs::MultiVersionVfs {
             data_plane,
             sector_size,
-            http_client: reqwest::Client::new(),
+            http_client: builder.build().expect("failed to build http client"),
         },
     };
 
