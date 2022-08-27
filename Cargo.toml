@@ -6,4 +6,5 @@ members = [
     "mvstore-stress",
     "mvclient",
     "mvfs",
+    "mvcache",
 ]
