@@ -185,6 +185,12 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.history.record(page_offset);
 
+        if let Some(x) = self.write_buffer.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("write buffer hit");
+            return Ok(());
+        }
+
         let cache_entry = self.page_cache.get(page_offset);
         match &cache_entry {
             PageCacheEntry::Fresh { data } => {
@@ -193,12 +199,6 @@ impl Connection {
                 return Ok(());
             }
             _ => {}
-        }
-
-        if let Some(x) = self.write_buffer.get(&page_offset) {
-            buf.copy_from_slice(x);
-            tracing::trace!("write buffer hit");
-            return Ok(());
         }
 
         let txn = self.txn.as_mut().unwrap();
