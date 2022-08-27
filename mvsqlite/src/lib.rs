@@ -9,6 +9,8 @@ pub mod vfs;
 
 use std::sync::{atomic::Ordering, Arc};
 
+use tempdir::TempDir;
+
 use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
 
 pub static VFS_NAME: &'static str = "mv-vfs";
@@ -34,6 +36,9 @@ pub fn init_with_options(opts: InitOptions) {
 fn init_with_options_impl(opts: InitOptions) {
     let mut sector_size: usize = 8192;
     let mut force_http2 = false;
+    let mut page_cache_path: Option<String> = None;
+    let mut page_cache_index_size: u64 = 100000;
+    let mut page_cache_threshold_size: u64 = 1 * 1024 * 1048576; // 1GiB
 
     if let Ok(s) = std::env::var("MVSQLITE_SECTOR_SIZE") {
         let requested_ss = s
@@ -72,6 +77,35 @@ fn init_with_options_impl(opts: InitOptions) {
             tracing::debug!("enabling forced http2");
         }
     }
+    if let Ok(s) = std::env::var("MVSQLITE_PAGE_CACHE_INDEX_SIZE") {
+        let requested = s
+            .parse::<u64>()
+            .expect("MVSQLITE_PAGE_CACHE_INDEX_SIZE must be a u64");
+        page_cache_index_size = requested;
+        tracing::debug!(requested, "setting page cache index size",);
+    }
+    if let Ok(s) = std::env::var("MVSQLITE_PAGE_CACHE_THRESHOLD_SIZE") {
+        let requested = s
+            .parse::<u64>()
+            .expect("MVSQLITE_PAGE_CACHE_THRESHOLD_SIZE must be a u64");
+        page_cache_threshold_size = requested;
+        tracing::debug!(requested, "setting page cache threshold size",);
+    }
+    if let Ok(s) = std::env::var("MVSQLITE_PAGE_CACHE_PATH") {
+        tracing::debug!(requested = s, "setting page cache path",);
+        page_cache_path = Some(s);
+    }
+
+    if page_cache_path.is_none() {
+        let tempdir = TempDir::new("mvsqlite-page-cache").unwrap();
+        let path = tempdir
+            .into_path()
+            .to_str()
+            .expect("invalid tempdir path")
+            .to_string();
+        tracing::info!(path, "creating temporary page cache");
+        page_cache_path = Some(path);
+    }
 
     let mut builder = reqwest::ClientBuilder::new();
     if force_http2 {
@@ -87,6 +121,9 @@ fn init_with_options_impl(opts: InitOptions) {
             sector_size,
             http_client: builder.build().expect("failed to build http client"),
         },
+        page_cache_path: page_cache_path.unwrap(),
+        page_cache_index_size,
+        page_cache_threshold_size,
     };
 
     sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");

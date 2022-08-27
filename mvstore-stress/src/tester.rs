@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{Arc, Mutex},
@@ -186,19 +187,24 @@ impl Tester {
             match mode {
                 0..=5 => {
                     let num_reads_requested = rand::thread_rng().gen_range(1..=10);
-                    let reads = (0..num_reads_requested)
-                        .map(|_| rand::thread_rng().gen_range::<u32, _>(0..self.config.num_pages))
-                        .filter(|x| !self.config.disable_ryw || !txn.page_is_written(*x))
+                    let reads: Vec<(u32, Vec<(String, Bytes)>)> = (0..num_reads_requested)
+                        .map(|_| {
+                            (
+                                rand::thread_rng().gen_range::<u32, _>(0..self.config.num_pages),
+                                vec![],
+                            )
+                        })
+                        .filter(|x| !self.config.disable_ryw || !txn.page_is_written(x.0))
                         .collect::<Vec<_>>();
                     if reads.len() == 0 {
                         continue;
                     }
-                    for &id in &reads {
-                        txn.mark_read(id);
+                    for (index, _) in &reads {
+                        txn.mark_read(*index);
                     }
                     let pages = txn.read_many_nomark(&reads).await?;
                     let mut mem = self.mem.write().await;
-                    for (&index, page) in reads.iter().zip(pages.iter()) {
+                    for ((index, _), (_, page)) in reads.iter().zip(pages.iter()) {
                         tracing::debug!(
                             task = task_id,
                             txn_id,
@@ -207,7 +213,7 @@ impl Tester {
                             version = txn.version(),
                             "read"
                         );
-                        mem.verify_page(txn_id, index, page, txn.version());
+                        mem.verify_page(txn_id, *index, page, txn.version());
                     }
                 }
                 6..=7 => {

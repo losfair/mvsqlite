@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use crate::{
     io_engine::IoEngine,
@@ -6,11 +6,15 @@ use crate::{
     tempfile::TempFile,
 };
 
+use mvfs::page_cache::PageCache;
 pub use mvfs::vfs::{PAGE_CACHE_SIZE, PREFETCH_DEPTH, WRITE_CHUNK_SIZE};
 
 pub struct MultiVersionVfs {
     pub io: Arc<IoEngine>,
     pub inner: mvfs::MultiVersionVfs,
+    pub page_cache_path: String,
+    pub page_cache_index_size: u64,
+    pub page_cache_threshold_size: u64,
 }
 
 impl Vfs for MultiVersionVfs {
@@ -25,7 +29,14 @@ impl Vfs for MultiVersionVfs {
             return Ok(Box::new(TempFile::new()));
         }
 
-        let conn = self.inner.open(db)?;
+        let page_cache = PageCache::new(
+            Path::new(self.page_cache_path.as_str()),
+            self.page_cache_index_size,
+            self.page_cache_threshold_size,
+        )
+        .expect("failed to open page cache");
+
+        let conn = self.inner.open(db, page_cache)?;
         Ok(Box::new(Connection {
             io: self.io.clone(),
             inner: conn,

@@ -75,13 +75,14 @@ pub struct ReadRequest<'a> {
     pub hash: Option<&'a [u8]>,
 
     #[serde(default)]
-    pub revalidate_version: Option<&'a str>,
+    pub revalidate_versions: Vec<&'a str>,
 }
 
 #[derive(Serialize)]
 pub struct ReadResponse {
     pub version: String,
     pub data: Bytes,
+
     #[serde(default)]
     pub revalidated: bool,
 }
@@ -1670,14 +1671,12 @@ impl Server {
                 .await
             {
                 Ok(Some((version, hash))) => {
-                    if let Some(revalidate_version) = read_req.revalidate_version {
-                        if version.as_str() == revalidate_version {
-                            return Ok(ReadResponse {
-                                version: version.as_str().to_string(),
-                                data: Bytes::new(),
-                                revalidated: true,
-                            });
-                        }
+                    if read_req.revalidate_versions.contains(&version.as_str()) {
+                        return Ok(ReadResponse {
+                            version: version.as_str().to_string(),
+                            data: Bytes::new(),
+                            revalidated: true,
+                        });
                     }
                     match self
                         .get_page_content_decoded_snapshot(&txn, ns_id, hash)

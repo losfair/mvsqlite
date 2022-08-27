@@ -1,4 +1,4 @@
-use moka::sync::Cache;
+use bytes::Bytes;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -9,7 +9,10 @@ use std::{
 
 use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
 
-use crate::types::LockKind;
+use crate::{
+    page_cache::{PageCache, PageCacheEntry},
+    types::LockKind,
+};
 const TRANSITION_HISTORY_SIZE: usize = 10;
 static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template_4k.db");
 static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
@@ -26,7 +29,7 @@ pub struct MultiVersionVfs {
 }
 
 impl MultiVersionVfs {
-    pub fn open(&self, db: &str) -> Result<Connection, std::io::Error> {
+    pub fn open(&self, db: &str, page_cache: PageCache) -> Result<Connection, std::io::Error> {
         let db_str_segs = db.split("@").collect::<Vec<_>>();
         let (ns_key, fixed_version) = if db_str_segs.len() < 2 {
             (db_str_segs[0], None)
@@ -87,7 +90,7 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            page_cache,
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -110,7 +113,7 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    page_cache: Cache<u32, Arc<[u8]>>,
+    page_cache: PageCache,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -182,14 +185,22 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.history.record(page_offset);
 
-        if let Some(x) = &self.page_cache.get(&page_offset) {
+        let cache_entry = self.page_cache.get(page_offset);
+        match &cache_entry {
+            PageCacheEntry::Fresh { data } => {
+                buf.copy_from_slice(data);
+                tracing::trace!("page cache hit");
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if let Some(x) = self.write_buffer.get(&page_offset) {
             buf.copy_from_slice(x);
-            tracing::trace!("page cache hit");
+            tracing::trace!("write buffer hit");
             return Ok(());
         }
 
-        // Ensure we see the latest data
-        self.force_flush_write_buffer().await;
         let txn = self.txn.as_mut().unwrap();
 
         tracing::debug!(
@@ -214,7 +225,7 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains_key(x))
+            .filter(|x| !self.page_cache.maybe_contains_key(**x))
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -224,12 +235,27 @@ impl Connection {
             read_vec.push(predicted_next_page);
         }
 
+        let mut read_vec_with_context: Vec<(u32, Vec<(String, Bytes)>)> =
+            Vec::with_capacity(read_vec.len());
+        for page_index in read_vec {
+            let entry = self.page_cache.get(page_index);
+            match entry {
+                PageCacheEntry::Fresh { .. } => {}
+                PageCacheEntry::Stale { data, candidate } => {
+                    read_vec_with_context.push((page_index, vec![(candidate, data)]));
+                }
+                PageCacheEntry::NotFound => {
+                    read_vec_with_context.push((page_index, vec![]));
+                }
+            }
+        }
+
         let pages = txn
-            .read_many_nomark(&read_vec)
+            .read_many_nomark(&read_vec_with_context)
             .await
             .expect("unrecoverable read failure");
         assert_eq!(pages.len(), 1 + predicted_next.len());
-        let page = &pages[0];
+        let (version, page) = &pages[0];
 
         if page.is_empty() {
             if offset == 0 {
@@ -248,12 +274,16 @@ impl Connection {
             buf.copy_from_slice(&page);
         }
 
-        self.page_cache.insert(page_offset, Arc::from(&*buf));
+        self.page_cache.insert(page_offset, *version, &buf);
 
-        for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
+        for ((their_version, maybe_other_page), (their_index, _)) in pages
+            .iter()
+            .skip(1)
+            .zip(read_vec_with_context.iter().skip(1))
+        {
             if *their_index != 0 && !maybe_other_page.is_empty() {
                 self.page_cache
-                    .insert(*their_index, Arc::from(&maybe_other_page[..]));
+                    .insert(*their_index, *their_version, &maybe_other_page[..]);
             }
         }
         Ok(())
@@ -369,15 +399,13 @@ impl Connection {
             buf[92..96].copy_from_slice(&[0u8; 4]);
         }
 
-        if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
-            if &*x == &*buf {
+        if let Some(x) = self.write_buffer.get(&(page_offset as u32)) {
+            if &**x == buf {
                 tracing::info!(page = page_offset, "identity write ignored");
                 return Ok(());
             }
         }
 
-        self.page_cache
-            .insert(page_offset as u32, Arc::clone(&buf_arc));
         self.write_buffer
             .insert(page_offset as u32, Arc::clone(&buf_arc));
 
@@ -433,7 +461,7 @@ impl Connection {
                 match interval {
                     Some(interval) => {
                         for index in &interval {
-                            self.page_cache.invalidate(index);
+                            self.page_cache.invalidate(*index);
                         }
                         tracing::info!(
                             count = interval.len(),
@@ -441,7 +469,7 @@ impl Connection {
                         );
                     }
                     None => {
-                        self.page_cache.invalidate_all();
+                        self.page_cache.mark_all_as_stale();
                         if self.last_known_write_version.is_some() {
                             tracing::warn!("non-local change detected, invalidating cache");
                         }
@@ -504,7 +532,7 @@ impl Connection {
                         // Invalidate page cache
                         if let Some(changelog) = changelog {
                             for &index in changelog {
-                                self.page_cache.invalidate(&index);
+                                self.page_cache.invalidate(index);
                             }
                             tracing::info!(
                                     count = changelog.len(),
@@ -512,11 +540,15 @@ impl Connection {
                                 );
                         } else {
                             // Changelog is not available - do a full flush
-                            self.page_cache.invalidate_all();
+                            self.page_cache.mark_all_as_stale();
                             tracing::warn!(
                                 "non-local concurrent transaction detected, invalidating cache"
                             );
                         }
+                    }
+
+                    for &index in &dirty_pages {
+                        self.page_cache.invalidate(index);
                     }
 
                     self.txn = Some(
@@ -534,7 +566,7 @@ impl Connection {
                 }
                 CommitOutput::Conflict => {
                     for index in &dirty_pages {
-                        self.page_cache.invalidate(index);
+                        self.page_cache.invalidate(*index);
                     }
                     tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                     commit_ok = false;

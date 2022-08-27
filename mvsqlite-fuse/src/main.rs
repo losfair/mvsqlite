@@ -372,7 +372,7 @@ impl fuser::Filesystem for FuseFs {
                 .unwrap()
                 .remove(&ino);
             let (ns_name, namespace) = self.namespaces.get_index(inode.ns).unwrap();
-            let conn = match self.vfs.open(namespace) {
+            let conn = match self.vfs.open(namespace, todo!()) {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::error!(ns = ns_name, error = %e, "failed to open namespace");

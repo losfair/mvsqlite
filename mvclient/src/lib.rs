@@ -59,6 +59,9 @@ pub struct ReadRequest<'a> {
     #[serde(default)]
     #[serde(with = "serde_bytes")]
     pub hash: Option<&'a [u8]>,
+
+    #[serde(default)]
+    pub revalidate_versions: &'a [&'a str],
 }
 
 #[derive(Deserialize)]
@@ -66,6 +69,9 @@ pub struct ReadResponse<'a> {
     pub version: &'a str,
     #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
+
+    #[serde(default)]
+    pub revalidated: bool,
 }
 
 #[derive(Serialize)]
@@ -360,7 +366,10 @@ impl Transaction {
         }
     }
 
-    pub async fn read_many_nomark(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+    pub async fn read_many_nomark(
+        &self,
+        page_id_list: &[(u32, Vec<(String, Bytes)>)],
+    ) -> Result<Vec<([u8; 10], Bytes)>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
@@ -370,12 +379,17 @@ impl Transaction {
         let mut url = self.c.config.data_plane.clone();
         url.set_path("/batch/read");
 
-        for &page_index in page_id_list {
+        for (page_index, revalidations) in page_id_list {
             let buffered = self.page_buffer.get(&page_index).map(|x| x.as_slice());
+            let revalidate_versions = revalidations
+                .iter()
+                .map(|x| x.0.as_str())
+                .collect::<Vec<_>>();
             let req = ReadRequest {
-                page_index,
+                page_index: *page_index,
                 version: self.version.as_str(),
                 hash: buffered,
+                revalidate_versions: revalidate_versions.as_slice(),
             };
             let serialized = rmp_serde::to_vec_named(&req)?;
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
@@ -400,18 +414,34 @@ impl Transaction {
                 }
             };
             let mut raw_response = &raw_response[..];
-            let mut out: Vec<Vec<u8>> = Vec::with_capacity(page_id_list.len());
+            let mut out: Vec<([u8; 10], Bytes)> = Vec::with_capacity(page_id_list.len());
+            let mut revalidations = page_id_list.iter().map(|x| &x.1);
             while !raw_response.is_empty() {
                 let len = raw_response.read_u32::<BigEndian>()? as usize;
                 let serialized = &raw_response[..len];
                 raw_response = &raw_response[len..];
+                let revalidations = revalidations.next().unwrap();
 
                 let data: ReadResponse = rmp_serde::from_slice(serialized)?;
-                out.push(data.data.to_vec());
+                let payload = if data.revalidated {
+                    revalidations
+                        .iter()
+                        .find(|x| data.version == x.0)
+                        .unwrap()
+                        .1
+                        .clone()
+                } else {
+                    Bytes::from(data.data.to_vec())
+                };
                 self.seen_hashes
                     .lock()
                     .unwrap()
-                    .insert(*blake3::hash(&data.data).as_bytes());
+                    .insert(*blake3::hash(&payload).as_bytes());
+                let mut version = [0u8; 10];
+                if !data.version.is_empty() {
+                    hex::decode_to_slice(&data.version, &mut version).unwrap();
+                }
+                out.push((version, payload));
             }
 
             if out.len() != page_id_list.len() {
