@@ -8,8 +8,9 @@ use std::{
 
 use bytes::Bytes;
 use rand::{Rng, RngCore};
+use tempdir::TempDir;
 
-use crate::{moka_backend::MokaBackend, LoadOutput, VersionedPageCache};
+use crate::{lmdb_backend::LmdbBackend, moka_backend::MokaBackend, LoadOutput, VersionedPageCache};
 
 struct MockstoreConfig {
     target_page_count: u32,
@@ -186,7 +187,25 @@ async fn test_moka_backend() {
             target_page_count: 900,
             page_bound: 2500,
             max_reads_per_round: 10,
-            max_invalidations_per_round: 0,
+            max_invalidations_per_round: 10,
+            stale_all_probability: 0.05,
+        },
+        10000,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_lmdb_backend() {
+    let tempdir = TempDir::new("mvcache-lmdb-test").unwrap();
+    let backend = LmdbBackend::new(1000000, tempdir.path()).unwrap();
+    run_test(
+        Box::new(backend),
+        MockstoreConfig {
+            target_page_count: 9000,
+            page_bound: 250000,
+            max_reads_per_round: 10,
+            max_invalidations_per_round: 10,
             stale_all_probability: 0.05,
         },
         10000,

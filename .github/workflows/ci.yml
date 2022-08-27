@@ -35,6 +35,8 @@ jobs:
         run: make -C ./mvsqlite-preload build-preload && make -C ./mvsqlite-preload build-lib
       - name: Build (mvstore-stress)
         run: cargo build --release -p mvstore-stress
+      - name: Unit test
+        run: cargo test --release
       - name: Collect binaries
         run: |
           set -e
