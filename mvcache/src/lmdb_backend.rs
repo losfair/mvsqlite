@@ -57,6 +57,30 @@ impl LmdbBackend {
 
 #[async_trait]
 impl VersionedPageCache for LmdbBackend {
+    fn contains_key(&self, key: u32) -> bool {
+        self.index.get(&key).is_some()
+    }
+
+    async fn try_get(&self, key: u32) -> Option<Bytes> {
+        if let Some(x) = self.index.get(&key) {
+            let x = x.lock().await;
+            if x.generation != self.generation {
+                return None;
+            }
+            let data = if let Some(hash) = x.hash {
+                let txn = self.env.begin_ro_txn().unwrap();
+                Some(Bytes::from(
+                    txn.get(self.db, hash.as_bytes()).unwrap().to_vec(),
+                ))
+            } else {
+                None
+            };
+            return data;
+        }
+
+        None
+    }
+
     async fn get(&self, key: u32, load: CacheLoader) -> anyhow::Result<Option<Bytes>> {
         if let Some(x) = self.index.get(&key) {
             let mut x = x.lock().await;

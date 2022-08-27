@@ -37,6 +37,22 @@ fn flatten_get_output<T>(res: Result<T, Arc<anyhow::Error>>) -> Result<T> {
 
 #[async_trait]
 impl VersionedPageCache for MokaBackend {
+    fn contains_key(&self, key: u32) -> bool {
+        self.inner.get(&key).is_some()
+    }
+
+    async fn try_get(&self, key: u32) -> Option<Bytes> {
+        if let Some(x) = self.inner.get(&key) {
+            let x = x.lock().await;
+            if x.generation != self.generation {
+                return None;
+            }
+            return x.data.clone();
+        }
+
+        None
+    }
+
     async fn get(&self, key: u32, load: CacheLoader) -> anyhow::Result<Option<Bytes>> {
         if let Some(x) = self.inner.get(&key) {
             let mut x = x.lock().await;

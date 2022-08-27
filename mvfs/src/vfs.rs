@@ -1,4 +1,5 @@
 use moka::sync::Cache;
+use mvcache::VersionedPageCache;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -15,7 +16,6 @@ static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template
 static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
 static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../template_16k.db");
 static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
-pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
 pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(10);
 
@@ -26,7 +26,11 @@ pub struct MultiVersionVfs {
 }
 
 impl MultiVersionVfs {
-    pub fn open(&self, db: &str) -> Result<Connection, std::io::Error> {
+    pub fn open(
+        &self,
+        db: &str,
+        page_cache: Box<dyn VersionedPageCache>,
+    ) -> Result<Connection, std::io::Error> {
         let db_str_segs = db.split("@").collect::<Vec<_>>();
         let (ns_key, fixed_version) = if db_str_segs.len() < 2 {
             (db_str_segs[0], None)
@@ -87,7 +91,7 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            page_cache,
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -110,7 +114,7 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    page_cache: Cache<u32, Arc<[u8]>>,
+    page_cache: Box<dyn VersionedPageCache>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -182,14 +186,18 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.history.record(page_offset);
 
-        if let Some(x) = &self.page_cache.get(&page_offset) {
-            buf.copy_from_slice(x);
+        if let Some(x) = self.page_cache.try_get(page_offset).await {
+            buf.copy_from_slice(&x[..]);
             tracing::trace!("page cache hit");
             return Ok(());
         }
 
-        // Ensure we see the latest data
-        self.force_flush_write_buffer().await;
+        if let Some(x) = self.write_buffer.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("write buffer hit");
+            return Ok(());
+        }
+
         let txn = self.txn.as_mut().unwrap();
 
         tracing::debug!(
@@ -214,7 +222,7 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains_key(x))
+            .filter(|x| !self.page_cache.contains_key(**x))
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -223,6 +231,8 @@ impl Connection {
         for &predicted_next_page in &predicted_next {
             read_vec.push(predicted_next_page);
         }
+
+        let mut txn = self.txn.take().unwrap();
 
         let pages = txn
             .read_many_nomark(&read_vec)
@@ -256,6 +266,8 @@ impl Connection {
                     .insert(*their_index, Arc::from(&maybe_other_page[..]));
             }
         }
+
+        self.txn = Some(txn);
         Ok(())
     }
 

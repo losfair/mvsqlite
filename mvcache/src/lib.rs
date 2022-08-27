@@ -27,6 +27,8 @@ pub enum LoadOutput {
 
 #[async_trait]
 pub trait VersionedPageCache {
+    fn contains_key(&self, key: u32) -> bool;
+    async fn try_get(&self, key: u32) -> Option<Bytes>;
     async fn get(&self, key: u32, load: CacheLoader) -> Result<Option<Bytes>>;
     fn mark_all_as_stale(&mut self);
     async fn invalidate(&mut self, keys: &[u32]);

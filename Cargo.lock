@@ -1252,6 +1252,7 @@ dependencies = [
  "anyhow",
  "lazy_static",
  "moka",
+ "mvcache",
  "mvclient",
  "reqwest",
  "serde",
