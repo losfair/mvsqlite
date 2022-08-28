@@ -105,6 +105,37 @@ jobs:
           sleep 1
           curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
+  stress-content-cache:
+    name: mvstore stress test (with content cache)
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Fetch binaries
+        uses: actions/download-artifact@v3
+        with:
+          name: build
+          path: ./build
+      - name: Run it
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvstore-stress
+          export RUST_LOG=info
+          mkdir /tmp/mvstore-content-cache
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
+            --content-cache /tmp/mvstore-content-cache --content-cache-size 50000000 &
+          sleep 1
+          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   stress-disable-read-set:
     name: mvstore stress test (disable read set)
     runs-on: ubuntu-20.04
@@ -448,6 +479,7 @@ jobs:
     needs:
     - build
     - stress
+    - stress-content-cache
     - stress-buggify
     - stress-small-gc-batch
     - stress-gc-nofresh
