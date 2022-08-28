@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::FdbValues,
-    options::{MutationType, StreamingMode, TransactionOption},
+    options::{ConflictRangeType, MutationType, StreamingMode, TransactionOption},
     tuple::unpack,
-    Database, RangeOption, Transaction,
+    Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
 use hyper::{Body, Request, Response};
@@ -803,11 +803,21 @@ impl Server {
         } else {
             None
         };
+        let uri_path = req.uri().path().to_string();
         match self.do_serve_data_plane_stage2(ns_id, req).await {
             Ok(res) => Ok(res),
             Err(e) => {
                 let ns_id_hex = ns_id.map(|x| hex::encode(&x)).unwrap_or_default();
-                tracing::warn!(ns = ns_id_hex, error = %e, "stage 2 failure");
+                if e.chain().any(|x| {
+                    x.downcast_ref::<FdbError>()
+                        .map(|x| x.code() == 1020)
+                        .unwrap_or_default()
+                }) {
+                    // conflict
+                    tracing::debug!(ns = ns_id_hex, endpoint = uri_path, error = %e, "fdb conflict");
+                } else {
+                    tracing::warn!(ns = ns_id_hex, error = %e, "stage 2 failure");
+                }
                 Ok(Response::builder().status(500).body(Body::empty())?)
             }
         }
@@ -1518,6 +1528,7 @@ impl Server {
         ns_id: [u8; 10],
         page_index: u32,
         page_version_hex: Option<&str>,
+        snapshot: bool,
     ) -> Result<Option<(String, [u8; 32])>> {
         let page_version = match page_version_hex {
             Some(x) => decode_version(x)?,
@@ -1550,6 +1561,17 @@ impl Server {
         } else {
             let page = page_vec.into_iter().next().unwrap();
             let key = page.key();
+            if !snapshot {
+                txn.add_conflict_range(
+                    key,
+                    &key.iter()
+                        .copied()
+                        .chain(std::iter::once(0u8))
+                        .collect::<Vec<u8>>(),
+                    ConflictRangeType::Read,
+                )?;
+            }
+
             let version = hex::encode(&key[key.len() - 10..]);
             let hash = page.value();
             let hash = <[u8; 32]>::try_from(hash).with_context(|| "invalid content hash")?;
@@ -1565,7 +1587,7 @@ impl Server {
         page_version_hex: &str,
     ) -> Result<Option<Page>> {
         let (version, hash) = match self
-            .read_page_hash(txn, ns_id, page_index, Some(page_version_hex))
+            .read_page_hash(txn, ns_id, page_index, Some(page_version_hex), true)
             .await?
         {
             Some(x) => x,
@@ -1588,7 +1610,7 @@ impl Server {
         let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
 
         let (_, delta_base_hash) = match self
-            .read_page_hash(&txn, ns_id, base_page_index, Some(version_hex.as_str()))
+            .read_page_hash(&txn, ns_id, base_page_index, Some(version_hex.as_str()), false)
             .await?
         {
             Some(x) => x,

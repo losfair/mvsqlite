@@ -142,7 +142,9 @@ impl Server {
             // Idempotency & non-plcc conflict check
             {
                 let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
-                let actual_lwv_value = txn.get(&last_write_version_key, false).await?;
+
+                // If we rely on PLCC to check conflicts, it is not necessary to add LWV to conflict set.
+                let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns).await?;
 
                 if let Some(t) = actual_lwv_value {
                     if t.len() == 16 + 10 {
@@ -180,7 +182,7 @@ impl Server {
             if plcc_enable_ns {
                 let mut fut_list = FuturesOrdered::new();
                 for &page in &ns.read_set {
-                    let read_page_hash_fut = self.read_page_hash(&txn, ns.ns_id, page, None);
+                    let read_page_hash_fut = self.read_page_hash(&txn, ns.ns_id, page, None, false);
                     fut_list.push(async move { (page, read_page_hash_fut.await) });
                 }
 
