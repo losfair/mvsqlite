@@ -854,7 +854,7 @@ impl Server {
         let key = self.construct_content_key(ns_id, hash);
         let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
         if let Some(cached) = cached {
-            return Ok(Some(cached));
+            return Ok(Some(cached.data));
         }
 
         let undecoded = txn.get(&key, true).await?;
@@ -863,11 +863,18 @@ impl Server {
             None => return Ok(None),
         };
 
+        let delta_base: Option<[u8; 32]> =
+            if undecoded.len() >= 33 && undecoded[0] == PAGE_ENCODING_DELTA {
+                Some(undecoded[1..33].try_into().unwrap())
+            } else {
+                None
+            };
+
         let decoded = self
             .decode_page_for_read_caching(txn, ns_id, undecoded)
             .await?;
         if let Some(cache) = &self.content_cache {
-            cache.set(hash, &decoded);
+            cache.set(hash, &decoded, delta_base);
         }
 
         Ok(Some(decoded))
@@ -882,7 +889,7 @@ impl Server {
         let key = self.construct_content_key(ns_id, hash);
         let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
         if let Some(cached) = cached {
-            return Ok(Some(cached));
+            return Ok(Some(cached.data));
         }
 
         let undecoded = txn.get(&key, true).await?;
@@ -893,7 +900,7 @@ impl Server {
 
         let decoded = self.decode_page_no_delta(undecoded).await?;
         if let Some(cache) = &self.content_cache {
-            cache.set(hash, &decoded);
+            cache.set(hash, &decoded, None);
         }
 
         Ok(Some(decoded))

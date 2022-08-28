@@ -13,7 +13,14 @@ pub struct ContentCache {
     threshold_size: u64,
 }
 
-const ENTRY_TYPE_V0: u8 = 0;
+#[derive(Clone)]
+pub struct ContentCacheEntry {
+    pub delta_base: Option<[u8; 32]>,
+    pub data: Bytes,
+}
+
+const ENTRY_TYPE_BASE: u8 = 0;
+const ENTRY_TYPE_DELTA: u8 = 1;
 
 impl ContentCache {
     pub fn new(path: &Path, threshold_size: u64) -> Result<Self> {
@@ -91,22 +98,35 @@ impl ContentCache {
         txn.commit().unwrap();
     }
 
-    pub fn set(&self, hash: [u8; 32], data: &[u8]) {
+    pub fn set(&self, hash: [u8; 32], data: &[u8], delta_base: Option<[u8; 32]>) {
         let mut txn = self.env.begin_rw_txn().unwrap();
         let db = self.primary_db(&txn);
 
-        let buf = match txn.reserve(db, &hash, 1 + data.len(), WriteFlags::NO_OVERWRITE) {
+        let len = if let Some(_) = delta_base {
+            1 + 32 + data.len()
+        } else {
+            1 + data.len()
+        };
+
+        let buf = match txn.reserve(db, &hash, len, WriteFlags::NO_OVERWRITE) {
             Ok(buf) => buf,
             Err(lmdb::Error::KeyExist) => return,
             Err(e) => panic!("lmdb txn set error: {}", e),
         };
-        buf[0] = ENTRY_TYPE_V0;
-        buf[1..].copy_from_slice(data);
+
+        if let Some(delta_base) = delta_base {
+            buf[0] = ENTRY_TYPE_DELTA;
+            buf[1..33].copy_from_slice(&delta_base);
+            buf[33..].copy_from_slice(data);
+        } else {
+            buf[0] = ENTRY_TYPE_BASE;
+            buf[1..].copy_from_slice(data);
+        }
 
         self.check_size_and_commit(txn);
     }
 
-    pub fn get(&self, hash: [u8; 32]) -> Option<Bytes> {
+    pub fn get(&self, hash: [u8; 32]) -> Option<ContentCacheEntry> {
         let txn = self.env.begin_ro_txn().unwrap();
         let db = self.primary_db(&txn);
         let buf = match txn.get(db, &hash) {
@@ -128,9 +148,17 @@ impl ContentCache {
             }
             Err(e) => panic!("lmdb txn get error: {}", e),
         };
-        if buf[0] != ENTRY_TYPE_V0 {
-            return None;
+
+        match buf[0] {
+            ENTRY_TYPE_BASE => Some(ContentCacheEntry {
+                delta_base: None,
+                data: buf.slice(1..),
+            }),
+            ENTRY_TYPE_DELTA => Some(ContentCacheEntry {
+                delta_base: Some(buf[1..33].try_into().unwrap()),
+                data: buf.slice(33..),
+            }),
+            _ => None,
         }
-        Some(buf.slice(1..))
     }
 }
