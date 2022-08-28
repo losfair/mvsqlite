@@ -492,17 +492,33 @@ jobs:
           chmod +x ./go-ycsb/go-ycsb
           RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
           sleep 1
+
           # Preload mode
-          curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          curl -f http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
           PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" \
             MVSQLITE_PAGE_CACHE_SIZE=50000 \
             MVSQLITE_DATA_PLANE=http://localhost:7000 \
             RUST_LOG=off \
             ./res/ci/ycsb.sh ycsb "${{ matrix.workload }}"
-          curl http://localhost:7001/api/delete_namespace -d '{"key":"ycsb"}'
+          curl -f http://localhost:7001/api/delete_namespace -d '{"key":"ycsb"}'
+
+          # Preload mode with content cache
+          killall mvstore
+          sleep 1
+          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
+            --content-cache /tmp/mvstore-content-cache --content-cache-size 50000000 &
+          sleep 1
+          curl -f http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" \
+            MVSQLITE_PAGE_CACHE_SIZE=50000 \
+            MVSQLITE_DATA_PLANE=http://localhost:7000 \
+            RUST_LOG=off \
+            ./res/ci/ycsb.sh ycsb "${{ matrix.workload }}"
+          curl -f http://localhost:7001/api/delete_namespace -d '{"key":"ycsb"}'
           exit 0
+          
           # FUSE mode is broken
-          curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          curl -f http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
           mkdir fusemnt
           chmod +x ./build/mvsqlite-fuse
           sh -c 'RUST_LOG=error ./build/mvsqlite-fuse --data-plane http://localhost:7000 \
