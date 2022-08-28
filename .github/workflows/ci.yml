@@ -371,6 +371,78 @@ jobs:
             --namespaces "db=test" &
           sleep 1
           ./speedtest1 ./fusemnt/db
+  build-ycsb:
+    name: Build ycsb
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Build
+      run: |
+        git clone https://github.com/losfair/go-ycsb
+        cd go-ycsb
+        git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
+        make
+    - name: Push binaries
+      uses: actions/upload-artifact@v3
+      with:
+        name: go-ycsb
+        path: ./go-ycsb/bin/go-ycsb
+  ycsb:
+    name: ycsb
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    - build-ycsb
+    strategy:
+      matrix:
+        workload: [workloada, workloadb, workloadc]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-server_7.1.17-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+          sudo apt update && sudo apt install -y libfuse3-3
+      - name: Fetch binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: build
+          path: ./build
+      - name: Fetch go-ycsb
+        uses: actions/download-artifact@v2
+        with:
+          name: go-ycsb
+          path: ./go-ycsb
+      - name: Run it
+        run: |
+          set -e
+          chmod +x ./build/mvstore
+          chmod +x ./go-ycsb/go-ycsb
+          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          # Preload mode
+          curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" \
+            MVSQLITE_PAGE_CACHE_SIZE=50000 \
+            MVSQLITE_DATA_PLANE=http://localhost:7000 \
+            RUST_LOG=off \
+            ./res/ci/ycsb.sh ycsb "${{ matrix.workload }}"
+          curl http://localhost:7001/api/delete_namespace -d '{"key":"ycsb"}'
+          exit 0
+          # FUSE mode is broken
+          curl http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
+          mkdir fusemnt
+          chmod +x ./build/mvsqlite-fuse
+          sh -c 'RUST_LOG=error ./build/mvsqlite-fuse --data-plane http://localhost:7000 \
+            --mountpoint ./fusemnt \
+            --namespaces "ycsb=ycsb" 2>&1 | grep -v "500 Internal Server Error"' &
+          sleep 1
+          ./res/ci/ycsb.sh "$PWD/fusemnt/ycsb" "${{ matrix.workload }}"
   release:
     name: Release
     needs:
