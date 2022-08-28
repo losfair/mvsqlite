@@ -188,8 +188,12 @@ impl Connection {
             return Ok(());
         }
 
-        // Ensure we see the latest data
-        self.force_flush_write_buffer().await;
+        if let Some(x) = &self.write_buffer.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("write buffer hit");
+            return Ok(());
+        }
+
         let txn = self.txn.as_mut().unwrap();
 
         tracing::debug!(
