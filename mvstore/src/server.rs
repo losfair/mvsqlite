@@ -1598,37 +1598,63 @@ impl Server {
             Some(x) => x,
             None => return Ok(None),
         };
-        let (undecoded_base, delta_base_hash) = {
-            let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-            let base = match txn.get(&base_page_key, false).await? {
-                Some(x) => x,
-                None => return Ok(None),
-            };
-            if base.len() == 0 {
-                return Ok(None);
-            }
-            if base[0] == PAGE_ENCODING_DELTA {
-                // Flatten the link
-                if base.len() < 33 {
-                    return Ok(None);
+        let (base_page, delta_base_hash) = {
+            let base_info: Result<Bytes, [u8; 32]>;
+            if let Some(cached_base) = self
+                .content_cache
+                .as_ref()
+                .and_then(|x| x.get(delta_base_hash))
+            {
+                if let Some(h) = cached_base.delta_base {
+                    base_info = Err(h);
+                } else {
+                    base_info = Ok(cached_base.data);
                 }
-                let flattened_base_hash = <[u8; 32]>::try_from(&base[1..33]).unwrap();
-                let flattened_base_key = self.construct_content_key(ns_id, flattened_base_hash);
-                let flattened_base = match txn.get(&flattened_base_key, false).await? {
+            } else {
+                let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
+                let base = match txn.get(&base_page_key, true).await? {
                     Some(x) => x,
                     None => return Ok(None),
                 };
-                tracing::debug!(
-                    from = hex::encode(&delta_base_hash),
-                    to = hex::encode(&flattened_base_hash),
-                    "flattened delta page"
-                );
-                (flattened_base, flattened_base_hash)
-            } else {
-                (base, delta_base_hash)
+                if base.len() == 0 {
+                    return Ok(None);
+                }
+                if base[0] == PAGE_ENCODING_DELTA {
+                    // Flatten the link
+                    if base.len() < 33 {
+                        return Ok(None);
+                    }
+                    base_info = Err(base[1..33].try_into().unwrap());
+                } else {
+                    base_info = Ok(self.decode_page_no_delta(base).await?);
+                }
+            }
+
+            match base_info {
+                Ok(data) => (data, delta_base_hash),
+                Err(indirect_base_hash) => {
+                    if let Some(cached_base) = self
+                        .content_cache
+                        .as_ref()
+                        .and_then(|x| x.get(indirect_base_hash))
+                    {
+                        if cached_base.delta_base.is_some() {
+                            anyhow::bail!("double indirection");
+                        }
+                        (cached_base.data, indirect_base_hash)
+                    } else {
+                        let flattened_base_key =
+                            self.construct_content_key(ns_id, indirect_base_hash);
+                        let flattened_base = match txn.get(&flattened_base_key, true).await? {
+                            Some(x) => x,
+                            None => return Ok(None),
+                        };
+                        (Bytes::copy_from_slice(&flattened_base), indirect_base_hash)
+                    }
+                }
             }
         };
-        let base_page = self.decode_page_no_delta(undecoded_base).await?;
+
         if base_page.len() != this_page.len() || this_page.is_empty() {
             return Ok(None);
         }
