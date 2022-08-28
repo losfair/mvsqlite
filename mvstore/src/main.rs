@@ -1,4 +1,5 @@
 mod commit;
+mod content_cache;
 mod fixed_key_vec;
 mod gc;
 mod keys;
@@ -87,6 +88,14 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
 
+    /// Path to the content cache. A directory for LMDB will be created with this path.
+    #[structopt(long, env = "MVSTORE_CONTENT_CACHE")]
+    content_cache: Option<String>,
+
+    /// Content cache threshold size ("half size") in bytes.
+    #[structopt(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "100000000")]
+    content_cache_size: u64,
+
     /// Whether this instance is read-only. This enables replica-read from FDB DR replica.
     #[structopt(long)]
     read_only: bool,
@@ -134,6 +143,8 @@ async fn async_main(opt: Opt) -> Result<()> {
         raw_data_prefix: opt.raw_data_prefix.clone(),
         metadata_prefix: opt.metadata_prefix.clone(),
         read_only: opt.read_only,
+        content_cache: opt.content_cache.clone(),
+        content_cache_size: opt.content_cache_size,
     })
     .with_context(|| "failed to initialize server")?;
 

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    path::Path,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -28,6 +29,7 @@ use tokio_util::{
 
 use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
+    content_cache::ContentCache,
     lock::DistributedLock,
 };
 
@@ -53,7 +55,7 @@ pub struct Server {
     nskey_cache: Cache<String, [u8; 10]>,
     read_version_cache: Cache<[u8; 10], i64>,
     pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
-    content_cache: Cache<([u8; 10], [u8; 32]), Bytes>,
+    content_cache: Option<ContentCache>,
 
     pub read_only: bool,
 }
@@ -63,6 +65,8 @@ pub struct ServerConfig {
     pub raw_data_prefix: String,
     pub metadata_prefix: String,
     pub read_only: bool,
+    pub content_cache: Option<String>,
+    pub content_cache_size: u64,
 }
 
 #[derive(Deserialize)]
@@ -219,10 +223,19 @@ impl Server {
             read_version_and_nsid_to_lwv_cache: Cache::builder()
                 .time_to_idle(Duration::from_secs(2))
                 .build(),
-            content_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(60))
-                .max_capacity(5000)
-                .build(),
+            content_cache: if let Some(path) = &config.content_cache {
+                tracing::info!(
+                    path,
+                    size = config.content_cache_size,
+                    "content cache enabled"
+                );
+                Some(
+                    ContentCache::new(Path::new(path), config.content_cache_size)
+                        .with_context(|| "failed to initialize content cache")?,
+                )
+            } else {
+                None
+            },
             read_only: config.read_only,
         }))
     }
@@ -839,31 +852,25 @@ impl Server {
         hash: [u8; 32],
     ) -> Result<Option<Bytes>> {
         let key = self.construct_content_key(ns_id, hash);
-        let res = self
-            .content_cache
-            .try_get_with((ns_id, hash), async {
-                let kv = txn.get(&key, true).await;
-
-                match kv {
-                    Ok(Some(x)) => {
-                        let page = self.decode_page_for_read_caching(txn, ns_id, x).await;
-                        match page {
-                            Ok(x) => Ok(x),
-                            Err(e) => Err(GetError::Other(e)),
-                        }
-                    }
-                    Ok(None) => Err(GetError::NotFound),
-                    Err(e) => Err(GetError::Other(e.into())),
-                }
-            })
-            .await;
-        match res {
-            Ok(x) => Ok(Some(x)),
-            Err(e) => match &*e {
-                GetError::NotFound => Ok(None),
-                GetError::Other(e) => Err(anyhow::anyhow!("content read failed: {}", e)),
-            },
+        let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
+        if let Some(cached) = cached {
+            return Ok(Some(cached));
         }
+
+        let undecoded = txn.get(&key, true).await?;
+        let undecoded = match undecoded {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+
+        let decoded = self
+            .decode_page_for_read_caching(txn, ns_id, undecoded)
+            .await?;
+        if let Some(cache) = &self.content_cache {
+            cache.set(hash, &decoded);
+        }
+
+        Ok(Some(decoded))
     }
 
     async fn get_page_content_decoded_no_delta_snapshot(
@@ -873,31 +880,23 @@ impl Server {
         hash: [u8; 32],
     ) -> Result<Option<Bytes>> {
         let key = self.construct_content_key(ns_id, hash);
-        let res = self
-            .content_cache
-            .try_get_with((ns_id, hash), async {
-                let kv = txn.get(&key, true).await;
-
-                match kv {
-                    Ok(Some(x)) => {
-                        let page = self.decode_page_no_delta(x).await;
-                        match page {
-                            Ok(x) => Ok(x),
-                            Err(e) => Err(GetError::Other(e)),
-                        }
-                    }
-                    Ok(None) => Err(GetError::NotFound),
-                    Err(e) => Err(GetError::Other(e.into())),
-                }
-            })
-            .await;
-        match res {
-            Ok(x) => Ok(Some(x)),
-            Err(e) => match &*e {
-                GetError::NotFound => Ok(None),
-                GetError::Other(e) => Err(anyhow::anyhow!("content read failed: {}", e)),
-            },
+        let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
+        if let Some(cached) = cached {
+            return Ok(Some(cached));
         }
+
+        let undecoded = txn.get(&key, true).await?;
+        let undecoded = match undecoded {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+
+        let decoded = self.decode_page_no_delta(undecoded).await?;
+        if let Some(cache) = &self.content_cache {
+            cache.set(hash, &decoded);
+        }
+
+        Ok(Some(decoded))
     }
 
     async fn do_serve_data_plane_stage2(

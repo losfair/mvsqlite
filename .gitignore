@@ -2,3 +2,4 @@ target/
 *.so
 *.o
 *.a
+/work/
