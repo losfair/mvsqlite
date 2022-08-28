@@ -1201,6 +1201,9 @@ impl Server {
                             break;
                         }
                         let hash = blake3::hash(write_req.data);
+                        if let Some(cache) = &me.content_cache {
+                            cache.set(*hash.as_bytes(), write_req.data);
+                        }
                         let content_key = me.construct_content_key(ns_id, *hash.as_bytes());
 
                         let mut early_completion = false;
@@ -1591,9 +1594,9 @@ impl Server {
             Some(x) => x,
             None => return Ok(None),
         };
-        let (undecoded_base, delta_base_hash) = {
+        let (base_page, delta_base_hash) = {
             let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-            let base = match txn.get(&base_page_key, false).await? {
+            let base = match txn.get(&base_page_key, true).await? {
                 Some(x) => x,
                 None => return Ok(None),
             };
@@ -1606,8 +1609,10 @@ impl Server {
                     return Ok(None);
                 }
                 let flattened_base_hash = <[u8; 32]>::try_from(&base[1..33]).unwrap();
-                let flattened_base_key = self.construct_content_key(ns_id, flattened_base_hash);
-                let flattened_base = match txn.get(&flattened_base_key, false).await? {
+                let flattened_base = match self
+                    .get_page_content_decoded_no_delta_snapshot(txn, ns_id, flattened_base_hash)
+                    .await?
+                {
                     Some(x) => x,
                     None => return Ok(None),
                 };
@@ -1618,10 +1623,9 @@ impl Server {
                 );
                 (flattened_base, flattened_base_hash)
             } else {
-                (base, delta_base_hash)
+                (self.decode_page_no_delta(base).await?, delta_base_hash)
             }
         };
-        let base_page = self.decode_page_no_delta(undecoded_base).await?;
         if base_page.len() != this_page.len() || this_page.is_empty() {
             return Ok(None);
         }
