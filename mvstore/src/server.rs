@@ -29,7 +29,7 @@ use tokio_util::{
 
 use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
-    content_cache::ContentCache,
+    content_cache::{ContentCache, ContentCacheEntry},
     lock::DistributedLock,
 };
 
@@ -850,11 +850,11 @@ impl Server {
         txn: &Transaction,
         ns_id: [u8; 10],
         hash: [u8; 32],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<ContentCacheEntry>> {
         let key = self.construct_content_key(ns_id, hash);
         let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
         if let Some(cached) = cached {
-            return Ok(Some(cached.data));
+            return Ok(Some(cached));
         }
 
         let undecoded = txn.get(&key, true).await?;
@@ -877,7 +877,10 @@ impl Server {
             cache.set(hash, &decoded, delta_base);
         }
 
-        Ok(Some(decoded))
+        Ok(Some(ContentCacheEntry {
+            data: decoded,
+            delta_base,
+        }))
     }
 
     async fn get_page_content_decoded_no_delta_snapshot(
@@ -885,11 +888,11 @@ impl Server {
         txn: &Transaction,
         ns_id: [u8; 10],
         hash: [u8; 32],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<ContentCacheEntry>> {
         let key = self.construct_content_key(ns_id, hash);
         let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
         if let Some(cached) = cached {
-            return Ok(Some(cached.data));
+            return Ok(Some(cached));
         }
 
         let undecoded = txn.get(&key, true).await?;
@@ -903,7 +906,10 @@ impl Server {
             cache.set(hash, &decoded, None);
         }
 
-        Ok(Some(decoded))
+        Ok(Some(ContentCacheEntry {
+            data: decoded,
+            delta_base: None,
+        }))
     }
 
     async fn do_serve_data_plane_stage2(
@@ -1061,7 +1067,7 @@ impl Server {
                                     match content {
                                         Ok(Some(x)) => Some(Page {
                                             version: read_req.version.to_string(),
-                                            data: x,
+                                            data: x.data,
                                         }),
                                         Ok(None) => None,
                                         Err(e) => {
@@ -1579,7 +1585,10 @@ impl Server {
             .get_page_content_decoded_snapshot(txn, ns_id, hash)
             .await?
             .with_context(|| "cannot find content for the provided hash")?;
-        Ok(Some(Page { version, data }))
+        Ok(Some(Page {
+            version,
+            data: data.data,
+        }))
     }
 
     async fn delta_encode(
@@ -1599,59 +1608,24 @@ impl Server {
             None => return Ok(None),
         };
         let (base_page, delta_base_hash) = {
-            let base_info: Result<Bytes, [u8; 32]>;
-            if let Some(cached_base) = self
-                .content_cache
-                .as_ref()
-                .and_then(|x| x.get(delta_base_hash))
+            if let Some(x) = self
+                .get_page_content_decoded_snapshot(txn, ns_id, delta_base_hash)
+                .await?
             {
-                if let Some(h) = cached_base.delta_base {
-                    base_info = Err(h);
-                } else {
-                    base_info = Ok(cached_base.data);
-                }
-            } else {
-                let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-                let base = match txn.get(&base_page_key, true).await? {
-                    Some(x) => x,
-                    None => return Ok(None),
-                };
-                if base.len() == 0 {
-                    return Ok(None);
-                }
-                if base[0] == PAGE_ENCODING_DELTA {
-                    // Flatten the link
-                    if base.len() < 33 {
+                if let Some(flattened_base_hash) = x.delta_base {
+                    if let Some(base) = self
+                        .get_page_content_decoded_no_delta_snapshot(txn, ns_id, flattened_base_hash)
+                        .await?
+                    {
+                        (base.data, flattened_base_hash)
+                    } else {
                         return Ok(None);
                     }
-                    base_info = Err(base[1..33].try_into().unwrap());
                 } else {
-                    base_info = Ok(self.decode_page_no_delta(base).await?);
+                    (x.data, delta_base_hash)
                 }
-            }
-
-            match base_info {
-                Ok(data) => (data, delta_base_hash),
-                Err(indirect_base_hash) => {
-                    if let Some(cached_base) = self
-                        .content_cache
-                        .as_ref()
-                        .and_then(|x| x.get(indirect_base_hash))
-                    {
-                        if cached_base.delta_base.is_some() {
-                            anyhow::bail!("double indirection");
-                        }
-                        (cached_base.data, indirect_base_hash)
-                    } else {
-                        let flattened_base_key =
-                            self.construct_content_key(ns_id, indirect_base_hash);
-                        let flattened_base = match txn.get(&flattened_base_key, true).await? {
-                            Some(x) => x,
-                            None => return Ok(None),
-                        };
-                        (Bytes::copy_from_slice(&flattened_base), indirect_base_hash)
-                    }
-                }
+            } else {
+                return Ok(None);
             }
         };
 
@@ -1749,12 +1723,12 @@ impl Server {
                 let mut delta_data = block_in_place(|| {
                     zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)
                 })?;
-                if delta_data.len() != base_page.len() {
+                if delta_data.len() != base_page.data.len() {
                     anyhow::bail!("delta and base have different sizes");
                 }
 
                 for (i, b) in delta_data.iter_mut().enumerate() {
-                    *b ^= base_page[i];
+                    *b ^= base_page.data[i];
                 }
 
                 Ok(Bytes::from(delta_data))
