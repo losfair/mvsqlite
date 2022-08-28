@@ -44,3 +44,4 @@ moka = { version = "0.9.3", features = ["future"] }
 bloom = "0.3.2"
 constant_time_eq = "0.2.4"
 heapless = "0.7"
+lmdb-rkv = "0.14.0"
