@@ -1610,7 +1610,13 @@ impl Server {
         let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
 
         let (_, delta_base_hash) = match self
-            .read_page_hash(&txn, ns_id, base_page_index, Some(version_hex.as_str()), false)
+            .read_page_hash(
+                &txn,
+                ns_id,
+                base_page_index,
+                Some(version_hex.as_str()),
+                false,
+            )
             .await?
         {
             Some(x) => x,
