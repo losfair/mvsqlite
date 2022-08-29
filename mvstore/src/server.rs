@@ -1564,7 +1564,7 @@ impl Server {
             if !snapshot {
                 txn.add_conflict_range(
                     key,
-                    &key.iter()
+                    &scan_end.iter()
                         .copied()
                         .chain(std::iter::once(0u8))
                         .collect::<Vec<u8>>(),
