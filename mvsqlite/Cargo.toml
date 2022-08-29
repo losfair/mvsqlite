@@ -1,6 +1,6 @@
 [package]
 name = "mvsqlite"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
