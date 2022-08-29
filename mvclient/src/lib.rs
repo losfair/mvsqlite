@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use backoff::RandomizedExponentialBackoff;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     RequestBuilder, StatusCode, Url,
@@ -35,12 +35,19 @@ pub struct MultiVersionClient {
 #[derive(Clone, Debug)]
 pub struct MultiVersionClientConfig {
     /// Data plane URL.
-    pub data_plane: Url,
+    pub data_plane: Vec<Url>,
 
     /// Namespace key.
     pub ns_key: String,
 
     pub ns_key_hashproof: Option<String>,
+}
+
+impl MultiVersionClientConfig {
+    fn random_data_plane(&self) -> &Url {
+        let index = rand::thread_rng().gen_range(0..self.data_plane.len());
+        &self.data_plane[index]
+    }
 }
 
 #[derive(Deserialize)]
@@ -148,7 +155,7 @@ impl MultiVersionClient {
         self: &Arc<Self>,
         from_version: Option<&str>,
     ) -> Result<(Transaction, TransactionInfo)> {
-        let mut url = self.config.data_plane.clone();
+        let mut url = self.config.random_data_plane().clone();
         url.set_path("/stat");
 
         if let Some(from_version) = from_version {
@@ -213,7 +220,7 @@ impl MultiVersionClient {
         }
 
         let start_time = Instant::now();
-        let mut url = self.config.data_plane.clone();
+        let mut url = self.config.random_data_plane().clone();
         url.set_path("/batch/commit");
         let mut raw_request: Vec<u8> = Vec::new();
 
@@ -367,7 +374,7 @@ impl Transaction {
 
         let mut raw_request: Vec<u8> = Vec::new();
 
-        let mut url = self.c.config.data_plane.clone();
+        let mut url = self.c.config.random_data_plane().clone();
         url.set_path("/batch/read");
 
         for &page_index in page_id_list {
@@ -435,7 +442,7 @@ impl Transaction {
             return;
         }
 
-        let mut url = c.config.data_plane.clone();
+        let mut url = c.config.random_data_plane().clone();
         url.set_path("/batch/write");
 
         let mut boff = RandomizedExponentialBackoff::default();

@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use moka::sync::Cache;
 use std::{
     collections::{HashMap, HashSet},
@@ -62,7 +63,12 @@ impl MultiVersionVfs {
             MultiVersionClientConfig {
                 data_plane: self
                     .data_plane
-                    .parse()
+                    .split(",")
+                    .map(|s| {
+                        s.parse()
+                            .with_context(|| format!("failed to parse data plane address: {}", s))
+                    })
+                    .collect::<Result<Vec<_>>>()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                 ns_key: ns_key.to_string(),
                 ns_key_hashproof,

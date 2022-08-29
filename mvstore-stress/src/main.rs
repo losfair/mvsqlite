@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
 
     let client = MultiVersionClient::new(
         MultiVersionClientConfig {
-            data_plane: opt.data_plane.parse()?,
+            data_plane: vec![opt.data_plane.parse()?],
             ns_key: opt.ns_key.clone(),
             ns_key_hashproof: None,
         },
