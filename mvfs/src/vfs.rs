@@ -87,7 +87,8 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            leaf_page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            high_priority_page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -110,7 +111,8 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    page_cache: Cache<u32, Arc<[u8]>>,
+    high_priority_page_cache: Cache<u32, Arc<[u8]>>,
+    leaf_page_cache: Cache<u32, Arc<[u8]>>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -182,7 +184,11 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.history.record(page_offset);
 
-        if let Some(x) = &self.page_cache.get(&page_offset) {
+        if let Some(x) = &self
+            .leaf_page_cache
+            .get(&page_offset)
+            .or_else(|| self.high_priority_page_cache.get(&page_offset))
+        {
             buf.copy_from_slice(x);
             tracing::trace!("page cache hit");
             return Ok(());
@@ -218,7 +224,10 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains_key(x))
+            .filter(|x| {
+                !self.leaf_page_cache.contains_key(x)
+                    && !self.high_priority_page_cache.contains_key(x)
+            })
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -252,15 +261,25 @@ impl Connection {
             buf.copy_from_slice(&page);
         }
 
-        self.page_cache.insert(page_offset, Arc::from(&*buf));
+        self.insert_to_page_cache(page_offset, Arc::from(&*buf));
 
         for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
             if *their_index != 0 && !maybe_other_page.is_empty() {
-                self.page_cache
-                    .insert(*their_index, Arc::from(&maybe_other_page[..]));
+                self.insert_to_page_cache(*their_index, Arc::from(&maybe_other_page[..]));
             }
         }
         Ok(())
+    }
+
+    fn insert_to_page_cache(&self, page_index: u32, buf: Arc<[u8]>) {
+        // Likely to be a interior b-tree page
+        if buf[0] == 0x02 || buf[0] == 0x05 {
+            self.high_priority_page_cache.insert(page_index, buf);
+            self.leaf_page_cache.invalidate(&page_index);
+        } else {
+            self.leaf_page_cache.insert(page_index, Arc::clone(&buf));
+            self.high_priority_page_cache.invalidate(&page_index);
+        }
     }
 
     pub async fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
@@ -353,43 +372,49 @@ impl Connection {
         self.history.prev_index = 0;
 
         let page_offset = offset as usize / self.sector_size;
-        let txn = self
-            .txn
-            .as_mut()
-            .expect("Cannot write to a database without a transaction");
 
-        if offset == 0 {
-            // validate first page
-            let page_size = u16::from_be_bytes(<[u8; 2]>::try_from(&buf[16..18]).unwrap());
-            if page_size as usize != self.sector_size {
-                panic!("attempting to change page size");
+        {
+            let txn = self
+                .txn
+                .as_mut()
+                .expect("Cannot write to a database without a transaction");
+
+            if offset == 0 {
+                // validate first page
+                let page_size = u16::from_be_bytes(<[u8; 2]>::try_from(&buf[16..18]).unwrap());
+                if page_size as usize != self.sector_size {
+                    panic!("attempting to change page size");
+                }
+
+                if buf[18] == 2 || buf[19] == 2 {
+                    panic!("attempting to enable wal mode");
+                }
+
+                buf[24..28].copy_from_slice(&[0u8; 4]);
+                buf[92..96].copy_from_slice(&[0u8; 4]);
             }
 
-            if buf[18] == 2 || buf[19] == 2 {
-                panic!("attempting to enable wal mode");
+            if let Some(x) = self
+                .leaf_page_cache
+                .get(&(page_offset as u32))
+                .or_else(|| self.high_priority_page_cache.get(&(page_offset as u32)))
+            {
+                if &*x == &*buf {
+                    tracing::info!(page = page_offset, "identity write ignored");
+                    return Ok(());
+                }
             }
-
-            buf[24..28].copy_from_slice(&[0u8; 4]);
-            buf[92..96].copy_from_slice(&[0u8; 4]);
+            tracing::trace!(
+                page_offset = page_offset,
+                txn_version = txn.version(),
+                "write_all_at"
+            );
         }
 
-        if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
-            if &*x == &*buf {
-                tracing::info!(page = page_offset, "identity write ignored");
-                return Ok(());
-            }
-        }
-
-        self.page_cache
-            .insert(page_offset as u32, Arc::clone(&buf_arc));
+        self.insert_to_page_cache(page_offset as u32, Arc::clone(&buf_arc));
         self.write_buffer
             .insert(page_offset as u32, Arc::clone(&buf_arc));
 
-        tracing::trace!(
-            page_offset = page_offset,
-            txn_version = txn.version(),
-            "write_all_at"
-        );
         self.maybe_flush_write_buffer().await;
 
         Ok(())
@@ -437,7 +462,8 @@ impl Connection {
                 match interval {
                     Some(interval) => {
                         for index in &interval {
-                            self.page_cache.invalidate(index);
+                            self.leaf_page_cache.invalidate(index);
+                            self.high_priority_page_cache.invalidate(index);
                         }
                         tracing::info!(
                             count = interval.len(),
@@ -445,7 +471,8 @@ impl Connection {
                         );
                     }
                     None => {
-                        self.page_cache.invalidate_all();
+                        self.leaf_page_cache.invalidate_all();
+                        self.high_priority_page_cache.invalidate_all();
                         if self.last_known_write_version.is_some() {
                             tracing::warn!("non-local change detected, invalidating cache");
                         }
@@ -508,7 +535,8 @@ impl Connection {
                         // Invalidate page cache
                         if let Some(changelog) = changelog {
                             for &index in changelog {
-                                self.page_cache.invalidate(&index);
+                                self.leaf_page_cache.invalidate(&index);
+                                self.high_priority_page_cache.invalidate(&index);
                             }
                             tracing::info!(
                                     count = changelog.len(),
@@ -516,7 +544,8 @@ impl Connection {
                                 );
                         } else {
                             // Changelog is not available - do a full flush
-                            self.page_cache.invalidate_all();
+                            self.leaf_page_cache.invalidate_all();
+                            self.high_priority_page_cache.invalidate_all();
                             tracing::warn!(
                                 "non-local concurrent transaction detected, invalidating cache"
                             );
@@ -538,7 +567,8 @@ impl Connection {
                 }
                 CommitOutput::Conflict => {
                     for index in &dirty_pages {
-                        self.page_cache.invalidate(index);
+                        self.leaf_page_cache.invalidate(index);
+                        self.high_priority_page_cache.invalidate(index);
                     }
                     tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                     commit_ok = false;
