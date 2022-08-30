@@ -100,6 +100,10 @@ struct Opt {
     #[structopt(long)]
     read_only: bool,
 
+    /// DR tag to use if this instance is read-only.
+    #[structopt(long, env = "MVSTORE_DR_TAG", default_value = "default")]
+    dr_tag: String,
+
     /// ADVANCED. Configure the GC scan batch size.
     #[structopt(long, env = "MVSTORE_KNOB_GC_SCAN_BATCH_SIZE")]
     knob_gc_scan_batch_size: Option<usize>,
@@ -143,9 +147,11 @@ async fn async_main(opt: Opt) -> Result<()> {
         raw_data_prefix: opt.raw_data_prefix.clone(),
         metadata_prefix: opt.metadata_prefix.clone(),
         read_only: opt.read_only,
+        dr_tag: opt.dr_tag,
         content_cache: opt.content_cache.clone(),
         content_cache_size: opt.content_cache_size,
     })
+    .await
     .with_context(|| "failed to initialize server")?;
 
     if !opt.read_only {

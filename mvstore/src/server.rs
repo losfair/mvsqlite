@@ -3,7 +3,7 @@ use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::FdbValues,
     options::{ConflictRangeType, MutationType, StreamingMode, TransactionOption},
-    tuple::unpack,
+    tuple::{pack, unpack},
     Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
@@ -41,6 +41,7 @@ const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
+const BACKUP_AGENT_PREFIX: &[u8] = b"\xff\x02/db-backup-agent/";
 
 enum GetError {
     NotFound,
@@ -58,6 +59,7 @@ pub struct Server {
     content_cache: Option<ContentCache>,
 
     pub read_only: bool,
+    pub dr_uid: Option<Vec<u8>>,
 }
 
 pub struct ServerConfig {
@@ -65,6 +67,7 @@ pub struct ServerConfig {
     pub raw_data_prefix: String,
     pub metadata_prefix: String,
     pub read_only: bool,
+    pub dr_tag: String,
     pub content_cache: Option<String>,
     pub content_cache_size: u64,
 }
@@ -200,10 +203,36 @@ impl Page {
 }
 
 impl Server {
-    pub fn open(config: ServerConfig) -> Result<Arc<Self>> {
+    pub async fn open(config: ServerConfig) -> Result<Arc<Self>> {
         let db = Database::new(Some(config.cluster.as_str()))
             .with_context(|| "cannot open fdb cluster")?;
         let raw_data_prefix = config.raw_data_prefix.as_bytes().to_vec();
+
+        // Read DR replica UID
+        let dr_uid = if config.read_only {
+            let tuple = pack(&(&b"tagname"[..], config.dr_tag.as_bytes()));
+            let key = BACKUP_AGENT_PREFIX
+                .iter()
+                .chain(&tuple)
+                .copied()
+                .collect::<Vec<_>>();
+            let txn = db.create_trx()?;
+            txn.set_option(TransactionOption::ReadLockAware).unwrap();
+            txn.set_option(TransactionOption::ReadSystemKeys).unwrap();
+            let uid = txn
+                .get(&key, true)
+                .await?
+                .with_context(|| "DR tag not found")?
+                .to_vec();
+            tracing::info!(
+                dr_tag = config.dr_tag,
+                dr_uid = hex::encode(&uid),
+                "dr replica mode enabled"
+            );
+            Some(uid)
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             db,
             raw_data_prefix,
@@ -237,7 +266,28 @@ impl Server {
                 None
             },
             read_only: config.read_only,
+            dr_uid,
         }))
+    }
+
+    async fn read_dr_replica_version(&self, txn: &Transaction) -> Result<i64> {
+        let dr_uid = self
+            .dr_uid
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no dr uid"))?
+            .as_slice();
+        let tuple = pack(&(&b"state"[..], dr_uid, &b"last_begin_version"[..]));
+        let key = BACKUP_AGENT_PREFIX
+            .iter()
+            .chain(&tuple)
+            .copied()
+            .collect::<Vec<_>>();
+        txn.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        let value = txn.get(&key, true).await?;
+        match value {
+            Some(x) if x.len() == 8 => Ok(i64::from_le_bytes(x[..].try_into().unwrap())),
+            _ => anyhow::bail!("bad last begin version"),
+        }
     }
 
     pub async fn serve_admin_api(
@@ -1535,11 +1585,12 @@ impl Server {
             None => [0xffu8; 10],
         };
         if self.read_only && page_version != [0xffu8; 10] {
-            let current_rv = txn.get_read_version().await?;
+            let current_rv = self.read_dr_replica_version(txn).await?;
             let requested_rv = i64::from_be_bytes(page_version[0..8].try_into().unwrap());
             if current_rv < requested_rv {
                 anyhow::bail!("this replica does not have the requested read version");
             }
+            tracing::debug!(current_rv, requested_rv, "read_page_hash replica read");
         }
         let scan_end = self.construct_page_key(ns_id, page_index, page_version);
         let scan_start = self.construct_page_key(ns_id, page_index, [0u8; 10]);
@@ -1564,7 +1615,8 @@ impl Server {
             if !snapshot {
                 txn.add_conflict_range(
                     key,
-                    &scan_end.iter()
+                    &scan_end
+                        .iter()
                         .copied()
                         .chain(std::iter::once(0u8))
                         .collect::<Vec<u8>>(),
