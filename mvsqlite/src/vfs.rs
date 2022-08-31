@@ -25,6 +25,10 @@ impl Vfs for MultiVersionVfs {
             return Ok(Box::new(TempFile::new()));
         }
 
+        // Bindings like Sequelize do not like bare SQLite filenames.
+        // So let's allow a fake "root" path!
+        let db = db.trim_start_matches("/");
+
         let conn = self.inner.open(db)?;
         Ok(Box::new(Connection {
             io: self.io.clone(),
