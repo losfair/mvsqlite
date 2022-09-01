@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use moka::sync::Cache;
+use lru::LruCache;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -93,8 +93,8 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            leaf_page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
-            high_priority_page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            leaf_page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
+            high_priority_page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -117,8 +117,8 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    high_priority_page_cache: Cache<u32, Arc<[u8]>>,
-    leaf_page_cache: Cache<u32, Arc<[u8]>>,
+    high_priority_page_cache: LruCache<u32, Arc<[u8]>>,
+    leaf_page_cache: LruCache<u32, Arc<[u8]>>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -231,8 +231,7 @@ impl Connection {
         let predicted_next = predicted_next
             .iter()
             .filter(|x| {
-                !self.leaf_page_cache.contains_key(x)
-                    && !self.high_priority_page_cache.contains_key(x)
+                !self.leaf_page_cache.contains(*x) && !self.high_priority_page_cache.contains(*x)
             })
             .copied()
             .collect::<Vec<_>>();
@@ -277,14 +276,14 @@ impl Connection {
         Ok(())
     }
 
-    fn insert_to_page_cache(&self, page_index: u32, buf: Arc<[u8]>) {
+    fn insert_to_page_cache(&mut self, page_index: u32, buf: Arc<[u8]>) {
         // Likely to be a interior b-tree page
         if buf[0] == 0x02 || buf[0] == 0x05 {
-            self.high_priority_page_cache.insert(page_index, buf);
-            self.leaf_page_cache.invalidate(&page_index);
+            self.high_priority_page_cache.put(page_index, buf);
+            self.leaf_page_cache.pop_entry(&page_index);
         } else {
-            self.leaf_page_cache.insert(page_index, Arc::clone(&buf));
-            self.high_priority_page_cache.invalidate(&page_index);
+            self.leaf_page_cache.put(page_index, Arc::clone(&buf));
+            self.high_priority_page_cache.pop_entry(&page_index);
         }
     }
 
@@ -405,7 +404,7 @@ impl Connection {
                 .get(&(page_offset as u32))
                 .or_else(|| self.high_priority_page_cache.get(&(page_offset as u32)))
             {
-                if &*x == &*buf {
+                if &**x == &*buf {
                     tracing::info!(page = page_offset, "identity write ignored");
                     return Ok(());
                 }
@@ -468,8 +467,8 @@ impl Connection {
                 match interval {
                     Some(interval) => {
                         for index in &interval {
-                            self.leaf_page_cache.invalidate(index);
-                            self.high_priority_page_cache.invalidate(index);
+                            self.leaf_page_cache.pop_entry(index);
+                            self.high_priority_page_cache.pop_entry(index);
                         }
                         tracing::info!(
                             count = interval.len(),
@@ -477,8 +476,8 @@ impl Connection {
                         );
                     }
                     None => {
-                        self.leaf_page_cache.invalidate_all();
-                        self.high_priority_page_cache.invalidate_all();
+                        self.leaf_page_cache.clear();
+                        self.high_priority_page_cache.clear();
                         if self.last_known_write_version.is_some() {
                             tracing::warn!("non-local change detected, invalidating cache");
                         }
@@ -541,8 +540,8 @@ impl Connection {
                         // Invalidate page cache
                         if let Some(changelog) = changelog {
                             for &index in changelog {
-                                self.leaf_page_cache.invalidate(&index);
-                                self.high_priority_page_cache.invalidate(&index);
+                                self.leaf_page_cache.pop_entry(&index);
+                                self.high_priority_page_cache.pop_entry(&index);
                             }
                             tracing::info!(
                                     count = changelog.len(),
@@ -550,8 +549,8 @@ impl Connection {
                                 );
                         } else {
                             // Changelog is not available - do a full flush
-                            self.leaf_page_cache.invalidate_all();
-                            self.high_priority_page_cache.invalidate_all();
+                            self.leaf_page_cache.clear();
+                            self.high_priority_page_cache.clear();
                             tracing::warn!(
                                 "non-local concurrent transaction detected, invalidating cache"
                             );
@@ -573,8 +572,8 @@ impl Connection {
                 }
                 CommitOutput::Conflict => {
                     for index in &dirty_pages {
-                        self.leaf_page_cache.invalidate(index);
-                        self.high_priority_page_cache.invalidate(index);
+                        self.leaf_page_cache.pop_entry(index);
+                        self.high_priority_page_cache.pop_entry(index);
                     }
                     tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                     commit_ok = false;
