@@ -30,7 +30,7 @@ reqwest = { version = "0.11.11", default-features = false }
 mvfs = { path = "../mvfs" }
 
 [features]
-default = ["loadext", "syscall", "default-tls", "global-init"]
+default = ["loadext", "syscall", "rustls-tls", "global-init"]
 loadext = []
 syscall = []
 default-tls = ["reqwest/default-tls"]
