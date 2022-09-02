@@ -43,6 +43,10 @@ const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 const BACKUP_AGENT_PREFIX: &[u8] = b"\xff\x02/db-backup-agent/";
 
+lazy_static::lazy_static! {
+    static ref LOCK_TOKEN_REGEX: regex::Regex = regex::Regex::new(r"^([0-9a-f]{20})\.(.+)$").unwrap();
+}
+
 enum GetError {
     NotFound,
     Other(anyhow::Error),
@@ -118,6 +122,7 @@ pub struct CommitNamespaceInit<'a> {
     pub metadata: Option<&'a str>,
     pub num_pages: u32,
     pub read_set: Option<HashSet<u32>>,
+    pub lock_token: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1428,6 +1433,7 @@ impl Server {
                         metadata: init.metadata.map(|x| x.to_string()),
                         use_read_set: init.read_set.is_some(),
                         read_set: init.read_set.take().unwrap_or_default(),
+                        lock_token: init.lock_token.map(|x| x.to_string()),
                     };
 
                     for _ in 0..init.num_pages {
@@ -1563,6 +1569,107 @@ impl Server {
                     .status(200)
                     .header("content-type", "application/json")
                     .body(Body::from(body))?;
+            }
+            "/lock/acquire" => {
+                let query: HashMap<String, String> = uri
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+                let lock_id_str = query.get("id").with_context(|| "missing id")?;
+                let lock_id = lock_id_str.as_bytes();
+
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+                let lock_token_key = self.construct_lock_token_key(ns_id);
+                let txn = self.db.create_trx()?;
+                let token = txn.get(&lock_token_key, false).await?;
+
+                // Idempotent?
+                if let Some(token) = token {
+                    if token.len() >= 10 {
+                        if &token[10..] == lock_id {
+                            return Ok(Response::builder().body(Body::from(format!(
+                                "{}.{}",
+                                hex::encode(&token[..10]),
+                                lock_id_str
+                            )))?);
+                        }
+                    }
+                }
+
+                let mut atomic_payload: Vec<u8> = vec![0u8; 10 + lock_id.len() + 4];
+                atomic_payload[10..10 + lock_id.len()].copy_from_slice(lock_id);
+                txn.atomic_op(
+                    &lock_token_key,
+                    &atomic_payload,
+                    MutationType::SetVersionstampedValue,
+                );
+                let versionstamp = txn.get_versionstamp();
+                txn.commit().await.map_err(|e| FdbError::from(e))?;
+                let versionstamp = versionstamp.await?;
+                res = Response::builder().body(Body::from(format!(
+                    "{}.{}",
+                    hex::encode(&versionstamp[..]),
+                    lock_id_str
+                )))?;
+            }
+            "/lock/release" => {
+                let query: HashMap<String, String> = uri
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+                let lock_token = query.get("token").with_context(|| "missing token")?;
+
+                let mut locked_version = [0u8; 10];
+                let captures = match LOCK_TOKEN_REGEX.captures(lock_token) {
+                    Some(x) => x,
+                    None => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Body::from("invalid token"))?);
+                    }
+                };
+
+                // should not fail, validated by regex
+                hex::decode_to_slice(captures.get(1).unwrap().as_str(), &mut locked_version)
+                    .unwrap();
+                let lock_id = captures.get(2).unwrap().as_str();
+
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+                let lock_token_key = self.construct_lock_token_key(ns_id);
+                let txn = self.db.create_trx()?;
+                let token = txn.get(&lock_token_key, false).await?;
+
+                let mut unlocked = false;
+
+                if let Some(token) = token {
+                    if token.len() >= 10 {
+                        if &token[0..10] == &locked_version[..]
+                            && &token[10..] == lock_id.as_bytes()
+                        {
+                            txn.clear(&lock_token_key);
+                            txn.commit().await.map_err(|e| FdbError::from(e))?;
+                            unlocked = true;
+                        }
+                    }
+                }
+
+                res = Response::builder()
+                    .header("x-unlocked", if unlocked { "1" } else { "0" })
+                    .body(Body::from("ok"))?;
             }
             _ => {
                 res = Response::builder().status(404).body("not found".into())?;
@@ -1860,6 +1967,16 @@ impl ContentIndex {
         let mut buf = [0u8; 22];
         buf[0..8].copy_from_slice(&now.as_secs().to_be_bytes());
         buf[18..22].copy_from_slice(&8u32.to_le_bytes()[..]);
+        buf
+    }
+
+    pub fn generate_value_with_version_override(
+        now: Duration,
+        version_override: [u8; 10],
+    ) -> [u8; 18] {
+        let mut buf = [0u8; 18];
+        buf[0..8].copy_from_slice(&now.as_secs().to_be_bytes());
+        buf[8..18].copy_from_slice(&version_override);
         buf
     }
 

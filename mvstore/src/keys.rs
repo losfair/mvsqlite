@@ -56,6 +56,14 @@ impl Server {
         buf
     }
 
+    pub fn construct_lock_token_key(&self, ns_id: [u8; 10]) -> FixedKeyVec {
+        let mut buf = FixedKeyVec::new();
+        buf.extend_from_slice(&self.raw_data_prefix).unwrap();
+        buf.extend_from_slice(&ns_id).unwrap();
+        buf.extend_from_slice(b"*lock-token").unwrap();
+        buf
+    }
+
     pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> FixedKeyVec {
         let mut buf = FixedKeyVec::new();
         buf.extend_from_slice(&self.raw_data_prefix).unwrap();

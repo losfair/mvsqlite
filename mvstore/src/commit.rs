@@ -43,6 +43,7 @@ pub struct CommitNamespaceContext {
     pub read_set: HashSet<u32>,
     pub index_writes: Vec<(u32, [u8; 32])>,
     pub metadata: Option<String>,
+    pub lock_token: Option<String>,
 }
 
 impl Server {
@@ -136,15 +137,47 @@ impl Server {
             }
 
             let mut written_pages: BTreeSet<u32> = BTreeSet::new();
+            let versionstamp_override: Option<[u8; 10]>;
 
             let plcc_enable_ns = plcc_enable && ns.use_read_set;
 
             // Idempotency & non-plcc conflict check
             {
                 let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
+                let lock_token_key = self.construct_lock_token_key(ns.ns_id);
 
                 // If we rely on PLCC to check conflicts, it is not necessary to add LWV to conflict set.
-                let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns).await?;
+                let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns);
+                let actual_lock_token = txn.get(&lock_token_key, false);
+
+                let actual_lwv_value = actual_lwv_value.await?;
+                let actual_lock_token: Option<([u8; 10], Vec<u8>)> = actual_lock_token
+                    .await?
+                    .map(|x| {
+                        if x.len() >= 10 {
+                            Ok((x[0..10].try_into().unwrap(), x[10..].to_vec()))
+                        } else {
+                            Err(anyhow::anyhow!("invalid lock token"))
+                        }
+                    })
+                    .transpose()?;
+
+                let requested = ns.lock_token.as_ref().map(|x| x.as_str());
+                let actual = actual_lock_token
+                    .as_ref()
+                    .map(|x| format!("{}.{}", hex::encode(&x.0), String::from_utf8_lossy(&x.1)));
+                if requested != actual.as_ref().map(|x| x.as_str()) {
+                    tracing::warn!(
+                        ns_key = ns.ns_key,
+                        ns_id = hex::encode(&ns.ns_id),
+                        ?requested,
+                        ?actual,
+                        "lock token mismatch"
+                    );
+                    return Ok(CommitResult::Conflict);
+                }
+
+                versionstamp_override = actual_lock_token.as_ref().map(|x| x.0);
 
                 if let Some(t) = actual_lwv_value {
                     if t.len() == 16 + 10 {
@@ -171,11 +204,20 @@ impl Server {
                 let mut new_lwv_value = [0u8; 16 + 10 + 4];
                 new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
                 new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
-                txn.atomic_op(
-                    &last_write_version_key,
-                    &new_lwv_value,
-                    MutationType::SetVersionstampedValue,
-                );
+
+                if let Some(v) = versionstamp_override {
+                    new_lwv_value[16..26].copy_from_slice(&v);
+                    txn.set(
+                        &last_write_version_key,
+                        &new_lwv_value[..new_lwv_value.len() - 4],
+                    );
+                } else {
+                    txn.atomic_op(
+                        &last_write_version_key,
+                        &new_lwv_value,
+                        MutationType::SetVersionstampedValue,
+                    );
+                }
             }
 
             // Fine-grained conflict check
@@ -204,22 +246,38 @@ impl Server {
             }
 
             for (page_index, page_hash) in &ns.index_writes {
-                let page_key_template = self.construct_page_key(ns.ns_id, *page_index, [0u8; 10]);
-                let page_key_atomic_op = generate_suffix_versionstamp_atomic_op(&page_key_template);
                 let ci_key = self.construct_contentindex_key(ns.ns_id, *page_hash);
-                let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
+
                 if multi_phase {
                     txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
                 }
-                txn.atomic_op(
-                    &page_key_atomic_op,
-                    page_hash,
-                    MutationType::SetVersionstampedKey,
-                );
+
+                if let Some(v) = versionstamp_override {
+                    let page_key = self.construct_page_key(ns.ns_id, *page_index, v);
+                    txn.set(&page_key, page_hash);
+                } else {
+                    let page_key_template =
+                        self.construct_page_key(ns.ns_id, *page_index, [0u8; 10]);
+                    let page_key_atomic_op =
+                        generate_suffix_versionstamp_atomic_op(&page_key_template);
+                    txn.atomic_op(
+                        &page_key_atomic_op,
+                        page_hash,
+                        MutationType::SetVersionstampedKey,
+                    );
+                }
+
                 if multi_phase {
                     txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
                 }
-                txn.atomic_op(&ci_key, &ci_atomic_op, MutationType::SetVersionstampedValue);
+
+                if let Some(v) = versionstamp_override {
+                    let ci_value = ContentIndex::generate_value_with_version_override(now, v);
+                    txn.set(&ci_key, &ci_value);
+                } else {
+                    let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
+                    txn.atomic_op(&ci_key, &ci_atomic_op, MutationType::SetVersionstampedValue);
+                }
                 written_pages.insert(*page_index);
             }
             if multi_phase {
@@ -235,26 +293,34 @@ impl Server {
                 )?;
             }
 
-            let mut changelog: Vec<u8> = vec![];
-
-            if written_pages.len() >= INTERVAL_ENTRY_MAX_SIZE.load(Ordering::Relaxed) {
-                changelog.push(1); // infinite
+            if let Some(v) = versionstamp_override {
+                let changelog_key = self.construct_changelog_key(ns.ns_id, v);
+                txn.set(
+                    &changelog_key,
+                    &[1u8], // infinite
+                );
             } else {
-                changelog.reserve(1 + written_pages.len() * 4);
-                changelog.push(0);
-                for index in written_pages {
-                    changelog.extend_from_slice(&index.to_be_bytes());
-                }
-            }
+                let mut changelog: Vec<u8> = vec![];
 
-            let changelog_atomic_op_key = generate_suffix_versionstamp_atomic_op(
-                &self.construct_changelog_key(ns.ns_id, [0u8; 10]),
-            );
-            txn.atomic_op(
-                &changelog_atomic_op_key,
-                &changelog,
-                MutationType::SetVersionstampedKey,
-            );
+                if written_pages.len() >= INTERVAL_ENTRY_MAX_SIZE.load(Ordering::Relaxed) {
+                    changelog.push(1); // infinite
+                } else {
+                    changelog.reserve(1 + written_pages.len() * 4);
+                    changelog.push(0);
+                    for index in written_pages {
+                        changelog.extend_from_slice(&index.to_be_bytes());
+                    }
+                }
+
+                let changelog_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                    &self.construct_changelog_key(ns.ns_id, [0u8; 10]),
+                );
+                txn.atomic_op(
+                    &changelog_atomic_op_key,
+                    &changelog,
+                    MutationType::SetVersionstampedKey,
+                );
+            }
         }
 
         let versionstamp_fut = txn.get_versionstamp();
