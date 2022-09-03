@@ -9,6 +9,7 @@ use foundationdb::{
 use futures::StreamExt;
 use hyper::{Body, Request, Response};
 use moka::future::Cache;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -30,7 +31,7 @@ use tokio_util::{
 use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
     content_cache::ContentCache,
-    lock::DistributedLock,
+    distributed_lock::DistributedLock,
 };
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
@@ -1661,6 +1662,17 @@ impl Server {
                             && &token[10..] == lock_id.as_bytes()
                         {
                             txn.clear(&lock_token_key);
+
+                            let mut new_lwv_value = [0u8; 16 + 10];
+
+                            // Fake idempotency key
+                            rand::thread_rng().fill_bytes(&mut new_lwv_value[..16]);
+                            new_lwv_value[16..16 + 10].copy_from_slice(&locked_version);
+
+                            txn.set(
+                                &self.construct_last_write_version_key(ns_id),
+                                &new_lwv_value,
+                            );
                             txn.commit().await.map_err(|e| FdbError::from(e))?;
                             unlocked = true;
                         }

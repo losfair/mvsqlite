@@ -201,17 +201,12 @@ impl Server {
                         last_write_version = last_write_version.max(actual_last_write_version);
                     }
                 }
-                let mut new_lwv_value = [0u8; 16 + 10 + 4];
-                new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
-                new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
 
-                if let Some(v) = versionstamp_override {
-                    new_lwv_value[16..26].copy_from_slice(&v);
-                    txn.set(
-                        &last_write_version_key,
-                        &new_lwv_value[..new_lwv_value.len() - 4],
-                    );
-                } else {
+                // Do not write LWV if this is a long-running write transaction. Defer to lock release.
+                if versionstamp_override.is_none() {
+                    let mut new_lwv_value = [0u8; 16 + 10 + 4];
+                    new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
+                    new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
                     txn.atomic_op(
                         &last_write_version_key,
                         &new_lwv_value,

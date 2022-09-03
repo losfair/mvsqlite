@@ -16,7 +16,7 @@ use foundationdb::{
 
 use crate::{
     fixed_key_vec::FixedKeyVec,
-    lock::DistributedLock,
+    distributed_lock::DistributedLock,
     server::{ContentIndex, Server},
 };
 
