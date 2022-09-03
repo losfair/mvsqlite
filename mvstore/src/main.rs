@@ -7,6 +7,7 @@ mod distributed_lock;
 mod server;
 mod stat;
 mod nslock;
+mod error;
 
 use std::{net::SocketAddr, sync::atomic::Ordering};
 

@@ -9,7 +9,6 @@ use foundationdb::{
 use futures::StreamExt;
 use hyper::{Body, Request, Response};
 use moka::future::Cache;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +31,7 @@ use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
     content_cache::ContentCache,
     distributed_lock::DistributedLock,
+    error::UnretryableError,
 };
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
@@ -874,7 +874,13 @@ impl Server {
                 } else {
                     tracing::warn!(ns = ns_id_hex, error = %e, "stage 2 failure");
                 }
-                Ok(Response::builder().status(500).body(Body::empty())?)
+
+                let is_unretryable = e
+                    .chain()
+                    .any(|x| x.downcast_ref::<UnretryableError>().is_some());
+                Ok(Response::builder()
+                    .status(if is_unretryable { 400 } else { 500 })
+                    .body(Body::empty())?)
             }
         }
     }
@@ -1374,8 +1380,10 @@ impl Server {
                 let commit_global_init = reader
                     .next()
                     .await
-                    .with_context(|| "missing commit global init")?
-                    .with_context(|| "invalid commit global init")?;
+                    .with_context(|| "missing commit global init")
+                    .map_err(UnretryableError)?
+                    .with_context(|| "invalid commit global init")
+                    .map_err(UnretryableError)?;
                 let commit_global_init: CommitGlobalInit =
                     rmp_serde::from_slice(&commit_global_init)
                         .with_context(|| "error deserializing commit global init")?;
@@ -1399,8 +1407,10 @@ impl Server {
                     let init = reader
                         .next()
                         .await
-                        .with_context(|| "missing commit init")?
-                        .with_context(|| "invalid commit init")?;
+                        .with_context(|| "missing commit init")
+                        .map_err(UnretryableError)?
+                        .with_context(|| "invalid commit init")
+                        .map_err(UnretryableError)?;
                     let mut init: CommitNamespaceInit = rmp_serde::from_slice(&init)
                         .with_context(|| "error deserializing commit init")?;
                     if total_page_count.saturating_add(init.num_pages as usize)
@@ -1504,9 +1514,11 @@ impl Server {
                     .unwrap_or_else(HashMap::new);
                 let time_in_seconds = query
                     .get("t")
-                    .with_context(|| "missing t")?
+                    .with_context(|| "missing t")
+                    .map_err(UnretryableError)?
                     .parse::<u64>()
-                    .with_context(|| "invalid t")?;
+                    .with_context(|| "invalid t")
+                    .map_err(UnretryableError)?;
                 let key = self.construct_time2version_key(time_in_seconds);
                 let lower_bound = self.construct_time2version_key(std::u64::MIN);
                 let upper_bound = self.construct_time2version_key(std::u64::MAX);
@@ -1580,45 +1592,17 @@ impl Server {
                             .collect()
                     })
                     .unwrap_or_else(HashMap::new);
-                let lock_id_str = query.get("id").with_context(|| "missing id")?;
-                let lock_id = lock_id_str.as_bytes();
+                let lock_id_str = query
+                    .get("id")
+                    .with_context(|| "missing id")
+                    .map_err(UnretryableError)?;
 
                 let (ns_id, _) = match require_ns_id() {
                     Ok(x) => x,
                     Err(x) => return Ok(x),
                 };
-                let lock_token_key = self.construct_lock_token_key(ns_id);
-                let txn = self.db.create_trx()?;
-                let token = txn.get(&lock_token_key, false).await?;
-
-                // Idempotent?
-                if let Some(token) = token {
-                    if token.len() >= 10 {
-                        if &token[10..] == lock_id {
-                            return Ok(Response::builder().body(Body::from(format!(
-                                "{}.{}",
-                                hex::encode(&token[..10]),
-                                lock_id_str
-                            )))?);
-                        }
-                    }
-                }
-
-                let mut atomic_payload: Vec<u8> = vec![0u8; 10 + lock_id.len() + 4];
-                atomic_payload[10..10 + lock_id.len()].copy_from_slice(lock_id);
-                txn.atomic_op(
-                    &lock_token_key,
-                    &atomic_payload,
-                    MutationType::SetVersionstampedValue,
-                );
-                let versionstamp = txn.get_versionstamp();
-                txn.commit().await.map_err(|e| FdbError::from(e))?;
-                let versionstamp = versionstamp.await?;
-                res = Response::builder().body(Body::from(format!(
-                    "{}.{}",
-                    hex::encode(&versionstamp[..]),
-                    lock_id_str
-                )))?;
+                let lock_token = self.ns_lock_acquire(ns_id, lock_id_str).await?;
+                res = Response::builder().body(Body::from(lock_token))?;
             }
             "/lock/release" => {
                 let query: HashMap<String, String> = uri
@@ -1629,56 +1613,15 @@ impl Server {
                             .collect()
                     })
                     .unwrap_or_else(HashMap::new);
-                let lock_token = query.get("token").with_context(|| "missing token")?;
-
-                let mut locked_version = [0u8; 10];
-                let captures = match LOCK_TOKEN_REGEX.captures(lock_token) {
-                    Some(x) => x,
-                    None => {
-                        return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("invalid token"))?);
-                    }
-                };
-
-                // should not fail, validated by regex
-                hex::decode_to_slice(captures.get(1).unwrap().as_str(), &mut locked_version)
-                    .unwrap();
-                let lock_id = captures.get(2).unwrap().as_str();
-
+                let lock_token = query
+                    .get("token")
+                    .with_context(|| "missing token")
+                    .map_err(UnretryableError)?;
                 let (ns_id, _) = match require_ns_id() {
                     Ok(x) => x,
                     Err(x) => return Ok(x),
                 };
-                let lock_token_key = self.construct_lock_token_key(ns_id);
-                let txn = self.db.create_trx()?;
-                let token = txn.get(&lock_token_key, false).await?;
-
-                let mut unlocked = false;
-
-                if let Some(token) = token {
-                    if token.len() >= 10 {
-                        if &token[0..10] == &locked_version[..]
-                            && &token[10..] == lock_id.as_bytes()
-                        {
-                            txn.clear(&lock_token_key);
-
-                            let mut new_lwv_value = [0u8; 16 + 10];
-
-                            // Fake idempotency key
-                            rand::thread_rng().fill_bytes(&mut new_lwv_value[..16]);
-                            new_lwv_value[16..16 + 10].copy_from_slice(&locked_version);
-
-                            txn.set(
-                                &self.construct_last_write_version_key(ns_id),
-                                &new_lwv_value,
-                            );
-                            txn.commit().await.map_err(|e| FdbError::from(e))?;
-                            unlocked = true;
-                        }
-                    }
-                }
-
+                let unlocked = self.ns_lock_release(ns_id, lock_token).await?;
                 res = Response::builder()
                     .header("x-unlocked", if unlocked { "1" } else { "0" })
                     .body(Body::from("ok"))?;
