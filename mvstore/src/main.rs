@@ -3,9 +3,10 @@ mod content_cache;
 mod fixed_key_vec;
 mod gc;
 mod keys;
-mod lock;
+mod distributed_lock;
 mod server;
 mod stat;
+mod nslock;
 
 use std::{net::SocketAddr, sync::atomic::Ordering};
 
