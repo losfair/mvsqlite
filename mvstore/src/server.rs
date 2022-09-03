@@ -1925,16 +1925,6 @@ impl ContentIndex {
         buf
     }
 
-    pub fn generate_value_with_version_override(
-        now: Duration,
-        version_override: [u8; 10],
-    ) -> [u8; 18] {
-        let mut buf = [0u8; 18];
-        buf[0..8].copy_from_slice(&now.as_secs().to_be_bytes());
-        buf[8..18].copy_from_slice(&version_override);
-        buf
-    }
-
     pub fn decode(x: &[u8]) -> Result<Self> {
         if x.len() != 18 {
             return Err(anyhow::anyhow!("invalid content index"));

@@ -266,13 +266,20 @@ impl Server {
                     txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
                 }
 
-                if let Some(v) = versionstamp_override {
-                    let ci_value = ContentIndex::generate_value_with_version_override(now, v);
-                    txn.set(&ci_key, &ci_value);
-                } else {
-                    let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
-                    txn.atomic_op(&ci_key, &ci_atomic_op, MutationType::SetVersionstampedValue);
-                }
+                // Always write the current versionstamp to the content index. This is necessary for
+                // correctness because of the GC DUC process. Consider this sequence:
+                //
+                // 1. NS lock acquire
+                // 2. DUC stage 1 (Fetch read version)
+                // 3. DUC stage 2 (scan inconsistent snapshot)
+                // 4. Write + Commit
+                // 5. DUC stage 3 (CAM index scan)
+                //
+                // The new pages added in step 4 are not present in the snapshot created in step 3, and are left to
+                // step 5 for detection. If the content index versionstamps of the new pages are rewritten to lock
+                // version, step 5 would think it is a stale old page and delete it.
+                let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
+                txn.atomic_op(&ci_key, &ci_atomic_op, MutationType::SetVersionstampedValue);
                 written_pages.insert(*page_index);
             }
             if multi_phase {
