@@ -5,11 +5,15 @@ pub mod sqlite_c;
 pub mod sqlite_misc;
 pub mod sqlite_vfs;
 pub mod tempfile;
+mod util;
 pub mod vfs;
 
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    ffi::CString,
+    sync::{atomic::Ordering, Arc},
+};
 
-use crate::{io_engine::IoEngine, vfs::MultiVersionVfs};
+use crate::{io_engine::IoEngine, util::get_conn, vfs::MultiVersionVfs};
 
 pub static VFS_NAME: &'static str = "mv-vfs";
 
@@ -134,4 +138,41 @@ pub extern "C" fn init_mvsqlite() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn init_mvsqlite_connection(_db: *mut sqlite_c::sqlite3) {}
+pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
+    let mv_last_known_version_name = b"mv_last_known_version\0";
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_last_known_version_name.as_ptr() as *const i8,
+        1,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_last_known_version),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+}
+
+unsafe extern "C" fn mv_last_known_version(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert_eq!(argc, 1);
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+        .to_str()
+        .unwrap();
+    let conn = get_conn(db, selected_db);
+    let version = conn.inner.last_known_version().unwrap_or_default();
+    tracing::info!(selected_db, version, "last known version");
+    let version = CString::new(version).unwrap();
+    sqlite_c::sqlite3_result_text(
+        ctx,
+        version.as_ptr(),
+        version.as_bytes().len() as i32,
+        crate::sqlite_misc::SQLITE_TRANSIENT(),
+    );
+}

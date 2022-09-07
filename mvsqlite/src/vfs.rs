@@ -67,8 +67,8 @@ impl Vfs for MultiVersionVfs {
 }
 
 pub struct Connection {
-    io: Arc<IoEngine>,
-    inner: mvfs::Connection,
+    pub io: Arc<IoEngine>,
+    pub inner: mvfs::Connection,
 }
 
 impl DatabaseHandle for Connection {
@@ -115,9 +115,17 @@ impl DatabaseHandle for Connection {
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         unimplemented!("wal_index not implemented")
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
-impl<W: WalIndex> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
+impl<W: WalIndex + 'static> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
     type WalIndex = W;
 
     fn size(&mut self) -> Result<u64, std::io::Error> {
@@ -158,6 +166,14 @@ impl<W: WalIndex> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex = W>> {
 
     fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         (**self).wal_index(readonly)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
