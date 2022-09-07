@@ -8,7 +8,9 @@ use std::{
     },
 };
 
-use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, Transaction};
+use mvclient::{
+    CommitOutput, MultiVersionClient, MultiVersionClientConfig, TimeToVersionResponse, Transaction,
+};
 
 use crate::types::LockKind;
 const TRANSITION_HISTORY_SIZE: usize = 10;
@@ -322,6 +324,15 @@ impl Connection {
         if self.write_buffer.len() >= 1000 {
             self.force_flush_write_buffer().await;
         }
+    }
+
+    pub async fn time2version(&mut self, timestamp: u64) -> TimeToVersionResponse {
+        let res = self
+            .client
+            .time2version(timestamp)
+            .await
+            .expect("unrecoverable time2version failure");
+        res
     }
 }
 
