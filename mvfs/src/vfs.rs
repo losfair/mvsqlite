@@ -181,6 +181,10 @@ impl TransitionHistory {
 }
 
 impl Connection {
+    pub fn last_known_version(&self) -> Option<&str> {
+        self.last_known_write_version.as_deref()
+    }
+
     pub async fn do_read_raw(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);

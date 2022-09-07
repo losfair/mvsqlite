@@ -4,6 +4,7 @@
 //!
 //! https://github.com/rkusa/sqlite-vfs/blob/main/src/lib.rs
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::ffi::{c_void, CStr, CString};
 use std::io::ErrorKind;
@@ -16,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::SystemTime;
 
-mod ffi;
+pub mod ffi;
 
 /// A file opened by [Vfs].
 pub trait DatabaseHandle: Sync {
@@ -70,6 +71,9 @@ pub trait DatabaseHandle: Sync {
     }
 
     fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error>;
+
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// A virtual file system for SQLite.
@@ -887,6 +891,13 @@ mod vfs {
         }
         ffi::SQLITE_OK
     }
+}
+
+pub unsafe fn get_file<V: Vfs, F: DatabaseHandle>(
+    raw: *mut ffi::sqlite3_file,
+) -> Result<*mut F, std::io::Error> {
+    let state = file_state::<V, F>(raw)?;
+    Ok(&mut state.file)
 }
 
 mod io {
