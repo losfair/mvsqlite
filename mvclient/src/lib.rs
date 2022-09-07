@@ -138,6 +138,18 @@ pub struct NamespaceCommitIntent {
     pub requests: Vec<CommitRequest>,
 }
 
+#[derive(Deserialize)]
+pub struct TimeToVersionResponse {
+    pub after: Option<TimeToVersionPoint>,
+    pub not_after: Option<TimeToVersionPoint>,
+}
+
+#[derive(Deserialize)]
+pub struct TimeToVersionPoint {
+    pub version: String,
+    pub time: u64,
+}
+
 impl MultiVersionClient {
     pub fn new(config: MultiVersionClientConfig, client: reqwest::Client) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { client, config }))
@@ -291,6 +303,27 @@ impl MultiVersionClient {
                 changelog: body.changelog,
             }));
         }
+    }
+
+    pub async fn time2version(self: &Arc<Self>, timestamp: u64) -> Result<TimeToVersionResponse> {
+        let mut url = self.config.random_data_plane().clone();
+        url.set_path("/time2version");
+        url.query_pairs_mut()
+            .append_pair("t", &timestamp.to_string());
+
+        let mut boff = RandomizedExponentialBackoff::default();
+        let res: TimeToVersionResponse = loop {
+            let resp = request_and_check(self.client.get(url.clone()).decorate(self)).await?;
+            match resp {
+                Some((_, body)) => break serde_json::from_slice(&body)?,
+                None => {
+                    boff.wait().await;
+                    continue;
+                }
+            }
+        };
+
+        Ok(res)
     }
 }
 
