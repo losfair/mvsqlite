@@ -551,25 +551,26 @@ impl Connection {
                 CommitOutput::Committed(result) => {
                     self.last_known_write_version = Some(result.version.clone());
                     let changelog = result.changelog.get(ns_key);
-                    if result.last_version > read_version {
-                        // Invalidate page cache
-                        if let Some(changelog) = changelog {
+
+                    // Invalidate page cache
+                    if let Some(changelog) = changelog {
+                        if !changelog.is_empty() {
                             for &index in changelog {
                                 self.leaf_page_cache.pop_entry(&index);
                                 self.high_priority_page_cache.pop_entry(&index);
                             }
                             tracing::info!(
-                                    count = changelog.len(),
-                                    "non-local concurrent transaction detected, performed partial cache flush"
-                                );
-                        } else {
-                            // Changelog is not available - do a full flush
-                            self.leaf_page_cache.clear();
-                            self.high_priority_page_cache.clear();
-                            tracing::warn!(
-                                "non-local concurrent transaction detected, invalidating cache"
+                                count = changelog.len(),
+                                "non-local concurrent transaction detected, performed partial cache flush"
                             );
                         }
+                    } else {
+                        // Changelog is not available - do a full flush
+                        self.leaf_page_cache.clear();
+                        self.high_priority_page_cache.clear();
+                        tracing::warn!(
+                            "non-local concurrent transaction detected, invalidating cache"
+                        );
                     }
 
                     self.txn = Some(
@@ -582,7 +583,6 @@ impl Connection {
                             duration = ?result.duration,
                             num_pages = result.num_pages,
                             read_version,
-                            last_version = result.last_version,
                             "transaction committed");
                 }
                 CommitOutput::Conflict => {
