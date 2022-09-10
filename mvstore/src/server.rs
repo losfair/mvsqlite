@@ -1608,10 +1608,24 @@ impl Server {
             .await?;
         assert!(page_vec.len() <= 1);
         if page_vec.is_empty() {
+            // The reason we get an empty range is that there is no version of this page. Encode this causality.
+            if !snapshot {
+                txn.add_conflict_range(
+                    &scan_start[..],
+                    &scan_end
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(0u8))
+                        .collect::<Vec<u8>>(),
+                    ConflictRangeType::Read,
+                )?;
+            }
             Ok(None)
         } else {
             let page = page_vec.into_iter().next().unwrap();
             let key = page.key();
+
+            // The reason we get this page is that there are no more versions after. Encode this causality.
             if !snapshot {
                 txn.add_conflict_range(
                     key,
