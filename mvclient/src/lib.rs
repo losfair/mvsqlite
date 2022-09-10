@@ -94,6 +94,8 @@ pub struct CommitGlobalInit<'a> {
     #[serde(with = "serde_bytes")]
     pub idempotency_key: &'a [u8],
 
+    pub allow_skip_idempotency_check: bool,
+
     pub num_namespaces: usize,
 }
 
@@ -123,7 +125,6 @@ pub struct CommitResult {
     pub version: String,
     pub duration: Duration,
     pub num_pages: u64,
-    pub last_version: String,
     pub changelog: HashMap<String, Vec<u32>>,
 }
 
@@ -234,44 +235,44 @@ impl MultiVersionClient {
         let start_time = Instant::now();
         let mut url = self.config.random_data_plane().clone();
         url.set_path("/batch/commit");
-        let mut raw_request: Vec<u8> = Vec::new();
 
         let mut idempotency_key: [u8; 16] = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut idempotency_key);
 
-        let global_init = CommitGlobalInit {
-            idempotency_key: &idempotency_key[..],
-            num_namespaces: intents.len(),
-        };
+        let mut boff = RandomizedExponentialBackoff::default();
+        let mut allow_skip_idempotency_check = true; // only for the first attempt
 
-        {
-            let serialized = rmp_serde::to_vec_named(&global_init)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-        }
-
-        let mut total_num_pages: usize = 0;
-
-        for intent in intents {
-            let serialized = rmp_serde::to_vec_named(&intent.init)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-            for req in &intent.requests {
-                let serialized = rmp_serde::to_vec_named(&req)?;
+        loop {
+            let global_init = CommitGlobalInit {
+                idempotency_key: &idempotency_key[..],
+                allow_skip_idempotency_check,
+                num_namespaces: intents.len(),
+            };
+            allow_skip_idempotency_check = false;
+            let mut raw_request: Vec<u8> = Vec::new();
+            {
+                let serialized = rmp_serde::to_vec_named(&global_init)?;
                 raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
                 raw_request.extend_from_slice(&serialized);
             }
-            total_num_pages += intent.requests.len();
-        }
 
-        let raw_request = Bytes::from(raw_request);
-        let mut boff = RandomizedExponentialBackoff::default();
+            let mut total_num_pages: usize = 0;
 
-        loop {
-            let response = request_and_check_returning_status(
-                self.client.post(url.clone()).body(raw_request.clone()),
-            )
-            .await;
+            for intent in intents {
+                let serialized = rmp_serde::to_vec_named(&intent.init)?;
+                raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
+                raw_request.extend_from_slice(&serialized);
+                for req in &intent.requests {
+                    let serialized = rmp_serde::to_vec_named(&req)?;
+                    raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
+                    raw_request.extend_from_slice(&serialized);
+                }
+                total_num_pages += intent.requests.len();
+            }
+
+            let response =
+                request_and_check_returning_status(self.client.post(url.clone()).body(raw_request))
+                    .await;
             let (headers, body) = match response {
                 Ok(Some(x)) => x,
                 Ok(None) => {
@@ -290,16 +291,11 @@ impl MultiVersionClient {
                 .get("x-committed-version")
                 .with_context(|| format!("missing committed version header"))?
                 .to_str()?;
-            let last_version = headers
-                .get("x-last-version")
-                .with_context(|| format!("missing last version header"))?
-                .to_str()?;
             tracing::debug!(version = committed_version, "committed transaction");
             return Ok(Some(CommitResult {
                 version: committed_version.into(),
                 duration: start_time.elapsed(),
                 num_pages: total_num_pages as u64,
-                last_version: last_version.into(),
                 changelog: body.changelog,
             }));
         }

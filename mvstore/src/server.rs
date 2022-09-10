@@ -107,6 +107,9 @@ pub struct CommitGlobalInit<'a> {
     #[serde(with = "serde_bytes")]
     pub idempotency_key: &'a [u8],
 
+    #[serde(default)]
+    pub allow_skip_idempotency_check: bool,
+
     pub num_namespaces: usize,
 }
 
@@ -1454,6 +1457,8 @@ impl Server {
                 match self
                     .commit(CommitContext {
                         idempotency_key,
+                        allow_skip_idempotency_check: commit_global_init
+                            .allow_skip_idempotency_check,
                         namespaces: &ns_contexts,
                     })
                     .await?
@@ -1465,12 +1470,12 @@ impl Server {
                     }
                     CommitResult::Committed {
                         versionstamp,
-                        last_write_version,
                         changelog,
                     } => {
                         let data: CommitResponse = CommitResponse { changelog };
                         let body = rmp_serde::to_vec_named(&data)
                             .with_context(|| "cannot serialize commit response")?;
+                        let last_write_version = [0xffu8; 10]; // backward compatibility
                         res = Response::builder()
                             .header(COMMITTED_VERSION_HDR_NAME, hex::encode(&versionstamp))
                             .header(LAST_VERSION_HDR_NAME, hex::encode(&last_write_version))
