@@ -22,7 +22,6 @@ pub static INTERVAL_ENTRY_MAX_SIZE: AtomicUsize = AtomicUsize::new(500);
 pub enum CommitResult {
     Committed {
         versionstamp: [u8; 10],
-        last_write_version: [u8; 10],
         changelog: HashMap<String, Vec<u32>>,
     },
     Conflict,
@@ -32,6 +31,7 @@ pub enum CommitResult {
 
 pub struct CommitContext<'a> {
     pub idempotency_key: [u8; 16],
+    pub allow_skip_idempotency_check: bool,
     pub namespaces: &'a [CommitNamespaceContext],
 }
 
@@ -57,8 +57,6 @@ impl Server {
             // conflict with itself
             return Ok(CommitResult::NamespaceNotDistinct);
         }
-
-        let mut last_write_version: [u8; 10] = [0u8; 10];
 
         // Begin the writes.
         // We do two-phase commit (not that 2PC!) for large transactions here.
@@ -143,31 +141,36 @@ impl Server {
             {
                 let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
 
-                // If we rely on PLCC to check conflicts, it is not necessary to add LWV to conflict set.
-                let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns).await?;
+                // We need to go through the read-lwv path in the following cases:
+                //
+                // - This is not a PLCC commit. Database-level conflict check works by comparing LWV.
+                // - The client does not allow us to skip idempotency check. This happens when the client is retrying a commit.
+                if !plcc_enable_ns || !ctx.allow_skip_idempotency_check {
+                    // If we rely on PLCC to check conflicts, it is not necessary to add LWV to conflict set.
+                    let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns).await?;
 
-                if let Some(t) = actual_lwv_value {
-                    if t.len() == 16 + 10 {
-                        let actual_idempotency_token = <[u8; 16]>::try_from(&t[0..16]).unwrap();
-                        let actual_last_write_version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
-                        if actual_idempotency_token == ctx.idempotency_key {
-                            // This is an idempotent retry - return conservative values
-                            return Ok(CommitResult::Committed {
-                                versionstamp: actual_last_write_version,
-                                last_write_version: [0xff; 10],
-                                changelog: HashMap::new(),
-                            });
-                        }
+                    if let Some(t) = actual_lwv_value {
+                        if t.len() == 16 + 10 {
+                            let actual_idempotency_token = <[u8; 16]>::try_from(&t[0..16]).unwrap();
+                            let actual_last_write_version =
+                                <[u8; 10]>::try_from(&t[16..26]).unwrap();
+                            if actual_idempotency_token == ctx.idempotency_key {
+                                // This is an idempotent retry - return conservative values
+                                return Ok(CommitResult::Committed {
+                                    versionstamp: actual_last_write_version,
+                                    changelog: HashMap::new(),
+                                });
+                            }
 
-                        if ns.client_assumed_version < actual_last_write_version {
-                            if !plcc_enable_ns {
-                                return Ok(CommitResult::Conflict);
+                            if ns.client_assumed_version < actual_last_write_version {
+                                if !plcc_enable_ns {
+                                    return Ok(CommitResult::Conflict);
+                                }
                             }
                         }
-
-                        last_write_version = last_write_version.max(actual_last_write_version);
                     }
                 }
+
                 let mut new_lwv_value = [0u8; 16 + 10 + 4];
                 new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
                 new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
@@ -282,7 +285,6 @@ impl Server {
         }
         Ok(CommitResult::Committed {
             versionstamp: <[u8; 10]>::try_from(&versionstamp[..]).unwrap(),
-            last_write_version,
             changelog,
         })
     }
