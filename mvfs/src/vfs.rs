@@ -357,8 +357,16 @@ impl Connection {
     ) -> Result<(), std::io::Error> {
         if self.txn.is_none() {
             assert!(offset == 0);
-            assert!(buf.len() == 100);
-            buf.copy_from_slice(&self.first_page[0..100]);
+            let buf_len = buf.len();
+
+            if buf_len != 100 {
+                tracing::warn!(
+                    buf_len,
+                    "read_exact_at on the first page called without a transaction with non-standard size"
+                );
+            }
+
+            buf.copy_from_slice(&self.first_page[0..buf_len]);
             return Ok(());
         }
 
