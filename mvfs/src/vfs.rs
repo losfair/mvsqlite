@@ -356,13 +356,9 @@ impl Connection {
         offset: u64,
     ) -> Result<(), std::io::Error> {
         if self.txn.is_none() {
-            tracing::warn!(
-                offset = offset,
-                len = buf.len(),
-                "read_exact_at called without a transaction"
-            );
-            let len = buf.len();
-            buf.copy_from_slice(&self.first_page[offset as usize..(offset as usize) + len]);
+            assert!(offset == 0);
+            assert!(buf.len() == 100);
+            buf.copy_from_slice(&self.first_page[0..100]);
             return Ok(());
         }
 
