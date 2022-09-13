@@ -141,6 +141,7 @@ pub extern "C" fn init_mvsqlite() {
 pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
     let mv_last_known_version_name = b"mv_last_known_version\0";
     let mv_time2version_name = b"mv_time2version\0";
+    let mv_conflict_count_name = b"mv_conflict_count\0";
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
@@ -162,6 +163,19 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
         Some(mv_time2version),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_conflict_count_name.as_ptr() as *const i8,
+        1,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_conflict_count),
         None,
         None,
         None,
@@ -221,4 +235,19 @@ unsafe extern "C" fn mv_time2version(
     } else {
         sqlite_c::sqlite3_result_null(ctx);
     }
+}
+
+unsafe extern "C" fn mv_conflict_count(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert_eq!(argc, 1);
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+        .to_str()
+        .unwrap();
+    let conn = get_conn(db, selected_db);
+    sqlite_c::sqlite3_result_int64(ctx, conn.inner.conflict_count() as i64);
 }

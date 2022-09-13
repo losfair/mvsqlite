@@ -100,6 +100,7 @@ impl MultiVersionVfs {
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
+            conflict_count: 0,
         };
         Ok(conn)
     }
@@ -125,6 +126,7 @@ pub struct Connection {
     virtual_version_counter: u32,
 
     last_known_write_version: Option<String>,
+    conflict_count: u64,
 }
 
 #[derive(Default)]
@@ -333,6 +335,10 @@ impl Connection {
             .await
             .expect("unrecoverable time2version failure");
         res
+    }
+
+    pub fn conflict_count(&self) -> u64 {
+        self.conflict_count
     }
 }
 
@@ -596,6 +602,7 @@ impl Connection {
                     }
                     tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                     commit_ok = false;
+                    self.conflict_count += 1;
                 }
                 CommitOutput::Empty => {
                     tracing::info!("transaction is empty");
