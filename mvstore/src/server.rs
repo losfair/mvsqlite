@@ -323,8 +323,8 @@ impl Server {
                 loop {
                     if txn.get(&nskey_key, false).await?.is_some() {
                         return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("this key already exists"))?);
+                            .status(422)
+                            .body(Body::from("this key already exists\n"))?);
                     }
 
                     let nsmd_atomic_op_key =
@@ -342,7 +342,9 @@ impl Server {
                     );
                     match txn.commit().await {
                         Ok(_) => {
-                            res = Response::builder().status(200).body(Body::from("ok"))?;
+                            res = Response::builder()
+                                .status(201)
+                                .body(Body::from("created\n"))?;
                             break;
                         }
                         Err(e) => {
@@ -370,22 +372,24 @@ impl Server {
                 loop {
                     if txn.get(&new_nskey_key, false).await?.is_some() {
                         return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("new key already exists"))?);
+                            .status(422)
+                            .body(Body::from("new key already exists\n"))?);
                     }
                     let ns_id = match txn.get(&old_nskey_key, false).await? {
                         Some(v) => v,
                         None => {
                             return Ok(Response::builder()
-                                .status(400)
-                                .body(Body::from("old key does not exist"))?);
+                                .status(404)
+                                .body(Body::from("old key does not exist\n"))?);
                         }
                     };
                     txn.clear(&old_nskey_key);
                     txn.set(&new_nskey_key, &ns_id);
                     match txn.commit().await {
                         Ok(_) => {
-                            res = Response::builder().status(200).body(Body::from("ok"))?;
+                            res = Response::builder()
+                                .status(200)
+                                .body(Body::from("renamed\n"))?;
                             break;
                         }
                         Err(e) => {
@@ -414,8 +418,8 @@ impl Server {
                         Some(v) => v,
                         None => {
                             return Ok(Response::builder()
-                                .status(400)
-                                .body(Body::from("this key does not exist"))?);
+                                .status(404)
+                                .body(Body::from("this key does not exist\n"))?);
                         }
                     };
                     let ns_id =
@@ -431,7 +435,9 @@ impl Server {
                     txn.clear(&nsmd_key);
                     match txn.commit().await {
                         Ok(_) => {
-                            res = Response::builder().status(200).body(Body::from("ok"))?;
+                            res = Response::builder()
+                                .status(200)
+                                .body(Body::from("deleted\n"))?;
                             break;
                         }
                         Err(e) => {
@@ -458,8 +464,8 @@ impl Server {
                     Some(v) => v,
                     None => {
                         return Ok(Response::builder()
-                            .status(400)
-                            .body(Body::from("this key does not exist"))?);
+                            .status(404)
+                            .body(Body::from("this key does not exist\n"))?);
                     }
                 };
                 drop(txn);
