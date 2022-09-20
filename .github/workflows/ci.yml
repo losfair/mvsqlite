@@ -24,7 +24,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.17/foundationdb-clients_7.1.17-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
-          sudo apt update && sudo apt install -y libfuse3-dev
+          sudo apt update && sudo apt install -y libfuse3-dev execstack
       - name: Build (mvstore)
         run: cargo build --release -p mvstore
       - name: Build (mvsqlite)
@@ -46,6 +46,11 @@ jobs:
           cp ../mvsqlite-preload/libmvsqlite_preload.so ./
           cp ../mvsqlite-preload/libmvsqlite.a ./
           find . -type f -exec sha256sum '{}' ';'
+      - name: Check binaries
+        run: |
+          set -e
+          execstack -q ./build/libmvsqlite_preload.so | tee execstack.log
+          grep -v '^X ' execstack.log
       - name: Push binaries
         uses: actions/upload-artifact@v3
         with:
