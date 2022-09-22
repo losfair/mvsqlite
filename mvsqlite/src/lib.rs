@@ -141,6 +141,8 @@ pub extern "C" fn init_mvsqlite() {
 pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
     let mv_last_known_version_name = b"mv_last_known_version\0";
     let mv_time2version_name = b"mv_time2version\0";
+    let mv_pin_version_name = b"mv_pin_version\0";
+    let mv_unpin_version_name = b"mv_unpin_version\0";
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
@@ -162,6 +164,32 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
         Some(mv_time2version),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_pin_version_name.as_ptr() as *const i8,
+        2,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_pin_version),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_unpin_version_name.as_ptr() as *const i8,
+        1,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_unpin_version),
         None,
         None,
         None,
@@ -220,5 +248,57 @@ unsafe extern "C" fn mv_time2version(
         );
     } else {
         sqlite_c::sqlite3_result_null(ctx);
+    }
+}
+
+unsafe extern "C" fn mv_pin_version(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert_eq!(argc, 2);
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+        .to_str()
+        .unwrap();
+    let mut conn = get_conn(db, selected_db);
+
+    let version = sqlite_c::sqlite3_value_text(*argv.add(1));
+    let version = std::ffi::CStr::from_ptr(version as *const i8)
+        .to_str()
+        .unwrap();
+    match conn.inner.pin_version(version.to_string()) {
+        Ok(()) => {
+            sqlite_c::sqlite3_result_null(ctx);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{}", e)).unwrap();
+            sqlite_c::sqlite3_result_error(ctx, error.as_ptr(), error.as_bytes().len() as i32);
+        }
+    }
+}
+
+unsafe extern "C" fn mv_unpin_version(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert_eq!(argc, 1);
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+        .to_str()
+        .unwrap();
+    let mut conn = get_conn(db, selected_db);
+
+    match conn.inner.unpin_version() {
+        Ok(()) => {
+            sqlite_c::sqlite3_result_null(ctx);
+        }
+        Err(e) => {
+            let error = CString::new(format!("{}", e)).unwrap();
+            sqlite_c::sqlite3_result_error(ctx, error.as_ptr(), error.as_bytes().len() as i32);
+        }
     }
 }

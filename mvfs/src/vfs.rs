@@ -334,6 +334,24 @@ impl Connection {
             .expect("unrecoverable time2version failure");
         res
     }
+
+    pub fn pin_version(&mut self, version: String) -> Result<()> {
+        if self.txn.is_some() {
+            anyhow::bail!("cannot pin version while transaction is active");
+        }
+
+        self.fixed_version = Some(version);
+        Ok(())
+    }
+
+    pub fn unpin_version(&mut self) -> Result<()> {
+        if self.txn.is_some() {
+            anyhow::bail!("cannot unpin version while transaction is active");
+        }
+
+        self.fixed_version = None;
+        Ok(())
+    }
 }
 
 impl Connection {
@@ -449,6 +467,14 @@ impl Connection {
         assert!(lock != LockKind::None);
         if self.lock == lock {
             return Ok(true);
+        }
+
+        if self.fixed_version.is_some() && lock.level() >= LockKind::Reserved.level() {
+            tracing::error!(
+                ns_key = self.client.config().ns_key,
+                "cannot acquire lock for write while pinned to a version"
+            );
+            return Ok(false);
         }
 
         if self.txn.is_none() {
