@@ -150,6 +150,8 @@ pub struct TimeToVersionPoint {
 #[derive(Deserialize)]
 pub struct AdminCreateNamespaceRequest {
     pub key: String,
+
+    #[serde(default)]
     pub metadata: String,
 }
 

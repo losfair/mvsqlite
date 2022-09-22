@@ -11,6 +11,7 @@ use std::{net::SocketAddr, sync::atomic::Ordering};
 
 use anyhow::{Context, Result};
 use foundationdb::{api::FdbApiBuilder, options::NetworkOption};
+use futures::Future;
 use hyper::service::{make_service_fn, service_fn};
 use server::{Server, ServerConfig};
 use structopt::StructOpt;
@@ -58,11 +59,11 @@ fn main() -> Result<()> {
 struct Opt {
     /// Data plane listen address.
     #[structopt(long, env = "MVSTORE_DATA_PLANE")]
-    data_plane: SocketAddr,
+    data_plane: Option<SocketAddr>,
 
     /// Admin API listen address.
     #[structopt(long, env = "MVSTORE_ADMIN_API")]
-    admin_api: SocketAddr,
+    admin_api: Option<SocketAddr>,
 
     /// Output log in JSON format.
     #[structopt(long)]
@@ -158,44 +159,56 @@ async fn async_main(opt: Opt) -> Result<()> {
         server.clone().spawn_background_tasks();
     }
 
-    let data_plane_server = {
+    let data_plane_server = if let Some(data_plane) = opt.data_plane {
+        tracing::info!(listen = %data_plane, "starting data plane");
         let server = server.clone();
-        hyper::Server::bind(&opt.data_plane).serve(make_service_fn(move |_conn| {
-            let server = server.clone();
-            async move {
-                Ok::<_, anyhow::Error>(service_fn(move |req| server.clone().serve_data_plane(req)))
-            }
-        }))
+        Some(
+            hyper::Server::bind(&data_plane).serve(make_service_fn(move |_conn| {
+                let server = server.clone();
+                async move {
+                    Ok::<_, anyhow::Error>(service_fn(move |req| {
+                        server.clone().serve_data_plane(req)
+                    }))
+                }
+            })),
+        )
+    } else {
+        None
     };
 
     let admin_api_server = if opt.read_only {
         None
     } else {
-        Some(
-            hyper::Server::bind(&opt.admin_api).serve(make_service_fn(move |_conn| {
-                let server = server.clone();
-                async move {
-                    Ok::<_, anyhow::Error>(service_fn(move |req| {
-                        server.clone().serve_admin_api(req)
-                    }))
-                }
-            })),
-        )
-    };
-    let admin_api_server = async move {
-        match admin_api_server {
-            Some(x) => x.await,
-            None => futures::future::pending().await,
+        if let Some(admin_api) = opt.admin_api {
+            tracing::info!(listen = %admin_api, "starting admin api");
+            Some(
+                hyper::Server::bind(&admin_api).serve(make_service_fn(move |_conn| {
+                    let server = server.clone();
+                    async move {
+                        Ok::<_, anyhow::Error>(service_fn(move |req| {
+                            server.clone().serve_admin_api(req)
+                        }))
+                    }
+                })),
+            )
+        } else {
+            None
         }
     };
-
     tracing::info!("server initialized");
     tokio::select! {
-        x = data_plane_server => {
+        x = wait_or_never(data_plane_server) => {
             anyhow::bail!("data plane exit: {:?}", x);
         }
-        x = admin_api_server => {
+        x = wait_or_never(admin_api_server) => {
             anyhow::bail!("admin api exit: {:?}", x);
         }
+    }
+}
+
+async fn wait_or_never<T, F: Future<Output = T>>(f: Option<F>) -> T {
+    match f {
+        Some(f) => f.await,
+        None => futures::future::pending().await,
     }
 }
