@@ -469,10 +469,10 @@ impl Connection {
             return Ok(true);
         }
 
-        if self.fixed_version.is_some() && lock.level() >= LockKind::Reserved.level() {
+        if self.fixed_version.is_some() && lock == LockKind::Exclusive {
             tracing::error!(
                 ns_key = self.client.config().ns_key,
-                "cannot acquire lock for write while pinned to a version"
+                "cannot acquire exclusive lock while pinned to a version"
             );
             return Ok(false);
         }
