@@ -1,0 +1,39 @@
+--- sqlite3.c	2022-09-05 11:28:58.000000000 +0000
++++ sqlite3-mv.c	2022-09-23 13:02:17.876434507 +0000
+@@ -3931,7 +3931,7 @@
+   const void *filename,   /* Database filename (UTF-16) */
+   sqlite3 **ppDb          /* OUT: SQLite db handle */
+ );
+-SQLITE_API int sqlite3_open_v2(
++SQLITE_API int real_sqlite3_open_v2(
+   const char *filename,   /* Database filename (UTF-8) */
+   sqlite3 **ppDb,         /* OUT: SQLite db handle */
+   int flags,              /* Flags */
+@@ -130545,7 +130545,7 @@
+   sqlite3_mutex_leave,
+   sqlite3_mutex_try,
+ #endif
+-  sqlite3_open_v2,
++  real_sqlite3_open_v2,
+   sqlite3_release_memory,
+   sqlite3_result_error_nomem,
+   sqlite3_result_error_toobig,
+@@ -174158,17 +174158,7 @@
+ }
+ 
+ 
+-/*
+-** Open a new database handle.
+-*/
+-SQLITE_API int sqlite3_open(
+-  const char *zFilename,
+-  sqlite3 **ppDb
+-){
+-  return openDatabase(zFilename, ppDb,
+-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
+-}
+-SQLITE_API int sqlite3_open_v2(
++SQLITE_API int real_sqlite3_open_v2(
+   const char *filename,   /* Database filename (UTF-8) */
+   sqlite3 **ppDb,         /* OUT: SQLite db handle */
+   int flags,              /* Flags */
