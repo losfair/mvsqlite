@@ -1,11 +1,15 @@
 mod commit;
-mod content_cache;
-mod fixed_key_vec;
+mod delta;
+mod fixed;
 mod gc;
 mod keys;
 mod lock;
+mod page;
+mod replica;
 mod server;
 mod stat;
+mod util;
+mod write;
 
 use std::{net::SocketAddr, sync::atomic::Ordering};
 
@@ -149,8 +153,6 @@ async fn async_main(opt: Opt) -> Result<()> {
         metadata_prefix: opt.metadata_prefix.clone(),
         read_only: opt.read_only,
         dr_tag: opt.dr_tag,
-        content_cache: opt.content_cache.clone(),
-        content_cache_size: opt.content_cache_size,
     })
     .await
     .with_context(|| "failed to initialize server")?;

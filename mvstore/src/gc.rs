@@ -14,11 +14,7 @@ use foundationdb::{
     RangeOption,
 };
 
-use crate::{
-    fixed_key_vec::FixedKeyVec,
-    lock::DistributedLock,
-    server::{ContentIndex, Server},
-};
+use crate::{fixed::FixedKeyVec, lock::DistributedLock, server::Server, util::ContentIndex};
 
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
@@ -31,11 +27,14 @@ impl Server {
         before_version: [u8; 10],
         mut progress_callback: impl FnMut(Option<u64>),
     ) -> Result<()> {
-        let scan_start = self.construct_page_key(ns_id, 0, [0u8; 10]);
-        let scan_end = self.construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
+        let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
+        let scan_end = self
+            .key_codec
+            .construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
         let mut scan_cursor = scan_start.clone();
         let mut lock = DistributedLock::new(
-            self.construct_nstask_key(ns_id, "truncate_versions"),
+            self.key_codec
+                .construct_nstask_key(ns_id, "truncate_versions"),
             "truncate_versions".into(),
         );
 
@@ -141,8 +140,10 @@ impl Server {
         // Delete changelog
         loop {
             let txn = lock.create_txn_and_check_sync(&self.db).await?;
-            let start = self.construct_changelog_key(ns_id, [0u8; 10]);
-            let end = self.construct_changelog_key(ns_id, before_version);
+            let start = self.key_codec.construct_changelog_key(ns_id, [0u8; 10]);
+            let end = self
+                .key_codec
+                .construct_changelog_key(ns_id, before_version);
             // End is exclusive - `before_version` itself should not be deleted
             txn.clear_range(start.as_slice(), end.as_slice());
             match txn.commit().await {
@@ -212,8 +213,10 @@ impl Server {
         ns_id: [u8; 10],
         mut cb: impl FnMut([u8; 32]),
     ) -> Result<()> {
-        let scan_start = self.construct_page_key(ns_id, 0, [0u8; 10]);
-        let scan_end = self.construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
+        let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
+        let scan_end = self
+            .key_codec
+            .construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
         self.scan_range_simple(lock, scan_start, scan_end, |kv| {
             if let Ok(x) = <[u8; 32]>::try_from(kv.value()) {
                 cb(x);
@@ -228,8 +231,12 @@ impl Server {
         ns_id: [u8; 10],
         mut cb: impl FnMut([u8; 32]),
     ) -> Result<()> {
-        let scan_start = self.construct_delta_referrer_key(ns_id, [0u8; 32]);
-        let scan_end = self.construct_delta_referrer_key(ns_id, [0xffu8; 32]);
+        let scan_start = self
+            .key_codec
+            .construct_delta_referrer_key(ns_id, [0u8; 32]);
+        let scan_end = self
+            .key_codec
+            .construct_delta_referrer_key(ns_id, [0xffu8; 32]);
         self.scan_range_simple(lock, scan_start, scan_end, |kv| {
             if let Ok(x) = <[u8; 32]>::try_from(kv.value()) {
                 cb(x);
@@ -245,9 +252,10 @@ impl Server {
         mut progress_callback: impl FnMut(String),
     ) -> Result<()> {
         let ns_id_hex = hex::encode(&ns_id);
-        let commit_token_key = self.construct_ns_commit_token_key(ns_id);
+        let commit_token_key = self.key_codec.construct_ns_commit_token_key(ns_id);
         let mut lock = DistributedLock::new(
-            self.construct_nstask_key(ns_id, "delete_unreferenced_content"),
+            self.key_codec
+                .construct_nstask_key(ns_id, "delete_unreferenced_content"),
             "delete_unreferenced_content".into(),
         );
         let me = self.clone();
@@ -301,8 +309,10 @@ impl Server {
 
         // Step 3: scan the content index
         {
-            let scan_start = self.construct_contentindex_key(ns_id, [0u8; 32]);
-            let scan_end = self.construct_contentindex_key(ns_id, [0xffu8; 32]);
+            let scan_start = self.key_codec.construct_contentindex_key(ns_id, [0u8; 32]);
+            let scan_end = self
+                .key_codec
+                .construct_contentindex_key(ns_id, [0xffu8; 32]);
             let mut scan_cursor = scan_start.clone();
             let prefix_len = scan_start.len() - 32;
             let mut count = 0usize;
@@ -393,9 +403,10 @@ impl Server {
                 txn.set_read_version(txn1_rv);
 
                 for hash in &delete_queue {
-                    let ci_key = self.construct_contentindex_key(ns_id, *hash);
-                    let content_key = self.construct_content_key(ns_id, *hash);
-                    let delta_referrer_key = self.construct_delta_referrer_key(ns_id, *hash);
+                    let ci_key = self.key_codec.construct_contentindex_key(ns_id, *hash);
+                    let content_key = self.key_codec.construct_content_key(ns_id, *hash);
+                    let delta_referrer_key =
+                        self.key_codec.construct_delta_referrer_key(ns_id, *hash);
 
                     // 3e. Add the CAM index of the remaining pages to the conflict set.
                     txn.add_conflict_range(
