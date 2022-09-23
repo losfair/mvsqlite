@@ -443,7 +443,6 @@ jobs:
     needs:
     - build
     - stress
-    - stress-content-cache
     - stress-buggify
     - stress-small-gc-batch
     - stress-gc-nofresh
