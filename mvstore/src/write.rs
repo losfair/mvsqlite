@@ -1,5 +1,9 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime},
+};
 
+use blake3::Hash;
 use foundationdb::{options::MutationType, Transaction};
 
 use crate::{
@@ -25,6 +29,14 @@ pub struct WriteResponse {
 }
 
 pub struct WriteApplier<'a> {
+    txn: &'a Transaction,
+    ns_id: [u8; 10],
+    key_codec: &'a KeyCodec,
+    now: Duration,
+    seen_hashes: HashSet<Hash>,
+}
+
+pub struct WriteApplierContext<'a> {
     pub txn: &'a Transaction,
     pub ns_id: [u8; 10],
     pub key_codec: &'a KeyCodec,
@@ -32,7 +44,17 @@ pub struct WriteApplier<'a> {
 }
 
 impl<'a> WriteApplier<'a> {
-    pub async fn apply_write(&self, write_req: &WriteRequest<'a>) -> Option<WriteResponse> {
+    pub fn new(ctx: WriteApplierContext<'a>) -> Self {
+        Self {
+            txn: ctx.txn,
+            ns_id: ctx.ns_id,
+            key_codec: ctx.key_codec,
+            now: ctx.now,
+            seen_hashes: HashSet::new(),
+        }
+    }
+
+    pub async fn apply_write<'b>(&mut self, write_req: &WriteRequest<'b>) -> Option<WriteResponse> {
         if write_req.data.len() > MAX_PAGE_SIZE {
             tracing::warn!(
                 ns = hex::encode(&self.ns_id),
@@ -43,6 +65,15 @@ impl<'a> WriteApplier<'a> {
             return None;
         }
         let hash = blake3::hash(write_req.data);
+
+        // Writing a same hash twice in the same transaction will fail because
+        // we cannot read from a key previously written with `SetVersionstampedValue`.
+        if self.seen_hashes.contains(&hash) {
+            return Some(WriteResponse {
+                hash: hash.as_bytes().to_vec(),
+            });
+        }
+
         let content_key = self
             .key_codec
             .construct_content_key(self.ns_id, *hash.as_bytes());
@@ -123,6 +154,7 @@ impl<'a> WriteApplier<'a> {
             &ContentIndex::generate_mutation_payload(self.now),
             MutationType::SetVersionstampedValue,
         );
+        self.seen_hashes.insert(hash);
         Some(WriteResponse {
             hash: hash.as_bytes().to_vec(),
         })

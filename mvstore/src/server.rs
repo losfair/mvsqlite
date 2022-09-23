@@ -36,7 +36,7 @@ use crate::{
     page::Page,
     replica::ReplicaManager,
     util::{decode_version, generate_suffix_versionstamp_atomic_op},
-    write::{WriteApplier, WriteRequest, WriteResponse},
+    write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
 };
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
@@ -1035,6 +1035,12 @@ impl Server {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap();
                 tokio::spawn(async move {
+                    let mut applier = WriteApplier::new(WriteApplierContext {
+                        txn: &txn,
+                        ns_id,
+                        key_codec: &me.key_codec,
+                        now,
+                    });
                     loop {
                         let message = match body.next().await {
                             Some(Ok(x)) => x,
@@ -1080,12 +1086,6 @@ impl Server {
                                 tracing::warn!(ns = ns_id_hex, error = %e, "invalid message");
                                 break;
                             }
-                        };
-                        let applier = WriteApplier {
-                            txn: &txn,
-                            ns_id,
-                            key_codec: &me.key_codec,
-                            now,
                         };
                         let res = applier.apply_write(&write_req).await;
                         let res = match res {
