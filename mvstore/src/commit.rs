@@ -13,7 +13,12 @@ use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use rand::RngCore;
 
-use crate::server::{decode_version, generate_suffix_versionstamp_atomic_op, ContentIndex, Server};
+use crate::{
+    delta::reader::DeltaReader,
+    server::Server,
+    util::ContentIndex,
+    util::{decode_version, generate_suffix_versionstamp_atomic_op},
+};
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
 pub static PLCC_READ_SET_SIZE_THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
@@ -88,7 +93,9 @@ impl Server {
         let mut phase_1_ci_get_futures = FuturesOrdered::new();
         for ns in ctx.namespaces.iter() {
             for (_, page_hash) in &ns.index_writes {
-                let content_index_key = self.construct_contentindex_key(ns.ns_id, *page_hash);
+                let content_index_key = self
+                    .key_codec
+                    .construct_contentindex_key(ns.ns_id, *page_hash);
                 phase_1_ci_get_futures.push(txn.get(&content_index_key, false));
             }
         }
@@ -103,7 +110,7 @@ impl Server {
             let commit_token_keys = ctx
                 .namespaces
                 .iter()
-                .map(|x| self.construct_ns_commit_token_key(x.ns_id))
+                .map(|x| self.key_codec.construct_ns_commit_token_key(x.ns_id))
                 .collect::<Vec<_>>();
             for k in &commit_token_keys {
                 txn.set(k, &commit_token);
@@ -129,7 +136,7 @@ impl Server {
 
         for ns in ctx.namespaces {
             if let Some(md) = &ns.metadata {
-                let metadata_key = self.construct_nsmd_key(ns.ns_id);
+                let metadata_key = self.key_codec.construct_nsmd_key(ns.ns_id);
                 txn.set(&metadata_key, md.as_bytes());
             }
 
@@ -139,7 +146,8 @@ impl Server {
 
             // Idempotency & non-plcc conflict check
             {
-                let last_write_version_key = self.construct_last_write_version_key(ns.ns_id);
+                let last_write_version_key =
+                    self.key_codec.construct_last_write_version_key(ns.ns_id);
 
                 // We need to go through the read-lwv path in the following cases:
                 //
@@ -183,9 +191,15 @@ impl Server {
 
             // Fine-grained conflict check
             if plcc_enable_ns {
+                let reader = DeltaReader {
+                    txn: &txn,
+                    key_codec: &self.key_codec,
+                    ns_id: ns.ns_id,
+                    replica_manager: None,
+                };
                 let mut fut_list = FuturesOrdered::new();
                 for &page in &ns.read_set {
-                    let read_page_hash_fut = self.read_page_hash(&txn, ns.ns_id, page, None, false);
+                    let read_page_hash_fut = reader.read_page_hash(page, None, false);
                     fut_list.push(async move { (page, read_page_hash_fut.await) });
                 }
 
@@ -207,9 +221,13 @@ impl Server {
             }
 
             for (page_index, page_hash) in &ns.index_writes {
-                let page_key_template = self.construct_page_key(ns.ns_id, *page_index, [0u8; 10]);
+                let page_key_template =
+                    self.key_codec
+                        .construct_page_key(ns.ns_id, *page_index, [0u8; 10]);
                 let page_key_atomic_op = generate_suffix_versionstamp_atomic_op(&page_key_template);
-                let ci_key = self.construct_contentindex_key(ns.ns_id, *page_hash);
+                let ci_key = self
+                    .key_codec
+                    .construct_contentindex_key(ns.ns_id, *page_hash);
                 let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
                 if multi_phase {
                     txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
@@ -227,13 +245,21 @@ impl Server {
             }
             if multi_phase {
                 txn.add_conflict_range(
-                    &self.construct_page_key(ns.ns_id, std::u32::MIN, [0u8; 10]),
-                    &self.construct_page_key(ns.ns_id, std::u32::MAX, [0xffu8; 10]),
+                    &self
+                        .key_codec
+                        .construct_page_key(ns.ns_id, std::u32::MIN, [0u8; 10]),
+                    &self
+                        .key_codec
+                        .construct_page_key(ns.ns_id, std::u32::MAX, [0xffu8; 10]),
                     ConflictRangeType::Write,
                 )?;
                 txn.add_conflict_range(
-                    &self.construct_contentindex_key(ns.ns_id, [0u8; 32]),
-                    &self.construct_contentindex_key(ns.ns_id, [0xffu8; 32]),
+                    &self
+                        .key_codec
+                        .construct_contentindex_key(ns.ns_id, [0u8; 32]),
+                    &self
+                        .key_codec
+                        .construct_contentindex_key(ns.ns_id, [0xffu8; 32]),
                     ConflictRangeType::Write,
                 )?;
             }
@@ -251,7 +277,7 @@ impl Server {
             }
 
             let changelog_atomic_op_key = generate_suffix_versionstamp_atomic_op(
-                &self.construct_changelog_key(ns.ns_id, [0u8; 10]),
+                &self.key_codec.construct_changelog_key(ns.ns_id, [0u8; 10]),
             );
             txn.atomic_op(
                 &changelog_atomic_op_key,

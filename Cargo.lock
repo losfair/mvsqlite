@@ -866,6 +866,7 @@ dependencies = [
  "atomic-polyfill",
  "hash32",
  "rustc_version 0.4.0",
+ "serde",
  "spin 0.9.4",
  "stable_deref_trait",
 ]

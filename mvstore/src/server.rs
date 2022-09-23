@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     future::FdbValues,
-    options::{ConflictRangeType, MutationType, StreamingMode, TransactionOption},
-    tuple::{pack, unpack},
+    options::{MutationType, StreamingMode, TransactionOption},
+    tuple::unpack,
     Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    path::Path,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::{
     io::AsyncRead,
     sync::{oneshot, Semaphore},
-    task::{block_in_place, JoinHandle},
+    task::JoinHandle,
 };
 use tokio_util::{
     codec::{Decoder, FramedRead, LengthDelimitedCodec},
@@ -29,19 +29,23 @@ use tokio_util::{
 
 use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
-    content_cache::ContentCache,
+    delta::reader::DeltaReader,
+    fixed::FixedString,
+    keys::KeyCodec,
     lock::DistributedLock,
+    page::Page,
+    replica::ReplicaManager,
+    util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    write::{WriteApplier, WriteRequest, WriteResponse},
 };
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
-const MAX_PAGE_SIZE: usize = 32768;
 const MAX_PAGES_PER_BATCH_READ: usize = 200;
 const MAX_READ_CONCURRENCY: usize = 50;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
-const BACKUP_AGENT_PREFIX: &[u8] = b"\xff\x02/db-backup-agent/";
 
 enum GetError {
     NotFound,
@@ -50,16 +54,13 @@ enum GetError {
 
 pub struct Server {
     pub db: Database,
-    pub raw_data_prefix: Vec<u8>,
-    pub metadata_prefix: String,
+
+    pub key_codec: Arc<KeyCodec>,
 
     nskey_cache: Cache<String, [u8; 10]>,
     read_version_cache: Cache<[u8; 10], i64>,
     pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
-    content_cache: Option<ContentCache>,
-
-    pub read_only: bool,
-    pub dr_uid: Option<Vec<u8>>,
+    pub replica_manager: Option<ReplicaManager>,
 }
 
 pub struct ServerConfig {
@@ -68,8 +69,6 @@ pub struct ServerConfig {
     pub metadata_prefix: String,
     pub read_only: bool,
     pub dr_tag: String,
-    pub content_cache: Option<String>,
-    pub content_cache_size: u64,
 }
 
 #[derive(Deserialize)]
@@ -84,22 +83,8 @@ pub struct ReadRequest<'a> {
 
 #[derive(Serialize)]
 pub struct ReadResponse {
-    pub version: String,
+    pub version: FixedString,
     pub data: Bytes,
-}
-
-#[derive(Deserialize)]
-pub struct WriteRequest<'a> {
-    #[serde(with = "serde_bytes")]
-    pub data: &'a [u8],
-
-    pub delta_base: Option<u32>,
-}
-
-#[derive(Serialize)]
-pub struct WriteResponse<'a> {
-    #[serde(with = "serde_bytes")]
-    pub hash: &'a [u8],
 }
 
 #[derive(Deserialize)]
@@ -181,32 +166,6 @@ pub struct AdminDeleteUnreferencedContentInNamespaceRequest {
     pub apply: bool,
 }
 
-pub struct Page {
-    pub version: String,
-    pub data: Bytes,
-}
-
-#[derive(Default)]
-pub struct DecodedPage {
-    pub data: Vec<u8>,
-}
-
-const PAGE_ENCODING_NONE: u8 = 0;
-const PAGE_ENCODING_ZSTD: u8 = 1;
-const PAGE_ENCODING_DELTA: u8 = 2;
-
-impl Page {
-    fn compress_zstd(data: &[u8]) -> Vec<u8> {
-        let max_compressed_size = zstd::zstd_safe::compress_bound(data.len());
-        let mut buf = vec![0u8; max_compressed_size + 1];
-        buf[0] = PAGE_ENCODING_ZSTD;
-        let compressed_size = zstd::bulk::compress_to_buffer(data, &mut buf[1..], 0)
-            .expect("compress_to_buffer failed");
-        buf.truncate(compressed_size + 1);
-        buf
-    }
-}
-
 impl Server {
     pub async fn open(config: ServerConfig) -> Result<Arc<Self>> {
         let db = Database::new(Some(config.cluster.as_str()))
@@ -214,34 +173,17 @@ impl Server {
         let raw_data_prefix = config.raw_data_prefix.as_bytes().to_vec();
 
         // Read DR replica UID
-        let dr_uid = if config.read_only {
-            let tuple = pack(&(&b"tagname"[..], config.dr_tag.as_bytes()));
-            let key = BACKUP_AGENT_PREFIX
-                .iter()
-                .chain(&tuple)
-                .copied()
-                .collect::<Vec<_>>();
-            let txn = db.create_trx()?;
-            txn.set_option(TransactionOption::ReadLockAware).unwrap();
-            txn.set_option(TransactionOption::ReadSystemKeys).unwrap();
-            let uid = txn
-                .get(&key, true)
-                .await?
-                .with_context(|| "DR tag not found")?
-                .to_vec();
-            tracing::info!(
-                dr_tag = config.dr_tag,
-                dr_uid = hex::encode(&uid),
-                "dr replica mode enabled"
-            );
-            Some(uid)
+        let replica_manager = if config.read_only {
+            Some(ReplicaManager::new(&db, &config.dr_tag).await?)
         } else {
             None
         };
         Ok(Arc::new(Self {
             db,
-            raw_data_prefix,
-            metadata_prefix: config.metadata_prefix,
+            key_codec: Arc::new(KeyCodec {
+                raw_data_prefix,
+                metadata_prefix: config.metadata_prefix,
+            }),
             nskey_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(120))
                 .time_to_idle(Duration::from_secs(5))
@@ -257,42 +199,8 @@ impl Server {
             read_version_and_nsid_to_lwv_cache: Cache::builder()
                 .time_to_idle(Duration::from_secs(2))
                 .build(),
-            content_cache: if let Some(path) = &config.content_cache {
-                tracing::info!(
-                    path,
-                    size = config.content_cache_size,
-                    "content cache enabled"
-                );
-                Some(
-                    ContentCache::new(Path::new(path), config.content_cache_size)
-                        .with_context(|| "failed to initialize content cache")?,
-                )
-            } else {
-                None
-            },
-            read_only: config.read_only,
-            dr_uid,
+            replica_manager,
         }))
-    }
-
-    async fn read_dr_replica_version(&self, txn: &Transaction) -> Result<i64> {
-        let dr_uid = self
-            .dr_uid
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no dr uid"))?
-            .as_slice();
-        let tuple = pack(&(&b"state"[..], dr_uid, &b"last_begin_version"[..]));
-        let key = BACKUP_AGENT_PREFIX
-            .iter()
-            .chain(&tuple)
-            .copied()
-            .collect::<Vec<_>>();
-        txn.set_option(TransactionOption::ReadSystemKeys).unwrap();
-        let value = txn.get(&key, true).await?;
-        match value {
-            Some(x) if x.len() == 8 => Ok(i64::from_le_bytes(x[..].try_into().unwrap())),
-            _ => anyhow::bail!("bad last begin version"),
-        }
     }
 
     pub async fn serve_admin_api(
@@ -318,7 +226,7 @@ impl Server {
             "/api/create_namespace" => {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.construct_nskey_key(&body.key);
+                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
                 let mut txn = self.db.create_trx()?;
 
@@ -329,8 +237,9 @@ impl Server {
                             .body(Body::from("this key already exists\n"))?);
                     }
 
-                    let nsmd_atomic_op_key =
-                        generate_suffix_versionstamp_atomic_op(&self.construct_nsmd_key([0u8; 10]));
+                    let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                        &self.key_codec.construct_nsmd_key([0u8; 10]),
+                    );
                     let nskey_atomic_op_value = [0u8; 14];
                     txn.atomic_op(
                         &nsmd_atomic_op_key,
@@ -366,8 +275,8 @@ impl Server {
             "/api/rename_namespace" => {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
                 let body: AdminRenameNamespaceRequest = serde_json::from_slice(&body)?;
-                let old_nskey_key = self.construct_nskey_key(&body.old_key);
-                let new_nskey_key = self.construct_nskey_key(&body.new_key);
+                let old_nskey_key = self.key_codec.construct_nskey_key(&body.old_key);
+                let new_nskey_key = self.key_codec.construct_nskey_key(&body.new_key);
 
                 let mut txn = self.db.create_trx()?;
 
@@ -411,7 +320,7 @@ impl Server {
             "/api/delete_namespace" => {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
                 let body: AdminDeleteNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.construct_nskey_key(&body.key);
+                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
                 let mut txn = self.db.create_trx()?;
 
@@ -426,14 +335,14 @@ impl Server {
                     };
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
-                    let ns_data_start = self.construct_ns_data_prefix(ns_id);
+                    let ns_data_start = self.key_codec.construct_ns_data_prefix(ns_id);
                     let mut ns_data_end = ns_data_start.clone();
                     ns_data_end.push(0xff).unwrap();
 
                     txn.clear_range(&ns_data_start, &ns_data_end);
                     txn.clear(&nskey_key);
 
-                    let nsmd_key = self.construct_nsmd_key(ns_id);
+                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
                     match txn.commit().await {
                         Ok(_) => {
@@ -459,7 +368,7 @@ impl Server {
             "/api/truncate_namespace" => {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
                 let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.construct_nskey_key(&body.key);
+                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
                 let txn = self.db.create_trx()?;
                 let ns_id = match txn.get(&nskey_key, false).await? {
@@ -534,7 +443,7 @@ impl Server {
                 let body = hyper::body::to_bytes(req.body_mut()).await?;
                 let body: AdminDeleteUnreferencedContentInNamespaceRequest =
                     serde_json::from_slice(&body)?;
-                let nskey_key = self.construct_nskey_key(&body.key);
+                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
                 let txn = self.db.create_trx()?;
                 let ns_id = match txn.get(&nskey_key, false).await? {
@@ -612,8 +521,8 @@ impl Server {
                     .unwrap_or_else(HashMap::new);
 
                 let text_prefix = query.get("prefix").map(|x| x.as_str()).unwrap_or_default();
-                let start = self.construct_nskey_key(text_prefix);
-                let key_prefix = self.construct_nskey_prefix();
+                let start = self.key_codec.construct_nskey_key(text_prefix);
+                let key_prefix = self.key_codec.construct_nskey_prefix();
                 let mut cursor = start.clone();
                 let mut end = start.clone();
                 *end.last_mut().unwrap() = 0xff;
@@ -713,7 +622,7 @@ impl Server {
 
     async fn globaltask_timekeeper(self: Arc<Self>) {
         let mut lock = DistributedLock::new(
-            self.construct_globaltask_key("timekeeper"),
+            self.key_codec.construct_globaltask_key("timekeeper"),
             "timekeeper".into(),
         );
         'outer: loop {
@@ -751,7 +660,7 @@ impl Server {
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
-                    let key = self.construct_time2version_key(now);
+                    let key = self.key_codec.construct_time2version_key(now);
                     let value = [0u8; 14];
                     txn.atomic_op(&key, &value, MutationType::SetVersionstampedValue);
                     match txn.commit().await {
@@ -807,10 +716,13 @@ impl Server {
                 let txn = self.db.create_trx();
                 match txn {
                     Ok(txn) => {
-                        if self.read_only {
+                        if self.is_read_only() {
                             txn.set_option(TransactionOption::ReadLockAware).unwrap();
                         }
-                        match txn.get(&self.construct_nskey_key(nskey), false).await {
+                        match txn
+                            .get(&self.key_codec.construct_nskey_key(nskey), false)
+                            .await
+                        {
                             Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
                                 .with_context(|| "invalid namespace id")
                                 .map_err(GetError::Other),
@@ -884,21 +796,10 @@ impl Server {
         }
     }
 
-    async fn get_read_version_as_versionstamp(&self, txn: &Transaction) -> Result<[u8; 10]> {
-        let read_version = txn.get_read_version().await? as u64;
-        let mut buf = [0u8; 10];
-        buf[0..8].copy_from_slice(&read_version.to_be_bytes());
-
-        // Now we can observe all changes with `committed_version == read_version`.
-        buf[8] = 255;
-        buf[9] = 255;
-        Ok(buf)
-    }
-
     async fn create_versioned_read_txn(&self, version: &str) -> Result<Transaction> {
         let version = decode_version(version)?;
         let txn = self.db.create_trx()?;
-        if self.read_only {
+        if self.is_read_only() {
             txn.set_option(TransactionOption::ReadLockAware).unwrap();
         }
         let mut grv_called = false;
@@ -914,60 +815,6 @@ impl Server {
             txn.set_read_version(fdb_rv);
         }
         Ok(txn)
-    }
-
-    async fn get_page_content_decoded_snapshot(
-        &self,
-        txn: &Transaction,
-        ns_id: [u8; 10],
-        hash: [u8; 32],
-    ) -> Result<Option<Bytes>> {
-        let key = self.construct_content_key(ns_id, hash);
-        let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
-        if let Some(cached) = cached {
-            return Ok(Some(cached));
-        }
-
-        let undecoded = txn.get(&key, true).await?;
-        let undecoded = match undecoded {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-
-        let decoded = self
-            .decode_page_for_read_caching(txn, ns_id, undecoded)
-            .await?;
-        if let Some(cache) = &self.content_cache {
-            cache.set(hash, &decoded);
-        }
-
-        Ok(Some(decoded))
-    }
-
-    async fn get_page_content_decoded_no_delta_snapshot(
-        &self,
-        txn: &Transaction,
-        ns_id: [u8; 10],
-        hash: [u8; 32],
-    ) -> Result<Option<Bytes>> {
-        let key = self.construct_content_key(ns_id, hash);
-        let cached = self.content_cache.as_ref().and_then(|x| x.get(hash));
-        if let Some(cached) = cached {
-            return Ok(Some(cached));
-        }
-
-        let undecoded = txn.get(&key, true).await?;
-        let undecoded = match undecoded {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-
-        let decoded = self.decode_page_no_delta(undecoded).await?;
-        if let Some(cache) = &self.content_cache {
-            cache.set(hash, &decoded);
-        }
-
-        Ok(Some(decoded))
     }
 
     async fn do_serve_data_plane_stage2(
@@ -1011,42 +858,6 @@ impl Server {
                     .status(200)
                     .header("content-type", "application/json")
                     .body(Body::from(stat))?;
-            }
-            "/read" => {
-                let (ns_id, _) = match require_ns_id() {
-                    Ok(x) => x,
-                    Err(x) => return Ok(x),
-                };
-                let query: HashMap<String, String> = uri
-                    .query()
-                    .map(|v| {
-                        url::form_urlencoded::parse(v.as_bytes())
-                            .into_owned()
-                            .collect()
-                    })
-                    .unwrap_or_else(HashMap::new);
-                let page_index = query
-                    .get("page_index")
-                    .with_context(|| "missing page_index")?
-                    .parse::<u32>()
-                    .with_context(|| "invalid page_index")?;
-                let page_version_hex = query
-                    .get("page_version")
-                    .with_context(|| "missing page_version")?;
-                let txn = self.create_versioned_read_txn(page_version_hex).await?;
-                let page = self
-                    .read_page_decoded_snapshot(&txn, ns_id, page_index, &page_version_hex)
-                    .await?;
-                match page {
-                    Some(page) => {
-                        res = Response::builder()
-                            .header("x-page-version", page.version)
-                            .body(Body::from(page.data))?;
-                    }
-                    None => {
-                        res = Response::builder().body(Body::empty())?;
-                    }
-                }
             }
             "/batch/read" => {
                 let (ns_id, ns_id_hex) = match require_ns_id() {
@@ -1110,7 +921,7 @@ impl Server {
                                         }
                                     };
 
-                                    if me.read_only {
+                                    if me.is_read_only() {
                                         txn.set_option(TransactionOption::ReadLockAware).unwrap();
                                     }
 
@@ -1121,10 +932,18 @@ impl Server {
                                             break Err(());
                                         }
                                     };
-                                    let content = me.get_page_content_decoded_snapshot(&txn, ns_id, hash).await;
+
+
+                                    let reader = DeltaReader {
+                                        txn: &txn,
+                                        ns_id,
+                                        key_codec: &me.key_codec,
+                                        replica_manager: me.replica_manager.as_ref(),
+                                    };
+                                    let content = reader.get_page_content_decoded_snapshot(hash).await;
                                     match content {
                                         Ok(Some(x)) => Some(Page {
-                                            version: read_req.version.to_string(),
+                                            version: FixedString::from_str(read_req.version).unwrap_or_default(),
                                             data: x,
                                         }),
                                         Ok(None) => None,
@@ -1198,7 +1017,7 @@ impl Server {
                 });
             }
             "/batch/write" => {
-                if self.read_only {
+                if self.is_read_only() {
                     return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
                 }
 
@@ -1238,7 +1057,7 @@ impl Server {
                                 break;
                             }
                             let payload = match rmp_serde::to_vec_named(&WriteResponse {
-                                hash: b"",
+                                hash: Default::default(),
                             }) {
                                 Ok(x) => x,
                                 Err(e) => {
@@ -1262,95 +1081,19 @@ impl Server {
                                 break;
                             }
                         };
-                        if write_req.data.len() > MAX_PAGE_SIZE {
-                            tracing::warn!(
-                                ns = ns_id_hex,
-                                len = write_req.data.len(),
-                                limit = MAX_PAGE_SIZE,
-                                "page is too large"
-                            );
-                            break;
-                        }
-                        let hash = blake3::hash(write_req.data);
-                        if let Some(cache) = &me.content_cache {
-                            cache.set(*hash.as_bytes(), write_req.data);
-                        }
-                        let content_key = me.construct_content_key(ns_id, *hash.as_bytes());
+                        let applier = WriteApplier {
+                            txn: &txn,
+                            ns_id,
+                            key_codec: &me.key_codec,
+                            now,
+                        };
+                        let res = applier.apply_write(&write_req).await;
+                        let res = match res {
+                            Some(res) => res,
+                            None => break,
+                        };
 
-                        let mut early_completion = false;
-
-                        // This is not only an optimization. Without doing this check it is possible to form
-                        // loops in delta page construction.
-                        match txn.get(&content_key, false).await {
-                            Ok(x) => {
-                                if x.is_some() {
-                                    early_completion = true;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "error getting content");
-                                break;
-                            }
-                        }
-
-                        // Attempt delta-encoding
-                        if !early_completion {
-                            if let Some(delta_base_index) = write_req.delta_base {
-                                match me
-                                    .delta_encode(&txn, ns_id, delta_base_index, &write_req.data)
-                                    .await
-                                {
-                                    Ok(x) => {
-                                        if let Some((x, delta_base_hash)) = x {
-                                            let delta_referrer_key = self
-                                                .construct_delta_referrer_key(
-                                                    ns_id,
-                                                    *hash.as_bytes(),
-                                                );
-                                            txn.set(&content_key, &x);
-                                            txn.set(&delta_referrer_key, &delta_base_hash);
-                                            let base_content_index_key = self
-                                                .construct_contentindex_key(ns_id, delta_base_hash);
-                                            let now = SystemTime::now()
-                                                .duration_since(SystemTime::UNIX_EPOCH)
-                                                .unwrap();
-                                            txn.atomic_op(
-                                                &base_content_index_key,
-                                                &ContentIndex::generate_mutation_payload(now),
-                                                MutationType::SetVersionstampedValue,
-                                            );
-                                            early_completion = true;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            ns = ns_id_hex,
-                                            error = %e,
-                                            "delta encoding failed"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Finally...
-                        if !early_completion {
-                            txn.set(&content_key, &Page::compress_zstd(write_req.data));
-                        }
-
-                        // Set content index
-                        let content_index_key =
-                            self.construct_contentindex_key(ns_id, *hash.as_bytes());
-                        txn.atomic_op(
-                            &content_index_key,
-                            &ContentIndex::generate_mutation_payload(now),
-                            MutationType::SetVersionstampedValue,
-                        );
-
-                        let payload = match rmp_serde::to_vec_named(&WriteResponse {
-                            hash: hash.as_bytes(),
-                        }) {
+                        let payload = match rmp_serde::to_vec_named(&res) {
                             Ok(x) => x,
                             Err(e) => {
                                 tracing::warn!(ns = ns_id_hex, error = %e, "error serializing response");
@@ -1368,7 +1111,7 @@ impl Server {
                 });
             }
             "/batch/commit" => {
-                if self.read_only {
+                if self.is_read_only() {
                     return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
                 }
 
@@ -1513,13 +1256,13 @@ impl Server {
                     .with_context(|| "missing t")?
                     .parse::<u64>()
                     .with_context(|| "invalid t")?;
-                let key = self.construct_time2version_key(time_in_seconds);
-                let lower_bound = self.construct_time2version_key(std::u64::MIN);
-                let upper_bound = self.construct_time2version_key(std::u64::MAX);
-                let prefix = self.construct_time2version_prefix();
+                let key = self.key_codec.construct_time2version_key(time_in_seconds);
+                let lower_bound = self.key_codec.construct_time2version_key(std::u64::MIN);
+                let upper_bound = self.key_codec.construct_time2version_key(std::u64::MAX);
+                let prefix = self.key_codec.construct_time2version_prefix();
                 let txn = self.db.create_trx()?;
 
-                if self.read_only {
+                if self.is_read_only() {
                     txn.set_option(TransactionOption::ReadLockAware).unwrap();
                 }
 
@@ -1585,79 +1328,6 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn read_page_hash(
-        &self,
-        txn: &Transaction,
-        ns_id: [u8; 10],
-        page_index: u32,
-        page_version_hex: Option<&str>,
-        snapshot: bool,
-    ) -> Result<Option<(String, [u8; 32])>> {
-        let page_version = match page_version_hex {
-            Some(x) => decode_version(x)?,
-            None => [0xffu8; 10],
-        };
-        if self.read_only && page_version != [0xffu8; 10] {
-            let current_rv = self.read_dr_replica_version(txn).await?;
-            let requested_rv = i64::from_be_bytes(page_version[0..8].try_into().unwrap());
-            if current_rv < requested_rv {
-                anyhow::bail!("this replica does not have the requested read version");
-            }
-            tracing::debug!(current_rv, requested_rv, "read_page_hash replica read");
-        }
-        let scan_end = self.construct_page_key(ns_id, page_index, page_version);
-        let scan_start = self.construct_page_key(ns_id, page_index, [0u8; 10]);
-        let page_vec = txn
-            .get_range(
-                &RangeOption {
-                    limit: Some(1),
-                    reverse: true,
-                    mode: StreamingMode::Small,
-                    ..RangeOption::from(scan_start.as_slice()..=scan_end.as_slice())
-                },
-                0,
-                true,
-            )
-            .await?;
-        assert!(page_vec.len() <= 1);
-        if page_vec.is_empty() {
-            // The reason we get an empty range is that there is no version of this page. Encode this causality.
-            if !snapshot {
-                txn.add_conflict_range(
-                    &scan_start[..],
-                    &scan_end
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(0u8))
-                        .collect::<Vec<u8>>(),
-                    ConflictRangeType::Read,
-                )?;
-            }
-            Ok(None)
-        } else {
-            let page = page_vec.into_iter().next().unwrap();
-            let key = page.key();
-
-            // The reason we get this page is that there are no more versions after. Encode this causality.
-            if !snapshot {
-                txn.add_conflict_range(
-                    key,
-                    &scan_end
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(0u8))
-                        .collect::<Vec<u8>>(),
-                    ConflictRangeType::Read,
-                )?;
-            }
-
-            let version = hex::encode(&key[key.len() - 10..]);
-            let hash = page.value();
-            let hash = <[u8; 32]>::try_from(hash).with_context(|| "invalid content hash")?;
-            Ok(Some((version, hash)))
-        }
-    }
-
     async fn read_page_decoded_snapshot(
         &self,
         txn: &Transaction,
@@ -1665,180 +1335,28 @@ impl Server {
         page_index: u32,
         page_version_hex: &str,
     ) -> Result<Option<Page>> {
-        let (version, hash) = match self
-            .read_page_hash(txn, ns_id, page_index, Some(page_version_hex), true)
+        let reader = DeltaReader {
+            txn: &txn,
+            ns_id,
+            key_codec: &self.key_codec,
+            replica_manager: self.replica_manager.as_ref(),
+        };
+        let (version, hash) = match reader
+            .read_page_hash(page_index, Some(page_version_hex), true)
             .await?
         {
             Some(x) => x,
             None => return Ok(None),
         };
-        let data = self
-            .get_page_content_decoded_snapshot(txn, ns_id, hash)
+        let data = reader
+            .get_page_content_decoded_snapshot(hash)
             .await?
             .with_context(|| "cannot find content for the provided hash")?;
         Ok(Some(Page { version, data }))
     }
 
-    async fn delta_encode(
-        &self,
-        txn: &Transaction,
-        ns_id: [u8; 10],
-        base_page_index: u32,
-        this_page: &[u8],
-    ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
-        let version_hex = hex::encode(&self.get_read_version_as_versionstamp(&txn).await?);
-
-        let (_, delta_base_hash) = match self
-            .read_page_hash(
-                &txn,
-                ns_id,
-                base_page_index,
-                Some(version_hex.as_str()),
-                false,
-            )
-            .await?
-        {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-        let (base_page, delta_base_hash) = {
-            let base_page_key = self.construct_content_key(ns_id, delta_base_hash);
-            let base = match txn.get(&base_page_key, true).await? {
-                Some(x) => x,
-                None => return Ok(None),
-            };
-            if base.len() == 0 {
-                return Ok(None);
-            }
-            if base[0] == PAGE_ENCODING_DELTA {
-                // Flatten the link
-                if base.len() < 33 {
-                    return Ok(None);
-                }
-                let flattened_base_hash = <[u8; 32]>::try_from(&base[1..33]).unwrap();
-                let flattened_base = match self
-                    .get_page_content_decoded_no_delta_snapshot(txn, ns_id, flattened_base_hash)
-                    .await?
-                {
-                    Some(x) => x,
-                    None => return Ok(None),
-                };
-                tracing::debug!(
-                    from = hex::encode(&delta_base_hash),
-                    to = hex::encode(&flattened_base_hash),
-                    "flattened delta page"
-                );
-                (flattened_base, flattened_base_hash)
-            } else {
-                (self.decode_page_no_delta(base).await?, delta_base_hash)
-            }
-        };
-        if base_page.len() != this_page.len() || this_page.is_empty() {
-            return Ok(None);
-        }
-
-        let num_diff_bytes = base_page
-            .iter()
-            .zip(this_page.iter())
-            .filter(|(b, t)| b != t)
-            .count();
-        if num_diff_bytes >= this_page.len() / 5 {
-            return Ok(None);
-        }
-
-        let xor_image = base_page
-            .iter()
-            .zip(this_page.iter())
-            .map(|(b, t)| b ^ t)
-            .collect::<Vec<_>>();
-        let compressed = zstd::bulk::compress(&xor_image, 0)?;
-        if compressed.len() >= this_page.len() / 3 {
-            return Ok(None);
-        }
-
-        let mut output: Vec<u8> = Vec::with_capacity(1 + 32 + compressed.len());
-        output.push(PAGE_ENCODING_DELTA);
-        output.extend_from_slice(&delta_base_hash);
-        output.extend_from_slice(&compressed);
-
-        tracing::debug!(
-            ns = hex::encode(&ns_id),
-            base = hex::encode(&delta_base_hash),
-            "delta encoded"
-        );
-        Ok(Some((output, delta_base_hash)))
-    }
-
-    async fn decode_page_no_delta<T: AsRef<[u8]> + Send + Sync + 'static>(
-        &self,
-        data_container: T,
-    ) -> Result<Bytes> {
-        let data = data_container.as_ref();
-        if data.len() == 0 {
-            return Ok(Bytes::new());
-        }
-
-        let encode_type = data[0];
-        match encode_type {
-            PAGE_ENCODING_NONE => {
-                // not compressed
-                Ok(Bytes::from(data[1..].to_vec()))
-            }
-            PAGE_ENCODING_ZSTD => {
-                // zstd
-                let data = block_in_place(|| {
-                    zstd::bulk::decompress(&data_container.as_ref()[1..], MAX_PAGE_SIZE)
-                })
-                .with_context(|| "zstd decompress failed")?;
-                Ok(Bytes::from(data))
-            }
-            _ => Err(anyhow::anyhow!(
-                "decode_page_no_delta: unknown page encoding: {}",
-                encode_type
-            )),
-        }
-    }
-
-    async fn decode_page_for_read_caching<T: AsRef<[u8]> + Send + Sync + 'static>(
-        &self,
-        txn: &Transaction,
-        ns_id: [u8; 10],
-        data_container: T,
-    ) -> Result<Bytes> {
-        let data = data_container.as_ref();
-        if data.len() == 0 {
-            return Ok(Bytes::new());
-        }
-
-        let encode_type = data[0];
-        match encode_type {
-            PAGE_ENCODING_DELTA => {
-                if data.len() < 33 {
-                    anyhow::bail!("invalid delta encoding");
-                }
-                let base_page_hash = <[u8; 32]>::try_from(&data[1..33]).unwrap();
-                let base_page = self
-                    .get_page_content_decoded_no_delta_snapshot(txn, ns_id, base_page_hash)
-                    .await?;
-                let base_page = match base_page {
-                    Some(x) => x,
-                    None => anyhow::bail!("base page not found"),
-                };
-                let mut delta_data = block_in_place(|| {
-                    zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)
-                })?;
-                if delta_data.len() != base_page.len() {
-                    anyhow::bail!("delta and base have different sizes");
-                }
-
-                for (i, b) in delta_data.iter_mut().enumerate() {
-                    *b ^= base_page[i];
-                }
-
-                Ok(Bytes::from(delta_data))
-            }
-            _ => self.decode_page_no_delta(data_container).await,
-        }
+    pub fn is_read_only(&self) -> bool {
+        self.replica_manager.is_some()
     }
 }
 
@@ -1857,45 +1375,9 @@ fn new_body_reader(
     reader
 }
 
-pub fn generate_suffix_versionstamp_atomic_op(template: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(template.len() + 4);
-    out.extend_from_slice(template);
-    out.extend_from_slice(&(template.len() as u32 - 10).to_le_bytes());
-    out
-}
-
 fn prepend_length(data: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(data.len() + 4);
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(&data);
     out
-}
-
-pub fn decode_version(version: &str) -> Result<[u8; 10]> {
-    let mut bytes = [0u8; 10];
-    hex::decode_to_slice(version, &mut bytes).with_context(|| "cannot decode version")?;
-    Ok(bytes)
-}
-
-pub struct ContentIndex {
-    pub time: Duration,
-    pub versionstamp: [u8; 10],
-}
-
-impl ContentIndex {
-    pub fn generate_mutation_payload(now: Duration) -> [u8; 22] {
-        let mut buf = [0u8; 22];
-        buf[0..8].copy_from_slice(&now.as_secs().to_be_bytes());
-        buf[18..22].copy_from_slice(&8u32.to_le_bytes()[..]);
-        buf
-    }
-
-    pub fn decode(x: &[u8]) -> Result<Self> {
-        if x.len() != 18 {
-            return Err(anyhow::anyhow!("invalid content index"));
-        }
-        let time = Duration::from_secs(u64::from_be_bytes(x[0..8].try_into().unwrap()));
-        let versionstamp = x[8..18].try_into().unwrap();
-        Ok(Self { time, versionstamp })
-    }
 }

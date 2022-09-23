@@ -6,7 +6,8 @@ use std::{
     },
 };
 
-use crate::server::{decode_version, Server};
+use crate::server::Server;
+use crate::util::decode_version;
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
@@ -28,7 +29,7 @@ pub struct StatResponse {
 impl Server {
     pub async fn stat(&self, ns_id: [u8; 10], from_version: &str) -> Result<StatResponse> {
         let txn = self.db.create_trx()?;
-        if self.read_only {
+        if self.is_read_only() {
             txn.set_option(TransactionOption::ReadLockAware).unwrap();
         }
 
@@ -37,7 +38,7 @@ impl Server {
             .read_version_and_nsid_to_lwv_cache
             .try_get_with((rv, ns_id), async {
                 let mut version = [0u8; 10];
-                let last_write_version_key = self.construct_last_write_version_key(ns_id);
+                let last_write_version_key = self.key_codec.construct_last_write_version_key(ns_id);
                 if let Some(t) = txn
                     .get(&last_write_version_key, false)
                     .await
@@ -62,7 +63,7 @@ impl Server {
         let stat = StatResponse {
             version: hex::encode(&version),
             metadata: "".into(),
-            read_only: self.read_only,
+            read_only: self.is_read_only(),
             interval,
         };
 
@@ -85,8 +86,8 @@ impl Server {
             return Ok(Some(vec![]));
         }
 
-        let start = self.construct_changelog_key(ns_id, from_version);
-        let end = self.construct_changelog_key(ns_id, to_version);
+        let start = self.key_codec.construct_changelog_key(ns_id, from_version);
+        let end = self.key_codec.construct_changelog_key(ns_id, to_version);
         let range = txn
             .get_range(
                 &RangeOption {

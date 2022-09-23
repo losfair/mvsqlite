@@ -1,8 +1,13 @@
 use foundationdb::tuple::pack;
 
-use crate::{fixed_key_vec::FixedKeyVec, server::Server};
+use crate::fixed::FixedKeyVec;
 
-impl Server {
+pub struct KeyCodec {
+    pub metadata_prefix: String,
+    pub raw_data_prefix: Vec<u8>,
+}
+
+impl KeyCodec {
     pub fn construct_nsmd_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nsmd"));
         key.push(0x32);
