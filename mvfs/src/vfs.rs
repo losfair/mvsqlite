@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lru::LruCache;
+use moka::sync::Cache;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -95,7 +95,7 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
+            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -118,7 +118,7 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    page_cache: LruCache<u32, Arc<[u8]>>,
+    page_cache: Cache<u32, Arc<[u8]>>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -230,7 +230,7 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains(*x))
+            .filter(|x| !self.page_cache.contains_key(*x))
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -275,7 +275,7 @@ impl Connection {
     }
 
     fn insert_to_page_cache(&mut self, page_index: u32, buf: Arc<[u8]>) {
-        self.page_cache.put(page_index, buf);
+        self.page_cache.insert(page_index, buf);
     }
 
     pub async fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
@@ -360,7 +360,7 @@ impl Connection {
         if self.fixed_version.is_some() {
             // Disallow write to snapshot
             for index in &dirty_pages {
-                self.page_cache.pop_entry(index);
+                self.page_cache.invalidate(index);
             }
             tracing::warn!(
                 dirty_page_count = dirty_pages.len(),
@@ -381,7 +381,7 @@ impl Connection {
                 if let Some(changelog) = changelog {
                     if !changelog.is_empty() {
                         for &index in changelog {
-                            self.page_cache.pop_entry(&index);
+                            self.page_cache.invalidate(&index);
                         }
                         tracing::info!(
                             count = changelog.len(),
@@ -390,7 +390,7 @@ impl Connection {
                     }
                 } else {
                     // Changelog is not available - do a full flush
-                    self.page_cache.clear();
+                    self.page_cache.invalidate_all();
                     tracing::warn!("non-local concurrent transaction detected, invalidating cache");
                 }
 
@@ -409,7 +409,7 @@ impl Connection {
             }
             CommitOutput::Conflict => {
                 for index in &dirty_pages {
-                    self.page_cache.pop_entry(index);
+                    self.page_cache.invalidate(index);
                 }
                 tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
                 false
@@ -509,7 +509,7 @@ impl Connection {
             }
 
             if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
-                if &**x == &*buf {
+                if &x[..] == buf {
                     tracing::info!(page = page_offset, "identity write ignored");
                     return Ok(());
                 }
@@ -572,7 +572,7 @@ impl Connection {
                 match interval {
                     Some(interval) => {
                         for index in &interval {
-                            self.page_cache.pop_entry(index);
+                            self.page_cache.invalidate(index);
                         }
                         tracing::info!(
                             count = interval.len(),
@@ -580,7 +580,7 @@ impl Connection {
                         );
                     }
                     None => {
-                        self.page_cache.clear();
+                        self.page_cache.invalidate_all();
                         if self.last_known_write_version.is_some() {
                             tracing::warn!("non-local change detected, invalidating cache");
                         }
