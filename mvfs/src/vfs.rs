@@ -20,7 +20,7 @@ static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../templa
 static FIRST_PAGE_TEMPLATE_32K: &'static [u8; 32768] = include_bytes!("../template_32k.db");
 pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
-pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(10);
+pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 pub struct MultiVersionVfs {
     pub data_plane: String,
@@ -95,8 +95,7 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            leaf_page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
-            high_priority_page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
+            page_cache: LruCache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed)),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
@@ -119,8 +118,7 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    high_priority_page_cache: LruCache<u32, Arc<[u8]>>,
-    leaf_page_cache: LruCache<u32, Arc<[u8]>>,
+    page_cache: LruCache<u32, Arc<[u8]>>,
     write_buffer: HashMap<u32, Arc<[u8]>>,
     virtual_version_counter: u32,
 
@@ -196,11 +194,7 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.history.record(page_offset);
 
-        if let Some(x) = &self
-            .leaf_page_cache
-            .get(&page_offset)
-            .or_else(|| self.high_priority_page_cache.get(&page_offset))
-        {
+        if let Some(x) = &self.page_cache.get(&page_offset) {
             buf.copy_from_slice(x);
             tracing::trace!("page cache hit");
             return Ok(());
@@ -236,9 +230,7 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| {
-                !self.leaf_page_cache.contains(*x) && !self.high_priority_page_cache.contains(*x)
-            })
+            .filter(|x| !self.page_cache.contains(*x))
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -283,14 +275,7 @@ impl Connection {
     }
 
     fn insert_to_page_cache(&mut self, page_index: u32, buf: Arc<[u8]>) {
-        // Likely to be a interior b-tree page
-        if buf[0] == 0x02 || buf[0] == 0x05 {
-            self.high_priority_page_cache.put(page_index, buf);
-            self.leaf_page_cache.pop_entry(&page_index);
-        } else {
-            self.leaf_page_cache.put(page_index, Arc::clone(&buf));
-            self.high_priority_page_cache.pop_entry(&page_index);
-        }
+        self.page_cache.put(page_index, buf);
     }
 
     pub async fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
@@ -351,6 +336,93 @@ impl Connection {
 
         self.fixed_version = None;
         Ok(())
+    }
+
+    async fn finalize_transaction(&mut self) -> bool {
+        self.force_flush_write_buffer().await;
+
+        let mut txn = self
+            .txn
+            .take()
+            .expect("did not find transaction for commit");
+
+        let read_version = txn.version().to_string();
+        let ns_key = self.client.config().ns_key.as_str();
+
+        // If it is unlikely that a plcc commit can succeed, disable it locally first to save
+        // bandwidth and prevent message-too-large errors.
+        if txn.read_set_size() > 2000 {
+            txn.disable_read_set();
+        }
+
+        let dirty_pages = txn.written_pages();
+
+        if self.fixed_version.is_some() {
+            // Disallow write to snapshot
+            for index in &dirty_pages {
+                self.page_cache.pop_entry(index);
+            }
+            tracing::warn!(
+                dirty_page_count = dirty_pages.len(),
+                "discarding write to snapshot"
+            );
+            return true;
+        }
+
+        let result = txn.commit(None).await;
+
+        let result = result.expect("transaction commit failed");
+        match result {
+            CommitOutput::Committed(result) => {
+                self.last_known_write_version = Some(result.version.clone());
+                let changelog = result.changelog.get(ns_key);
+
+                // Invalidate page cache
+                if let Some(changelog) = changelog {
+                    if !changelog.is_empty() {
+                        for &index in changelog {
+                            self.page_cache.pop_entry(&index);
+                        }
+                        tracing::info!(
+                            count = changelog.len(),
+                            "non-local concurrent transaction detected, performed partial cache flush"
+                        );
+                    }
+                } else {
+                    // Changelog is not available - do a full flush
+                    self.page_cache.clear();
+                    tracing::warn!("non-local concurrent transaction detected, invalidating cache");
+                }
+
+                self.txn = Some(
+                    self.client
+                        .create_transaction_at_version(&result.version, false),
+                );
+
+                tracing::info!(
+                        version = result.version,
+                        duration = ?result.duration,
+                        num_pages = result.num_pages,
+                        read_version,
+                        "transaction committed");
+                true
+            }
+            CommitOutput::Conflict => {
+                for index in &dirty_pages {
+                    self.page_cache.pop_entry(index);
+                }
+                tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
+                false
+            }
+            CommitOutput::Empty => {
+                tracing::info!("transaction is empty");
+                self.txn = Some(
+                    self.client
+                        .create_transaction_at_version(&read_version, false),
+                );
+                true
+            }
+        }
     }
 }
 
@@ -436,11 +508,7 @@ impl Connection {
                 buf[92..96].copy_from_slice(&[0u8; 4]);
             }
 
-            if let Some(x) = self
-                .leaf_page_cache
-                .get(&(page_offset as u32))
-                .or_else(|| self.high_priority_page_cache.get(&(page_offset as u32)))
-            {
+            if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
                 if &**x == &*buf {
                     tracing::info!(page = page_offset, "identity write ignored");
                     return Ok(());
@@ -467,14 +535,6 @@ impl Connection {
         assert!(lock != LockKind::None);
         if self.lock == lock {
             return Ok(true);
-        }
-
-        if self.fixed_version.is_some() && lock == LockKind::Exclusive {
-            tracing::error!(
-                ns_key = self.client.config().ns_key,
-                "cannot acquire exclusive lock while pinned to a version"
-            );
-            return Ok(false);
         }
 
         if self.txn.is_none() {
@@ -512,8 +572,7 @@ impl Connection {
                 match interval {
                     Some(interval) => {
                         for index in &interval {
-                            self.leaf_page_cache.pop_entry(index);
-                            self.high_priority_page_cache.pop_entry(index);
+                            self.page_cache.pop_entry(index);
                         }
                         tracing::info!(
                             count = interval.len(),
@@ -521,8 +580,7 @@ impl Connection {
                         );
                     }
                     None => {
-                        self.leaf_page_cache.clear();
-                        self.high_priority_page_cache.clear();
+                        self.page_cache.clear();
                         if self.last_known_write_version.is_some() {
                             tracing::warn!("non-local change detected, invalidating cache");
                         }
@@ -552,86 +610,11 @@ impl Connection {
         self.lock = lock;
 
         let reserved_level = LockKind::Reserved.level();
-        let mut commit_ok = true;
-
-        if prev_lock.level() >= reserved_level && lock.level() < reserved_level {
-            // Write
-            self.force_flush_write_buffer().await;
-
-            let mut txn = self
-                .txn
-                .take()
-                .expect("did not find transaction for commit");
-
-            let read_version = txn.version().to_string();
-            let ns_key = self.client.config().ns_key.as_str();
-
-            // If it is unlikely that a plcc commit can succeed, disable it locally first to save
-            // bandwidth and prevent message-too-large errors.
-            if txn.read_set_size() > 2000 {
-                txn.disable_read_set();
-            }
-
-            let dirty_pages = txn.written_pages();
-
-            let result = txn.commit(None).await;
-
-            let result = result.expect("transaction commit failed");
-            match result {
-                CommitOutput::Committed(result) => {
-                    self.last_known_write_version = Some(result.version.clone());
-                    let changelog = result.changelog.get(ns_key);
-
-                    // Invalidate page cache
-                    if let Some(changelog) = changelog {
-                        if !changelog.is_empty() {
-                            for &index in changelog {
-                                self.leaf_page_cache.pop_entry(&index);
-                                self.high_priority_page_cache.pop_entry(&index);
-                            }
-                            tracing::info!(
-                                count = changelog.len(),
-                                "non-local concurrent transaction detected, performed partial cache flush"
-                            );
-                        }
-                    } else {
-                        // Changelog is not available - do a full flush
-                        self.leaf_page_cache.clear();
-                        self.high_priority_page_cache.clear();
-                        tracing::warn!(
-                            "non-local concurrent transaction detected, invalidating cache"
-                        );
-                    }
-
-                    self.txn = Some(
-                        self.client
-                            .create_transaction_at_version(&result.version, false),
-                    );
-
-                    tracing::info!(
-                            version = result.version,
-                            duration = ?result.duration,
-                            num_pages = result.num_pages,
-                            read_version,
-                            "transaction committed");
-                }
-                CommitOutput::Conflict => {
-                    for index in &dirty_pages {
-                        self.leaf_page_cache.pop_entry(index);
-                        self.high_priority_page_cache.pop_entry(index);
-                    }
-                    tracing::warn!(dirty_page_count = dirty_pages.len(), "transaction conflict");
-                    commit_ok = false;
-                }
-                CommitOutput::Empty => {
-                    tracing::info!("transaction is empty");
-                    self.txn = Some(
-                        self.client
-                            .create_transaction_at_version(&read_version, false),
-                    );
-                }
-            }
-        }
+        let commit_ok = if prev_lock.level() >= reserved_level && lock.level() < reserved_level {
+            self.finalize_transaction().await
+        } else {
+            true
+        };
 
         if lock == LockKind::None {
             // All locks dropped
