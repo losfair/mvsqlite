@@ -18,7 +18,17 @@ typedef int (*sqlite3_open_v2_fn)(
     const char *zVfs        /* Name of VFS module to use */
 );
 
+#ifdef MV_STATIC_PATCH
+int real_sqlite3_open_v2(
+    const char *filename,   /* Database filename (UTF-8) */
+    sqlite3 **ppDb,            /* OUT: SQLite db handle */
+    int flags,              /* Flags */
+    const char *zVfs        /* Name of VFS module to use */
+);
+#else
 static sqlite3_open_v2_fn real_sqlite3_open_v2 = NULL;
+#endif
+
 static int mvsqlite_enabled = 0;
 
 void mvsqlite_global_init(void) {
@@ -26,11 +36,13 @@ void mvsqlite_global_init(void) {
 }
 
 static void bootstrap(void) {
+#ifndef MV_STATIC_PATCH
     real_sqlite3_open_v2 = dlsym(RTLD_NEXT, "sqlite3_open_v2");
     if (real_sqlite3_open_v2 == NULL) {
         fprintf(stderr, "Failed to find real sqlite3_open_v2\n");
         exit(1);
     }
+#endif
 
     if(mvsqlite_enabled) {
         init_mvsqlite();

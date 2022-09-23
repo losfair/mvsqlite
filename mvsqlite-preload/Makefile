@@ -10,6 +10,14 @@ build-preload: preload.o shim.o
 build-lib: shim.o
 	ar rcs libmvsqlite.a shim.o
 
+build-patched-sqlite3:
+	$(CC) -O2 -fPIC -shared -o libsqlite3.so \
+		-Wl,-z,noexecstack \
+		-DSQLITE_OMIT_UTF16 \
+		-DMV_STATIC_PATCH \
+		./sqlite3.c ./preload.c ./shim.c \
+			-L../target/release -lmvsqlite -lpthread -ldl -lm
+
 clean:
 	rm -f libmvsqlite_preload.so preload.o shim.o
 
