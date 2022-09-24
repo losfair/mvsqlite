@@ -11,6 +11,7 @@ pub mod vfs;
 use std::{
     ffi::CString,
     sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
 
 use crate::{io_engine::IoEngine, util::get_conn, vfs::MultiVersionVfs};
@@ -78,6 +79,7 @@ fn init_with_options_impl(opts: InitOptions) {
     }
 
     let mut builder = reqwest::ClientBuilder::new();
+    builder = builder.timeout(Duration::from_secs(5));
     if force_http2 {
         builder = builder.http2_prior_knowledge();
     }
