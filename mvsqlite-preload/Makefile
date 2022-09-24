@@ -14,6 +14,8 @@ build-patched-sqlite3:
 	$(CC) -O2 -fPIC -shared -o libsqlite3.so \
 		-Wl,-z,noexecstack \
 		-DSQLITE_OMIT_UTF16 \
+		-DSQLITE_ENABLE_FTS3 \
+		-DSQLITE_ENABLE_FTS4 \
 		-DMV_STATIC_PATCH \
 		./sqlite3.c ./preload.c ./shim.c \
 			-L../target/release -lmvsqlite -lpthread -ldl -lm
