@@ -11,6 +11,7 @@ pub mod vfs;
 use std::{
     ffi::CString,
     sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
 
 use crate::{io_engine::IoEngine, util::get_conn, vfs::MultiVersionVfs};
@@ -77,7 +78,18 @@ fn init_with_options_impl(opts: InitOptions) {
         }
     }
 
+    let timeout_secs = if let Ok(s) = std::env::var("MVSQLITE_HTTP_TIMEOUT_SECS") {
+        let requested = s
+            .parse::<u64>()
+            .expect("MVSQLITE_HTTP_TIMEOUT_SECS must be a u64");
+        tracing::debug!(requested, "configuring http timeout secs");
+        requested
+    } else {
+        10
+    };
+
     let mut builder = reqwest::ClientBuilder::new();
+    builder = builder.timeout(Duration::from_secs(timeout_secs));
     if force_http2 {
         builder = builder.http2_prior_knowledge();
     }
