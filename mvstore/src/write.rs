@@ -124,6 +124,7 @@ impl<'a> WriteApplier<'a> {
                                 &ContentIndex::generate_mutation_payload(now),
                                 MutationType::SetVersionstampedValue,
                             );
+                            self.seen_hashes.insert(delta_base_hash.into());
                             early_completion = true;
                         }
                     }
