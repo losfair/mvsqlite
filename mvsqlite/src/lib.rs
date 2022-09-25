@@ -16,7 +16,7 @@ use std::{
 
 use crate::{io_engine::IoEngine, util::get_conn, vfs::MultiVersionVfs};
 
-pub static VFS_NAME: &'static str = "mv-vfs";
+pub static VFS_NAME: &'static str = "mvsqlite";
 
 static GLOBAL_INIT_DONE: std::sync::Once = std::sync::Once::new();
 
@@ -96,17 +96,33 @@ fn init_with_options_impl(opts: InitOptions) {
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
     let io_engine = Arc::new(IoEngine::new(opts.coroutine));
-    let vfs = MultiVersionVfs {
-        io: io_engine,
+    let http_client = builder.build().expect("failed to build http client");
+
+    let default_vfs = MultiVersionVfs {
+        io: io_engine.clone(),
         inner: mvfs::MultiVersionVfs {
-            data_plane,
+            data_plane: data_plane.clone(),
             sector_size,
-            http_client: builder.build().expect("failed to build http client"),
+            http_client: http_client.clone(),
         },
     };
 
-    sqlite_vfs::register(VFS_NAME, vfs, true).expect("Failed to register VFS");
-    tracing::info!(sector_size = sector_size, "mvsqlite initialized");
+    sqlite_vfs::register(VFS_NAME, default_vfs, true).expect("Failed to register VFS");
+
+    for sector_size in [4096, 8192, 16384, 32768] {
+        let vfs = MultiVersionVfs {
+            io: io_engine.clone(),
+            inner: mvfs::MultiVersionVfs {
+                data_plane: data_plane.clone(),
+                sector_size,
+                http_client: http_client.clone(),
+            },
+        };
+        sqlite_vfs::register(&format!("{}-{}", VFS_NAME, sector_size), vfs, false)
+            .expect("Failed to register VFS");
+    }
+
+    tracing::info!(default_sector_size = sector_size, "mvsqlite initialized");
 }
 
 #[no_mangle]
