@@ -174,7 +174,7 @@ impl Tester {
 
     async fn task(self: Arc<Self>, task_id: usize, iterations: usize) -> Result<()> {
         let mut mem = self.mem.write().await;
-        let mut txn = self.client.create_transaction().await?;
+        let mut txn = self.client.create_transaction(None).await?;
         let mut txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
         drop(mem);
@@ -319,7 +319,9 @@ impl Tester {
 
         if thread_rng().gen_bool(0.5) {
             if let Some(version) = mem.pick_random_version() {
-                let mut txn = self.client.create_transaction_at_version(version, false);
+                let mut txn = self
+                    .client
+                    .create_transaction_at_version(None, version, false);
                 let txn_id = mem.start_transaction(txn.version());
                 self.acquire_version(txn.version());
                 if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
@@ -329,7 +331,7 @@ impl Tester {
             }
         }
 
-        let mut txn = self.client.create_transaction().await?;
+        let mut txn = self.client.create_transaction(None).await?;
         let txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
         if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {

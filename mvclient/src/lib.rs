@@ -160,15 +160,20 @@ impl MultiVersionClient {
         &self.config
     }
 
-    pub async fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
-        self.create_transaction_with_info(None).await.map(|x| x.0)
+    pub async fn create_transaction(self: &Arc<Self>, dp: Option<&Url>) -> Result<Transaction> {
+        self.create_transaction_with_info(dp, None)
+            .await
+            .map(|x| x.0)
     }
 
     pub async fn create_transaction_with_info(
         self: &Arc<Self>,
+        dp: Option<&Url>,
         from_version: Option<&str>,
     ) -> Result<(Transaction, TransactionInfo)> {
-        let mut url = self.config.random_data_plane().clone();
+        let mut url = dp
+            .unwrap_or_else(|| self.config.random_data_plane())
+            .clone();
         url.set_path("/stat");
 
         if let Some(from_version) = from_version {
@@ -194,7 +199,7 @@ impl MultiVersionClient {
             "created transaction"
         );
         Ok((
-            self.create_transaction_at_version(&stat_res.version, stat_res.read_only),
+            self.create_transaction_at_version(dp, &stat_res.version, stat_res.read_only),
             TransactionInfo {
                 metadata: stat_res.metadata,
                 interval: stat_res.interval,
@@ -204,11 +209,13 @@ impl MultiVersionClient {
 
     pub fn create_transaction_at_version(
         self: &Arc<Self>,
+        dp: Option<&Url>,
         version: &str,
         read_only: bool,
     ) -> Transaction {
         let txn = Transaction {
             c: self.clone(),
+            dp: dp.cloned(),
             version: version.into(),
             page_buffer: HashMap::new(),
             async_ctx: Arc::new(TxnAsyncCtx {
@@ -226,6 +233,7 @@ impl MultiVersionClient {
 
     pub async fn apply_commit_intents(
         &self,
+        dp: Option<&Url>,
         intents: &[NamespaceCommitIntent],
     ) -> Result<Option<CommitResult>> {
         if intents.is_empty() {
@@ -233,7 +241,9 @@ impl MultiVersionClient {
         }
 
         let start_time = Instant::now();
-        let mut url = self.config.random_data_plane().clone();
+        let mut url = dp
+            .unwrap_or_else(|| self.config.random_data_plane())
+            .clone();
         url.set_path("/batch/commit");
 
         let mut idempotency_key: [u8; 16] = [0u8; 16];
@@ -301,8 +311,14 @@ impl MultiVersionClient {
         }
     }
 
-    pub async fn time2version(self: &Arc<Self>, timestamp: u64) -> Result<TimeToVersionResponse> {
-        let mut url = self.config.random_data_plane().clone();
+    pub async fn time2version(
+        self: &Arc<Self>,
+        dp: Option<&Url>,
+        timestamp: u64,
+    ) -> Result<TimeToVersionResponse> {
+        let mut url = dp
+            .unwrap_or_else(|| self.config.random_data_plane())
+            .clone();
         url.set_path("/time2version");
         url.query_pairs_mut()
             .append_pair("t", &timestamp.to_string());
@@ -325,6 +341,7 @@ impl MultiVersionClient {
 
 pub struct Transaction {
     c: Arc<MultiVersionClient>,
+    dp: Option<Url>,
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
     async_ctx: Arc<TxnAsyncCtx>,
@@ -403,7 +420,11 @@ impl Transaction {
 
         let mut raw_request: Vec<u8> = Vec::new();
 
-        let mut url = self.c.config.random_data_plane().clone();
+        let mut url = self
+            .dp
+            .as_ref()
+            .unwrap_or_else(|| self.c.config.random_data_plane())
+            .clone();
         url.set_path("/batch/read");
 
         for &page_index in page_id_list {
@@ -460,6 +481,7 @@ impl Transaction {
     }
 
     async fn bg_write_task(
+        dp: Option<Url>,
         c: Arc<MultiVersionClient>,
         _completion_guard: OwnedRwLockReadGuard<()>,
         _sem_permit: OwnedSemaphorePermit,
@@ -471,7 +493,7 @@ impl Transaction {
             return;
         }
 
-        let mut url = c.config.random_data_plane().clone();
+        let mut url = dp.unwrap_or_else(|| c.config.random_data_plane().clone());
         url.set_path("/batch/write");
 
         let mut boff = RandomizedExponentialBackoff::default();
@@ -570,6 +592,7 @@ impl Transaction {
             .unwrap();
         let async_ctx = self.async_ctx.clone();
         tokio::spawn(Self::bg_write_task(
+            self.dp.clone(),
             self.c.clone(),
             completion_guard,
             sem_permit,
@@ -620,10 +643,16 @@ impl Transaction {
             Some(x) => x,
             None => return Ok(CommitOutput::Empty),
         };
-        Ok(match self.c.apply_commit_intents(&[intent]).await? {
-            Some(x) => CommitOutput::Committed(x),
-            None => CommitOutput::Conflict,
-        })
+        Ok(
+            match self
+                .c
+                .apply_commit_intents(self.dp.as_ref(), &[intent])
+                .await?
+            {
+                Some(x) => CommitOutput::Committed(x),
+                None => CommitOutput::Conflict,
+            },
+        )
     }
 }
 

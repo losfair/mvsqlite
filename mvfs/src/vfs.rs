@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use moka::sync::Cache;
+use reqwest::Url;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -29,7 +30,16 @@ pub struct MultiVersionVfs {
 }
 
 impl MultiVersionVfs {
-    pub fn open(&self, db: &str) -> Result<Connection, std::io::Error> {
+    pub fn open(&self, db: &str) -> Result<Connection> {
+        let (dp, db) = if db.starts_with("http://") || db.starts_with("https://") {
+            let url = Url::parse(db)?;
+            let dp = Url::parse(&url.origin().ascii_serialization())?;
+            (Some(dp), url.path().to_string())
+        } else {
+            (None, db.to_string())
+        };
+        let db = db.trim_start_matches("/");
+
         let db_str_segs = db.split("@").collect::<Vec<_>>();
         let (ns_key, fixed_version) = if db_str_segs.len() < 2 {
             (db_str_segs[0], None)
@@ -76,8 +86,7 @@ impl MultiVersionVfs {
                 ns_key_hashproof,
             },
             self.http_client.clone(),
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        )?;
 
         let first_page = match self.sector_size {
             4096 => FIRST_PAGE_TEMPLATE_4K.to_vec(),
@@ -89,6 +98,7 @@ impl MultiVersionVfs {
 
         let conn = Connection {
             client,
+            dp,
             fixed_version,
             txn: None,
             lock: LockKind::None,
@@ -110,6 +120,7 @@ impl MultiVersionVfs {
 
 pub struct Connection {
     client: Arc<MultiVersionClient>,
+    dp: Option<Url>,
     fixed_version: Option<String>,
     txn: Option<Transaction>,
     lock: LockKind,
@@ -314,7 +325,7 @@ impl Connection {
     pub async fn time2version(&mut self, timestamp: u64) -> TimeToVersionResponse {
         let res = self
             .client
-            .time2version(timestamp)
+            .time2version(self.dp.as_ref(), timestamp)
             .await
             .expect("unrecoverable time2version failure");
         res
@@ -394,10 +405,11 @@ impl Connection {
                     tracing::warn!("non-local concurrent transaction detected, invalidating cache");
                 }
 
-                self.txn = Some(
-                    self.client
-                        .create_transaction_at_version(&result.version, false),
-                );
+                self.txn = Some(self.client.create_transaction_at_version(
+                    self.dp.as_ref(),
+                    &result.version,
+                    false,
+                ));
 
                 tracing::info!(
                         version = result.version,
@@ -416,10 +428,11 @@ impl Connection {
             }
             CommitOutput::Empty => {
                 tracing::info!("transaction is empty");
-                self.txn = Some(
-                    self.client
-                        .create_transaction_at_version(&read_version, false),
-                );
+                self.txn = Some(self.client.create_transaction_at_version(
+                    self.dp.as_ref(),
+                    &read_version,
+                    false,
+                ));
                 true
             }
         }
@@ -541,11 +554,14 @@ impl Connection {
             let mut interval: Option<Vec<u32>> = None;
 
             let txn_info = if let Some(version) = &self.fixed_version {
-                Ok(self.client.create_transaction_at_version(version, true))
+                Ok(self
+                    .client
+                    .create_transaction_at_version(self.dp.as_ref(), version, true))
             } else {
                 let client = self.client.clone();
                 let res = client
                     .create_transaction_with_info(
+                        self.dp.as_ref(),
                         self.last_known_write_version.as_ref().map(|x| x.as_str()),
                     )
                     .await;

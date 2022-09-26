@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::ErrorKind, sync::Arc};
 
 use crate::{
     io_engine::IoEngine,
@@ -25,11 +25,10 @@ impl Vfs for MultiVersionVfs {
             return Ok(Box::new(TempFile::new()));
         }
 
-        // Bindings like Sequelize do not like bare SQLite filenames.
-        // So let's allow a fake "root" path!
-        let db = db.trim_start_matches("/");
-
-        let conn = self.inner.open(db)?;
+        let conn = self
+            .inner
+            .open(db)
+            .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
         Ok(Box::new(Connection {
             io: self.io.clone(),
             inner: conn,
