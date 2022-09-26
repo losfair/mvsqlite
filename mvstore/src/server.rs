@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
-    future::FdbValues,
     options::{MutationType, StreamingMode, TransactionOption},
     tuple::unpack,
     Database, FdbError, RangeOption, Transaction,
@@ -35,6 +34,7 @@ use crate::{
     lock::DistributedLock,
     page::Page,
     replica::ReplicaManager,
+    time2version::time2version,
     util::{decode_version, generate_suffix_versionstamp_atomic_op},
     write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
 };
@@ -118,18 +118,6 @@ pub struct CommitRequest<'a> {
 #[derive(Serialize)]
 pub struct CommitResponse {
     pub changelog: HashMap<String, Vec<u32>>,
-}
-
-#[derive(Serialize)]
-pub struct TimeToVersionResponse {
-    pub after: Option<TimeToVersionPoint>,
-    pub not_after: Option<TimeToVersionPoint>,
-}
-
-#[derive(Serialize)]
-pub struct TimeToVersionPoint {
-    pub version: String,
-    pub time: u64,
 }
 
 #[derive(Deserialize)]
@@ -1256,63 +1244,21 @@ impl Server {
                     .with_context(|| "missing t")?
                     .parse::<u64>()
                     .with_context(|| "invalid t")?;
-                let key = self.key_codec.construct_time2version_key(time_in_seconds);
-                let lower_bound = self.key_codec.construct_time2version_key(std::u64::MIN);
-                let upper_bound = self.key_codec.construct_time2version_key(std::u64::MAX);
-                let prefix = self.key_codec.construct_time2version_prefix();
+
                 let txn = self.db.create_trx()?;
 
                 if self.is_read_only() {
                     txn.set_option(TransactionOption::ReadLockAware).unwrap();
                 }
 
-                let after = txn
-                    .get_range(
-                        &RangeOption {
-                            limit: Some(1),
-                            reverse: true,
-                            mode: StreamingMode::Small,
-                            ..RangeOption::from(lower_bound.clone()..key.clone())
-                        },
-                        0,
-                        true,
-                    )
-                    .await?;
-
-                let not_after = txn
-                    .get_range(
-                        &RangeOption {
-                            limit: Some(1),
-                            reverse: false,
-                            mode: StreamingMode::Small,
-                            ..RangeOption::from(key.clone()..upper_bound.clone())
-                        },
-                        0,
-                        true,
-                    )
-                    .await?;
-                let map_it = |x: FdbValues| -> Option<TimeToVersionPoint> {
-                    if x.len() == 0 || x[0].key().len() < prefix.len() {
-                        None
-                    } else {
-                        let item = &x[0];
-                        let time_suffix = &item.key()[prefix.len()..];
-                        match unpack::<u64>(time_suffix) {
-                            Ok(time_secs) => match <[u8; 10]>::try_from(item.value()) {
-                                Ok(version) => Some(TimeToVersionPoint {
-                                    version: hex::encode(&version),
-                                    time: time_secs,
-                                }),
-                                Err(_) => None,
-                            },
-                            Err(_) => None,
-                        }
-                    }
-                };
-                let after = map_it(after);
-                let not_after = map_it(not_after);
-
-                let body = serde_json::to_vec(&TimeToVersionResponse { after, not_after })
+                let ttv_res = time2version(
+                    &txn,
+                    &self.key_codec,
+                    time_in_seconds,
+                    self.replica_manager.as_ref(),
+                )
+                .await?;
+                let body = serde_json::to_vec(&ttv_res)
                     .with_context(|| "cannot serialize time2version response")?;
 
                 res = Response::builder()
