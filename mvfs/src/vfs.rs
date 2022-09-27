@@ -3,6 +3,7 @@ use moka::sync::Cache;
 use reqwest::Url;
 use std::{
     collections::{HashMap, HashSet},
+    io::ErrorKind,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -265,12 +266,16 @@ impl Connection {
                 panic!("read on non-existing page: offset={}", offset);
             }
         } else {
-            if offset == 0 {
-                let actual_page_size =
-                    u16::from_be_bytes(page[16..18].try_into().unwrap()) as usize;
-                if actual_page_size != self.sector_size {
-                    panic!("page size mismatch with sector size. actual page size = {}, sector size = {}", actual_page_size, self.sector_size);
-                }
+            if page.len() != self.sector_size {
+                tracing::error!(
+                    actual = page.len(),
+                    sector_size = self.sector_size,
+                    "page size mismatch"
+                );
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    anyhow::anyhow!("page size mismatch"),
+                ));
             }
             buf.copy_from_slice(&page);
         }
