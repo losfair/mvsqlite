@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use blake3::Hash;
@@ -167,12 +167,9 @@ impl<'a> WriteApplier<'a> {
                                     let base_content_index_key = self
                                         .key_codec
                                         .construct_contentindex_key(self.ns_id, delta_base_hash);
-                                    let now = SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap();
                                     self.txn.atomic_op(
                                         &base_content_index_key,
-                                        &ContentIndex::generate_mutation_payload(now),
+                                        &ContentIndex::generate_mutation_payload(self.now),
                                         MutationType::SetVersionstampedValue,
                                     );
                                     req.early_completion.store(true, Ordering::Relaxed);
