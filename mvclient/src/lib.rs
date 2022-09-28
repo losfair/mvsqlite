@@ -114,6 +114,8 @@ pub struct CommitRequest {
     pub page_index: u32,
     #[serde(with = "serde_bytes")]
     pub hash: Vec<u8>,
+    #[serde(default)]
+    pub data: Option<Bytes>,
 }
 
 #[derive(Deserialize)]
@@ -606,31 +608,48 @@ impl Transaction {
     pub async fn commit_intent(
         &self,
         metadata: Option<String>,
+        fast_writes: &HashMap<u32, Bytes>,
     ) -> Result<Option<NamespaceCommitIntent>> {
         // wait for async completion
         self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
 
-        if self.page_buffer.is_empty() && metadata.is_none() {
+        if self.page_buffer.is_empty() && metadata.is_none() && fast_writes.is_empty() {
             return Ok(None);
         }
+
+        let total_num_pages = self.page_buffer.len() + fast_writes.len();
 
         let mut out = NamespaceCommitIntent {
             init: CommitNamespaceInit {
                 version: self.version.clone(),
                 metadata,
-                num_pages: self.page_buffer.len() as u32,
+                num_pages: total_num_pages as u32,
                 ns_key: self.c.config.ns_key.clone(),
                 ns_key_hashproof: self.c.config.ns_key_hashproof.clone(),
                 read_set: self.read_set.as_ref().map(|x| x.lock().unwrap().clone()),
             },
-            requests: Vec::with_capacity(self.page_buffer.len()),
+            requests: Vec::with_capacity(total_num_pages),
         };
 
+        for (&page_index, data) in fast_writes {
+            let req = CommitRequest {
+                page_index,
+                hash: blake3::hash(data).as_bytes().to_vec(),
+                data: Some(data.clone()),
+            };
+            out.requests.push(req);
+        }
+
         for (&page_index, hash) in self.page_buffer.iter() {
+            if fast_writes.contains_key(&page_index) {
+                continue;
+            }
+
             let req = CommitRequest {
                 page_index,
                 hash: hash.to_vec(),
+                data: None,
             };
             out.requests.push(req);
         }
@@ -638,8 +657,15 @@ impl Transaction {
         Ok(Some(out))
     }
 
-    pub async fn commit(self, metadata: Option<&str>) -> Result<CommitOutput> {
-        let intent = match self.commit_intent(metadata.map(|x| x.to_string())).await? {
+    pub async fn commit(
+        self,
+        metadata: Option<&str>,
+        fast_writes: &HashMap<u32, Bytes>,
+    ) -> Result<CommitOutput> {
+        let intent = match self
+            .commit_intent(metadata.map(|x| x.to_string()), fast_writes)
+            .await?
+        {
             Some(x) => x,
             None => return Ok(CommitOutput::Empty),
         };

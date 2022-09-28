@@ -68,7 +68,7 @@ impl<'a> WriteApplier<'a> {
 
     pub async fn apply_write<'b>(
         &mut self,
-        write_reqs: &[&WriteRequest<'b>],
+        write_reqs: &[WriteRequest<'b>],
     ) -> Option<Vec<WriteResponse>> {
         for req in write_reqs {
             if req.data.len() > MAX_PAGE_SIZE {
@@ -84,7 +84,7 @@ impl<'a> WriteApplier<'a> {
 
         let write_reqs = write_reqs
             .iter()
-            .map(|req| (*req, blake3::hash(req.data)))
+            .map(|req| (req, blake3::hash(req.data)))
             .collect::<Vec<_>>();
         let pregenerated_res = write_reqs
             .iter()

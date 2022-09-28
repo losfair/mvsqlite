@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use moka::sync::Cache;
 use reqwest::Url;
 use std::{
@@ -130,8 +131,8 @@ pub struct Connection {
 
     first_page: Vec<u8>,
 
-    page_cache: Cache<u32, Arc<[u8]>>,
-    write_buffer: HashMap<u32, Arc<[u8]>>,
+    page_cache: Cache<u32, Bytes>,
+    write_buffer: HashMap<u32, Bytes>,
     virtual_version_counter: u32,
 
     last_known_write_version: Option<String>,
@@ -280,17 +281,20 @@ impl Connection {
             buf.copy_from_slice(&page);
         }
 
-        self.insert_to_page_cache(page_offset, Arc::from(&*buf));
+        self.insert_to_page_cache(page_offset, Bytes::copy_from_slice(&*buf));
 
         for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
             if *their_index != 0 && !maybe_other_page.is_empty() {
-                self.insert_to_page_cache(*their_index, Arc::from(&maybe_other_page[..]));
+                self.insert_to_page_cache(
+                    *their_index,
+                    Bytes::copy_from_slice(&maybe_other_page[..]),
+                );
             }
         }
         Ok(())
     }
 
-    fn insert_to_page_cache(&mut self, page_index: u32, buf: Arc<[u8]>) {
+    fn insert_to_page_cache(&mut self, page_index: u32, buf: Bytes) {
         self.page_cache.insert(page_index, buf);
     }
 
@@ -355,7 +359,9 @@ impl Connection {
     }
 
     async fn finalize_transaction(&mut self) -> bool {
-        self.force_flush_write_buffer().await;
+        if self.write_buffer.len() > WRITE_CHUNK_SIZE.load(Ordering::Relaxed) {
+            self.force_flush_write_buffer().await;
+        }
 
         let mut txn = self
             .txn
@@ -378,6 +384,7 @@ impl Connection {
             for index in &dirty_pages {
                 self.page_cache.invalidate(index);
             }
+            self.write_buffer.clear();
             tracing::warn!(
                 dirty_page_count = dirty_pages.len(),
                 "discarding write to snapshot"
@@ -385,7 +392,9 @@ impl Connection {
             return true;
         }
 
-        let result = txn.commit(None).await;
+        let fast_write_size = self.write_buffer.len();
+        let result = txn.commit(None, &self.write_buffer).await;
+        self.write_buffer.clear();
 
         let result = result.expect("transaction commit failed");
         match result {
@@ -420,6 +429,7 @@ impl Connection {
                         version = result.version,
                         duration = ?result.duration,
                         num_pages = result.num_pages,
+                        fast_write_size,
                         read_version,
                         "transaction committed");
                 true
@@ -499,8 +509,7 @@ impl Connection {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
 
-        let mut buf_arc: Arc<[u8]> = Arc::from(buf);
-        let buf = Arc::get_mut(&mut buf_arc).unwrap();
+        let mut buf = buf.to_vec();
         self.history.prev_index = 0;
 
         let page_offset = offset as usize / self.sector_size;
@@ -539,9 +548,10 @@ impl Connection {
             );
         }
 
-        self.insert_to_page_cache(page_offset as u32, Arc::clone(&buf_arc));
-        self.write_buffer
-            .insert(page_offset as u32, Arc::clone(&buf_arc));
+        let buf = Bytes::from(buf);
+
+        self.insert_to_page_cache(page_offset as u32, buf.clone());
+        self.write_buffer.insert(page_offset as u32, buf);
 
         self.maybe_flush_write_buffer().await;
 
