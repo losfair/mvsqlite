@@ -18,6 +18,7 @@ use crate::{
     server::Server,
     util::ContentIndex,
     util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    write::{WriteApplier, WriteApplierContext, WriteRequest},
 };
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
@@ -37,15 +38,16 @@ pub enum CommitResult {
 pub struct CommitContext<'a> {
     pub idempotency_key: [u8; 16],
     pub allow_skip_idempotency_check: bool,
-    pub namespaces: &'a [CommitNamespaceContext],
+    pub namespaces: &'a [CommitNamespaceContext<'a>],
 }
 
-pub struct CommitNamespaceContext {
+pub struct CommitNamespaceContext<'a> {
     pub ns_key: String,
     pub ns_id: [u8; 10],
     pub client_assumed_version: [u8; 10],
     pub use_read_set: bool,
     pub read_set: HashSet<u32>,
+    pub page_writes: Vec<WriteRequest<'a>>,
     pub index_writes: Vec<(u32, [u8; 32])>,
     pub metadata: Option<String>,
 }
@@ -88,11 +90,38 @@ impl Server {
             "entering commit"
         );
 
-        // Phase 1 - Check page existence
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        // Phase 1 - Fast writes & check page existence
         let mut txn = self.db.create_trx()?;
         let mut phase_1_ci_get_futures = FuturesOrdered::new();
         for ns in ctx.namespaces.iter() {
+            let mut fast_write_hashes: HashSet<[u8; 32]> = HashSet::new();
+            if !ns.page_writes.is_empty() {
+                let mut applier = WriteApplier::new(WriteApplierContext {
+                    txn: &txn,
+                    ns_id: ns.ns_id,
+                    key_codec: &self.key_codec,
+                    now,
+                });
+                let res = applier.apply_write(&ns.page_writes).await;
+                match res {
+                    Some(write_res) => {
+                        for res in &write_res {
+                            fast_write_hashes.insert(res.hash[..].try_into().unwrap());
+                        }
+                    }
+                    None => {
+                        anyhow::bail!("fast write failed");
+                    }
+                }
+            }
             for (_, page_hash) in &ns.index_writes {
+                if fast_write_hashes.contains(page_hash) {
+                    continue;
+                }
                 let content_index_key = self
                     .key_codec
                     .construct_contentindex_key(ns.ns_id, *page_hash);
@@ -129,10 +158,6 @@ impl Server {
         }
 
         // Phase 2 - content index insertion
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
 
         for ns in ctx.namespaces {
             if let Some(md) = &ns.metadata {

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bumpalo::Bump;
 use bytes::{Bytes, BytesMut};
 use foundationdb::{
     options::{MutationType, StreamingMode, TransactionOption},
@@ -32,7 +33,7 @@ use crate::{
     fixed::FixedString,
     keys::KeyCodec,
     lock::DistributedLock,
-    page::Page,
+    page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
     time2version::time2version,
     util::{decode_version, generate_suffix_versionstamp_atomic_op},
@@ -1067,6 +1068,9 @@ impl Server {
                     Vec::with_capacity(commit_global_init.num_namespaces);
                 let mut total_page_count: usize = 0;
 
+                let page_alloc = Bump::new();
+                let mut total_allocated_pages: usize = 0;
+
                 for _ in 0..commit_global_init.num_namespaces {
                     let init = reader
                         .next()
@@ -1103,6 +1107,7 @@ impl Server {
                         ns_key: init.ns_key.to_string(),
                         client_assumed_version,
                         index_writes: Vec::new(),
+                        page_writes: Vec::new(),
                         metadata: init.metadata.map(|x| x.to_string()),
                         use_read_set: init.read_set.is_some(),
                         read_set: init.read_set.take().unwrap_or_default(),
@@ -1124,6 +1129,26 @@ impl Server {
                             commit_req.page_index,
                             <[u8; 32]>::try_from(commit_req.hash).unwrap(),
                         ));
+
+                        if let Some(data) = commit_req.data {
+                            if total_allocated_pages >= MAX_PAGES_PER_BATCH_WRITE {
+                                return Ok(Response::builder()
+                                    .status(413)
+                                    .body(Body::from("too many fast writes"))?);
+                            }
+
+                            if data.len() > MAX_PAGE_SIZE {
+                                return Ok(Response::builder()
+                                    .status(413)
+                                    .body(Body::from("fast write page too large"))?);
+                            }
+                            let data = page_alloc.alloc_slice_copy(data);
+                            ns_ctx.page_writes.push(WriteRequest {
+                                data,
+                                delta_base: Some(commit_req.page_index),
+                            });
+                            total_allocated_pages += 1;
+                        }
                     }
 
                     ns_contexts.push(ns_ctx);
@@ -1279,7 +1304,6 @@ impl Server {
             .map(|x| rmp_serde::from_slice(x))
             .collect::<Result<Vec<_>, _>>()
             .with_context(|| "error deserializing write requests")?;
-        let write_reqs = write_reqs.iter().map(|x| x).collect::<Vec<_>>();
         let mut applier = WriteApplier::new(WriteApplierContext {
             txn: &txn,
             ns_id,

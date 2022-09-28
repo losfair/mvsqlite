@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -262,7 +262,7 @@ impl Tester {
                     let mut mem = self.mem.write().await;
                     let version = txn.version().to_string();
                     let txn_version = txn.version().to_string();
-                    match txn.commit(None).await {
+                    match txn.commit(None, &HashMap::new()).await {
                         Ok(CommitOutput::Committed(info)) => {
                             mem.commit_transaction(txn_id, &info.version, txn_version.as_str());
                         }

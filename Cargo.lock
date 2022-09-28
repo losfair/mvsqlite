@@ -1236,6 +1236,7 @@ name = "mvfs"
 version = "0.1.18"
 dependencies = [
  "anyhow",
+ "bytes",
  "lazy_static",
  "moka",
  "mvclient",
