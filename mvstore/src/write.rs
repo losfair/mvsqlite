@@ -1,13 +1,17 @@
 use std::{
     collections::HashSet,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime},
 };
 
 use blake3::Hash;
 use foundationdb::{options::MutationType, Transaction};
+use futures::{stream::FuturesUnordered, StreamExt};
+use itertools::Itertools;
 
 use crate::{
     delta::writer::DeltaWriter,
+    fixed::FixedKeyVec,
     keys::KeyCodec,
     page::{Page, MAX_PAGE_SIZE},
     util::ContentIndex,
@@ -43,6 +47,14 @@ pub struct WriteApplierContext<'a> {
     pub now: Duration,
 }
 
+struct WriteContext<'a> {
+    req: &'a WriteRequest<'a>,
+    hash: Hash,
+    content_key: FixedKeyVec,
+    content_index_key: FixedKeyVec,
+    early_completion: AtomicBool,
+}
+
 impl<'a> WriteApplier<'a> {
     pub fn new(ctx: WriteApplierContext<'a>) -> Self {
         Self {
@@ -54,110 +66,168 @@ impl<'a> WriteApplier<'a> {
         }
     }
 
-    pub async fn apply_write<'b>(&mut self, write_req: &WriteRequest<'b>) -> Option<WriteResponse> {
-        if write_req.data.len() > MAX_PAGE_SIZE {
-            tracing::warn!(
-                ns = hex::encode(&self.ns_id),
-                len = write_req.data.len(),
-                limit = MAX_PAGE_SIZE,
-                "page is too large"
-            );
-            return None;
-        }
-        let hash = blake3::hash(write_req.data);
-
-        // Writing a same hash twice in the same transaction will fail because
-        // we cannot read from a key previously written with `SetVersionstampedValue`.
-        if self.seen_hashes.contains(&hash) {
-            return Some(WriteResponse {
-                hash: hash.as_bytes().to_vec(),
-            });
-        }
-
-        let content_key = self
-            .key_codec
-            .construct_content_key(self.ns_id, *hash.as_bytes());
-        let content_index_key = self
-            .key_codec
-            .construct_contentindex_key(self.ns_id, *hash.as_bytes());
-
-        let mut early_completion = false;
-
-        // This is not only an optimization. Without doing this check it is possible to form
-        // loops in delta page construction.
-        match self.txn.get(&content_index_key, false).await {
-            Ok(x) => {
-                if x.is_some() {
-                    early_completion = true;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(ns = hex::encode(&self.ns_id), error = %e, "error getting content");
+    pub async fn apply_write<'b>(
+        &mut self,
+        write_reqs: &[&WriteRequest<'b>],
+    ) -> Option<Vec<WriteResponse>> {
+        for req in write_reqs {
+            if req.data.len() > MAX_PAGE_SIZE {
+                tracing::warn!(
+                    ns = hex::encode(&self.ns_id),
+                    len = req.data.len(),
+                    limit = MAX_PAGE_SIZE,
+                    "page is too large"
+                );
                 return None;
             }
         }
 
-        // Attempt delta-encoding
-        if !early_completion {
-            let writer = DeltaWriter {
-                txn: self.txn,
-                ns_id: self.ns_id,
-                key_codec: self.key_codec,
-            };
-            if let Some(delta_base_index) = write_req.delta_base {
-                match writer.delta_encode(delta_base_index, &write_req.data).await {
-                    Ok(x) => {
-                        if let Some((x, delta_base_hash)) = x {
-                            let delta_referrer_key = self
-                                .key_codec
-                                .construct_delta_referrer_key(self.ns_id, *hash.as_bytes());
-                            self.txn.set(&content_key, &x);
-                            self.txn.set(&delta_referrer_key, &delta_base_hash);
-                            let base_content_index_key = self
-                                .key_codec
-                                .construct_contentindex_key(self.ns_id, delta_base_hash);
-                            let now = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap();
-                            self.txn.atomic_op(
-                                &base_content_index_key,
-                                &ContentIndex::generate_mutation_payload(now),
-                                MutationType::SetVersionstampedValue,
-                            );
-                            self.seen_hashes.insert(delta_base_hash.into());
-                            early_completion = true;
+        let write_reqs = write_reqs
+            .iter()
+            .map(|req| (*req, blake3::hash(req.data)))
+            .collect::<Vec<_>>();
+        let pregenerated_res = write_reqs
+            .iter()
+            .map(|req| WriteResponse {
+                hash: req.1.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+
+        // Here we filter by `seen_hashes`, because writing a same hash twice in the same transaction will fail
+        // since we cannot read from a key previously written with `SetVersionstampedValue`.
+        let write_reqs = write_reqs
+            .iter()
+            .dedup_by(|a, b| a.1 == b.1)
+            .filter(|x| !self.seen_hashes.contains(&x.1))
+            .map(|x| WriteContext {
+                req: x.0,
+                hash: x.1,
+                content_key: self
+                    .key_codec
+                    .construct_content_key(self.ns_id, *x.1.as_bytes()),
+                content_index_key: self
+                    .key_codec
+                    .construct_contentindex_key(self.ns_id, *x.1.as_bytes()),
+                early_completion: AtomicBool::new(false),
+            })
+            .collect::<Vec<_>>();
+
+        // This is not only an optimization. Without doing this check it is possible to form
+        // loops in delta page construction.
+        {
+            let mut fut = FuturesUnordered::new();
+            for req in &write_reqs {
+                fut.push(async {
+                    match self.txn.get(&req.content_index_key, false).await {
+                        Ok(x) => {
+                            if x.is_some() {
+                                req.early_completion.store(true, Ordering::Relaxed);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            tracing::warn!(ns = hex::encode(&self.ns_id), error = %e, "error getting content");
+                            Err(())
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            ns = hex::encode(&self.ns_id),
-                            error = %e,
-                            "delta encoding failed"
-                        );
-                        return None;
-                    }
+                });
+            }
+            while let Some(res) = fut.next().await {
+                if res.is_err() {
+                    return None;
                 }
             }
         }
 
+        // Attempt delta-encoding
+        {
+            let mut fut = FuturesUnordered::new();
+            for req in &write_reqs {
+                if req.early_completion.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                fut.push(async {
+                    let writer = DeltaWriter {
+                        txn: self.txn,
+                        ns_id: self.ns_id,
+                        key_codec: self.key_codec,
+                    };
+                    if let Some(delta_base_index) = req.req.delta_base {
+                        match writer.delta_encode(delta_base_index, &req.req.data).await {
+                            Ok(x) => {
+                                if let Some((x, delta_base_hash)) = x {
+                                    let delta_referrer_key =
+                                        self.key_codec.construct_delta_referrer_key(
+                                            self.ns_id,
+                                            *req.hash.as_bytes(),
+                                        );
+                                    self.txn.set(&req.content_key, &x);
+                                    self.txn.set(&delta_referrer_key, &delta_base_hash);
+                                    let base_content_index_key = self
+                                        .key_codec
+                                        .construct_contentindex_key(self.ns_id, delta_base_hash);
+                                    let now = SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap();
+                                    self.txn.atomic_op(
+                                        &base_content_index_key,
+                                        &ContentIndex::generate_mutation_payload(now),
+                                        MutationType::SetVersionstampedValue,
+                                    );
+                                    req.early_completion.store(true, Ordering::Relaxed);
+                                    Ok(Some(delta_base_hash))
+                                } else {
+                                    Ok(None)
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    ns = hex::encode(&self.ns_id),
+                                    error = %e,
+                                    "delta encoding failed"
+                                );
+                                Err(())
+                            }
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                });
+            }
+
+            let mut delta_base_hashes: Vec<Hash> = Vec::new();
+
+            while let Some(delta_base_hash) = fut.next().await {
+                let delta_base_hash = match delta_base_hash {
+                    Ok(x) => x,
+                    Err(()) => return None,
+                };
+                if let Some(delta_base_hash) = delta_base_hash {
+                    delta_base_hashes.push(delta_base_hash.into());
+                }
+            }
+
+            drop(fut);
+            for h in &delta_base_hashes {
+                self.seen_hashes.insert(*h);
+            }
+        }
         // Finally...
-        if !early_completion {
-            self.txn
-                .set(&content_key, &Page::compress_zstd(write_req.data));
+        for req in &write_reqs {
+            if !req.early_completion.load(Ordering::Relaxed) {
+                self.txn
+                    .set(&req.content_key, &Page::compress_zstd(req.req.data));
+            }
+            // Set content index
+            self.txn.atomic_op(
+                &req.content_index_key,
+                &ContentIndex::generate_mutation_payload(self.now),
+                MutationType::SetVersionstampedValue,
+            );
+            self.seen_hashes.insert(req.hash);
         }
 
-        // Set content index
-        let content_index_key = self
-            .key_codec
-            .construct_contentindex_key(self.ns_id, *hash.as_bytes());
-        self.txn.atomic_op(
-            &content_index_key,
-            &ContentIndex::generate_mutation_payload(self.now),
-            MutationType::SetVersionstampedValue,
-        );
-        self.seen_hashes.insert(hash);
-        Some(WriteResponse {
-            hash: hash.as_bytes().to_vec(),
-        })
+        Some(pregenerated_res)
     }
 }
