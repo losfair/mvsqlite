@@ -6,7 +6,7 @@ use foundationdb::{
     Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
-use hyper::{Body, Request, Response};
+use hyper::{body::Sender, Body, Request, Response};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +44,7 @@ const MAX_PAGES_PER_BATCH_READ: usize = 200;
 const MAX_READ_CONCURRENCY: usize = 50;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
+const MAX_PAGES_PER_BATCH_WRITE: usize = 20;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 
@@ -113,6 +114,9 @@ pub struct CommitRequest<'a> {
     pub page_index: u32,
     #[serde(with = "serde_bytes")]
     pub hash: &'a [u8],
+    #[serde(default)]
+    #[serde(with = "serde_bytes")]
+    pub data: Option<&'a [u8]>,
 }
 
 #[derive(Serialize)]
@@ -1014,86 +1018,18 @@ impl Server {
                     Err(x) => return Ok(x),
                 };
                 let body = req.into_body();
-                let mut body = new_body_reader(body);
-                let (mut res_sender, res_body) = Body::channel();
+                let body = new_body_reader(body);
+                let (res_sender, res_body) = Body::channel();
                 res = Response::builder().body(res_body)?;
                 let me = self.clone();
-                let txn = self.db.create_trx()?;
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap();
                 tokio::spawn(async move {
-                    let mut applier = WriteApplier::new(WriteApplierContext {
-                        txn: &txn,
-                        ns_id,
-                        key_codec: &me.key_codec,
-                        now,
-                    });
-                    loop {
-                        let message = match body.next().await {
-                            Some(Ok(x)) => x,
-                            Some(Err(e)) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "client disconnected with error");
-                                break;
-                            }
-                            None => {
-                                tracing::warn!(
-                                    ns = ns_id_hex,
-                                    "client disconnected before completion"
-                                );
-                                break;
-                            }
-                        };
-                        if message.len() == 0 {
-                            // completion
-                            if let Err(e) = txn.commit().await {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "error committing transaction");
-                                break;
-                            }
-                            let payload = match rmp_serde::to_vec_named(&WriteResponse {
-                                hash: Default::default(),
-                            }) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    tracing::warn!(ns = ns_id_hex, error = %e, "error serializing completion");
-                                    break;
-                                }
-                            };
-                            if let Err(e) = res_sender
-                                .send_data(Bytes::from(prepend_length(&payload)))
-                                .await
-                            {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "error sending completion");
-                            }
-                            break;
-                        }
-
-                        let write_req: WriteRequest = match rmp_serde::from_slice(&message) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "invalid message");
-                                break;
-                            }
-                        };
-                        let res = applier.apply_write(&write_req).await;
-                        let res = match res {
-                            Some(res) => res,
-                            None => break,
-                        };
-
-                        let payload = match rmp_serde::to_vec_named(&res) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                tracing::warn!(ns = ns_id_hex, error = %e, "error serializing response");
-                                break;
-                            }
-                        };
-                        if let Err(e) = res_sender
-                            .send_data(Bytes::from(prepend_length(&payload)))
-                            .await
-                        {
-                            tracing::warn!(ns = ns_id_hex, error = %e, "error sending response");
-                            break;
+                    match me.batch_write(ns_id, now, body, res_sender).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(ns = ns_id_hex, error = %e, "error in batch write");
                         }
                     }
                 });
@@ -1303,6 +1239,82 @@ impl Server {
 
     pub fn is_read_only(&self) -> bool {
         self.replica_manager.is_some()
+    }
+
+    async fn batch_write(
+        &self,
+        ns_id: [u8; 10],
+        now: Duration,
+        mut body: FramedRead<
+            impl AsyncRead + Unpin,
+            impl Decoder<Item = BytesMut, Error = std::io::Error>,
+        >,
+        mut res_sender: Sender,
+    ) -> Result<()> {
+        let txn = self.db.create_trx()?;
+        let mut messages: Vec<BytesMut> = Vec::new();
+        loop {
+            let message = match body.next().await {
+                Some(Ok(x)) => x,
+                Some(Err(e)) => {
+                    return Err(anyhow::Error::from(e).context("client disconnected with error"));
+                }
+                None => {
+                    anyhow::bail!("client disconnected before completion");
+                }
+            };
+            if message.len() == 0 {
+                // completion
+                break;
+            }
+
+            if messages.len() > MAX_PAGES_PER_BATCH_WRITE {
+                anyhow::bail!("too many pages in batch write");
+            }
+            messages.push(message);
+        }
+
+        let write_reqs: Vec<WriteRequest> = messages
+            .iter()
+            .map(|x| rmp_serde::from_slice(x))
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| "error deserializing write requests")?;
+        let write_reqs = write_reqs.iter().map(|x| x).collect::<Vec<_>>();
+        let mut applier = WriteApplier::new(WriteApplierContext {
+            txn: &txn,
+            ns_id,
+            key_codec: &self.key_codec,
+            now,
+        });
+        let res = applier.apply_write(&write_reqs).await;
+        let res = match res {
+            Some(x) => x,
+            None => {
+                anyhow::bail!("cannot apply write");
+            }
+        };
+        for res in res {
+            let payload =
+                rmp_serde::to_vec_named(&res).with_context(|| "error serializing response")?;
+            res_sender
+                .send_data(Bytes::from(prepend_length(&payload)))
+                .await
+                .with_context(|| "cannot send response")?;
+        }
+
+        txn.commit()
+            .await
+            .map_err(FdbError::from)
+            .with_context(|| "error committing transaction")?;
+        let payload = rmp_serde::to_vec_named(&WriteResponse {
+            hash: Default::default(),
+        })
+        .with_context(|| "error serializing completion")?;
+        res_sender
+            .send_data(Bytes::from(prepend_length(&payload)))
+            .await
+            .with_context(|| "error sending completion")?;
+        Ok(())
     }
 }
 
