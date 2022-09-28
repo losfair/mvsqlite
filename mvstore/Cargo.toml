@@ -45,3 +45,5 @@ bloom = "0.3.2"
 constant_time_eq = "0.2.4"
 heapless = { version = "0.7", features = ["serde"] }
 lmdb-rkv = "0.14.0"
+bumpalo = "3.11.0"
+itertools = "0.10.5"
