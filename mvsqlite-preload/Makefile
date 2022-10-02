@@ -16,6 +16,10 @@ build-patched-sqlite3:
 		-DSQLITE_OMIT_UTF16 \
 		-DSQLITE_ENABLE_FTS3 \
 		-DSQLITE_ENABLE_FTS4 \
+		-DSQLITE_ENABLE_FTS5 \
+		-DSQLITE_ENABLE_RTREE \
+		-DSQLITE_ENABLE_DBSTAT_VTAB \
+		-DSQLITE_ENABLE_MATH_FUNCTIONS \
 		-DMV_STATIC_PATCH \
 		./sqlite3.c ./preload.c ./shim.c \
 			-L../target/release -lmvsqlite -lpthread -ldl -lm
