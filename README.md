@@ -4,12 +4,10 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 [Documentation](https://github.com/losfair/mvsqlite/wiki/)
 
-**mvSQLite needs your help**: I consider mvSQLite to be *early-stage beta* software. Known high-severity bugs are fixed, I've been running this for a while without problems, but there are not enough tests under more diverse contexts. Testing under different use cases is appreciated, and please open an issue or contact me with the email in my profile if you want to file bug reports or have any kind of suggestions!
-
 - [mvSQLite](#mvsqlite)
   - [Features](#features)
   - [Releases](#releases)
-  - [Demo](#demo)
+  - [Quick reference](#quick-reference)
   - [Try it](#try-it)
   - [Contributing](#contributing)
 
@@ -17,21 +15,17 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 
 - **Full feature-set from SQLite**: mvsqlite integrates with SQLite using either a custom [VFS](https://www.sqlite.org/vfs.html) layer or [FUSE](https://en.wikipedia.org/wiki/Filesystem_in_Userspace) at your choice. Since it is a layer "below" SQLite itself, all of SQLite's features are available.
 - **Time travel**: Checkout the snapshot of your database at any point of time in the past.
-- **Scalable reads and writes**: Optimistic, fine-grained concurrency with [BEGIN CONCURRENT](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)-like semantics. See [this page](https://github.com/losfair/mvsqlite/wiki/Concurrency-and-conflict-check) for details.
+- **Scalable reads and writes**: Optimistic, fine-grained concurrency with [BEGIN CONCURRENT](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)-like semantics.
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
-- **Drop-in addition**: Use either `LD_PRELOAD` or FUSE to plug mvSQLite into your existing apps. [Read the docs](https://github.com/losfair/mvsqlite/wiki/Integration)
+- **Drop-in addition**: Use `LD_PRELOAD` or a patched `libsqlite3.so` to plug mvSQLite into your existing apps. [Read the docs](https://github.com/losfair/mvsqlite/wiki/Integration)
 
 ## Releases
 
 Grab the latest binaries from the [Releases](https://github.com/losfair/mvsqlite/releases) page. You can also [build your own binaries](#contributing) to run on a platform other than x86-64.
 
-## Demo
+## Quick reference
 
-**Time travel: checkout past snapshots**
-
-Use the format `namespace@version` for the database name passed to SQLite:
-
-![time travel](https://img.planet.ink/zhy/2022-07-27-154fef13e84d-207ea4945637b054b98be711396adc94.png)
+Check the single-page [mvSQLite Quick Reference](https://blob.univalent.net/mvsqlite-quick-reference-v0-2.pdf) for common operations with mvSQLite.
 
 ## Try it
 
@@ -47,8 +41,8 @@ sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 Download the binaries:
 
 ```bash
-curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.1.18/libmvsqlite_preload.so
-curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.1.18/mvstore
+curl -L -o ./libmvsqlite_preload.so https://github.com/losfair/mvsqlite/releases/download/v0.2.0/libmvsqlite_preload.so
+curl -L -o ./mvstore https://github.com/losfair/mvsqlite/releases/download/v0.2.0/mvstore
 chmod +x ./mvstore
 ```
 
@@ -58,22 +52,22 @@ Run `mvstore`, the server-side half that should be colocated with the Foundation
 RUST_LOG=info ./mvstore \
   --data-plane 127.0.0.1:7000 \
   --admin-api 127.0.0.1:7001 \
-  --metadata-prefix mvstore-test \
+  --metadata-prefix mvstore \
   --raw-data-prefix m
 ```
 
 Create a namespace with the admin API:
 
 ```bash
-curl http://localhost:7001/api/create_namespace -i -d '{"key":"test","metadata":""}'
+curl http://localhost:7001/api/create_namespace -i -d '{"key":"test"}'
 ```
 
 Build `libsqlite3` and the `sqlite3` CLI: (note that a custom build is only needed here because the `sqlite3` binary shipped on most systems are statically linked to `libsqlite3` and `LD_PRELOAD` don't work)
 
 ```bash
-wget https://www.sqlite.org/2022/sqlite-amalgamation-3390200.zip
-unzip sqlite-amalgamation-3390200.zip
-cd sqlite-amalgamation-3390200
+wget https://www.sqlite.org/2022/sqlite-amalgamation-3390300.zip
+unzip sqlite-amalgamation-3390300.zip
+cd sqlite-amalgamation-3390300
 gcc -O2 -fPIC --shared -o libsqlite3.so ./sqlite3.c -lpthread -ldl -lm
 gcc -O2 -o sqlite3 ./shell.c -L. -lsqlite3
 ```
