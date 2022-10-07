@@ -9,6 +9,7 @@
 
 extern void init_mvsqlite(void);
 extern void init_mvsqlite_connection(sqlite3 *db);
+extern void mvsqlite_autocommit_backoff(sqlite3 *db);
 
 typedef int (*sqlite3_initialize_fn)(void);
 typedef int (*sqlite3_open_v2_fn)(
@@ -17,6 +18,7 @@ typedef int (*sqlite3_open_v2_fn)(
     int flags,              /* Flags */
     const char *zVfs        /* Name of VFS module to use */
 );
+typedef int (*sqlite3_step_fn)(sqlite3_stmt *pStmt);
 
 #ifdef MV_STATIC_PATCH
 int real_sqlite3_open_v2(
@@ -25,8 +27,10 @@ int real_sqlite3_open_v2(
     int flags,              /* Flags */
     const char *zVfs        /* Name of VFS module to use */
 );
+int real_sqlite3_step(sqlite3_stmt *pStmt);
 #else
 static sqlite3_open_v2_fn real_sqlite3_open_v2 = NULL;
+static sqlite3_step_fn real_sqlite3_step = NULL;
 #endif
 
 static int mvsqlite_enabled = 0;
@@ -40,6 +44,12 @@ static void bootstrap(void) {
     real_sqlite3_open_v2 = dlsym(RTLD_NEXT, "sqlite3_open_v2");
     if (real_sqlite3_open_v2 == NULL) {
         fprintf(stderr, "Failed to find real sqlite3_open_v2\n");
+        exit(1);
+    }
+
+    real_sqlite3_step = dlsym(RTLD_NEXT, "sqlite3_step");
+    if (real_sqlite3_step == NULL) {
+        fprintf(stderr, "Failed to find real sqlite3_step\n");
         exit(1);
     }
 #endif
@@ -79,4 +89,20 @@ int sqlite3_open16(
     sqlite3 **ppDb          /* OUT: SQLite db handle */
 ) {
     abort();
+}
+
+int sqlite3_step(sqlite3_stmt *pStmt) {
+    int ret;
+    int autocommit;
+    sqlite3 *db = sqlite3_db_handle(pStmt);
+
+    while (1) {
+        autocommit = sqlite3_get_autocommit(db);
+        ret = real_sqlite3_step(pStmt);
+        if(ret == SQLITE_BUSY && mvsqlite_enabled && autocommit) {
+            mvsqlite_autocommit_backoff(db);
+        } else {
+            return ret;
+        }
+    }
 }
