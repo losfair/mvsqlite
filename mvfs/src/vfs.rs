@@ -377,7 +377,12 @@ impl Connection {
             txn.disable_read_set();
         }
 
-        let dirty_pages = txn.written_pages();
+        let dirty_pages = txn
+            .written_pages()
+            .iter()
+            .copied()
+            .chain(self.write_buffer.keys().copied())
+            .collect::<HashSet<_>>();
 
         if self.fixed_version.is_some() {
             // Disallow write to snapshot
