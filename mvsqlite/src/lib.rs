@@ -330,3 +330,12 @@ unsafe extern "C" fn mv_unpin_version(
         }
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn mvsqlite_autocommit_backoff(db: *mut sqlite_c::sqlite3) {
+    tracing::warn!("autocommit backoff");
+    let conn = get_conn(db, "main");
+    conn.io.run(async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+}
