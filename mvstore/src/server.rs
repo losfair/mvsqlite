@@ -795,15 +795,29 @@ impl Server {
         if self.is_read_only() {
             txn.set_option(TransactionOption::ReadLockAware).unwrap();
         }
+
+        // It's safe to set CRR here. We do our own version check below.
+        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+
         let mut grv_called = false;
         let fdb_rv = self
             .read_version_cache
             .try_get_with(version, async {
                 grv_called = true;
-                txn.get_read_version().await
+                let fdb_rv = txn.get_read_version().await;
+                match fdb_rv {
+                    Ok(fdb_rv) => {
+                        if fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
+                            Err(anyhow::anyhow!("fdb read version older than requested version - causal read fault?"))
+                        } else {
+                            Ok(fdb_rv)
+                        }
+                    },
+                    Err(e) => Err(anyhow::Error::from(e))
+                }
             })
             .await
-            .with_context(|| "cannot get read version")?;
+            .map_err(|e| anyhow::anyhow!("cannot get read version: {}", e))?;
         if !grv_called {
             txn.set_read_version(fdb_rv);
         }
@@ -843,7 +857,12 @@ impl Server {
                     .get("from_version")
                     .map(|x| x.as_str())
                     .unwrap_or_default();
-                let stat = self.stat(ns_id, from_version).await?;
+
+                let crr = query
+                    .get("causal_read_risky")
+                    .map(|x| x.as_str() == "1")
+                    .unwrap_or_default();
+                let stat = self.stat(ns_id, from_version, crr).await?;
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
 
@@ -1212,6 +1231,10 @@ impl Server {
                     txn.set_option(TransactionOption::ReadLockAware).unwrap();
                 }
 
+                // It's safe to set CRR for time2version. Not seeing something written
+                // by the timekeeper is okay.
+                txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+
                 let ttv_res = time2version(
                     &txn,
                     &self.key_codec,
@@ -1277,6 +1300,10 @@ impl Server {
         mut res_sender: Sender,
     ) -> Result<()> {
         let txn = self.db.create_trx()?;
+
+        // It's safe to set CRR for the write path. Seeing stale data doesn't affect correctness.
+        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+
         let mut messages: Vec<BytesMut> = Vec::new();
         loop {
             let message = match body.next().await {

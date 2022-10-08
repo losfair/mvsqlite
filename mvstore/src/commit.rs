@@ -16,8 +16,8 @@ use rand::RngCore;
 use crate::{
     delta::reader::DeltaReader,
     server::Server,
-    util::ContentIndex,
     util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    util::{get_txn_read_version_as_versionstamp, ContentIndex},
     write::{WriteApplier, WriteApplierContext, WriteRequest},
 };
 
@@ -96,8 +96,20 @@ impl Server {
 
         // Phase 1 - Fast writes & check page existence
         let mut txn = self.db.create_trx()?;
+        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+        let txn_rv = get_txn_read_version_as_versionstamp(&txn).await?;
+
         let mut phase_1_ci_get_futures = FuturesOrdered::new();
         for ns in ctx.namespaces.iter() {
+            if txn_rv < ns.client_assumed_version {
+                tracing::error!(
+                    our_version = hex::encode(&txn_rv),
+                    client_assumed_version = hex::encode(&ns.client_assumed_version),
+                    "we are behind the client - causal read fault?"
+                );
+                return Ok(CommitResult::Conflict);
+            }
+
             let mut fast_write_hashes: HashSet<[u8; 32]> = HashSet::new();
             if !ns.page_writes.is_empty() {
                 let mut applier = WriteApplier::new(WriteApplierContext {
@@ -144,7 +156,10 @@ impl Server {
             for k in &commit_token_keys {
                 txn.set(k, &commit_token);
             }
-            txn = txn.commit().await.map_err(|e| FdbError::from(e))?.reset();
+            let committed = txn.commit().await.map_err(|e| FdbError::from(e))?;
+            let committed_version = committed.committed_version()?;
+            txn = committed.reset();
+            txn.set_read_version(committed_version);
             let mut current_tokens = FuturesOrdered::new();
             for k in &commit_token_keys {
                 current_tokens.push(txn.get(k, false));
@@ -312,13 +327,15 @@ impl Server {
         }
 
         let versionstamp_fut = txn.get_versionstamp();
-        txn.commit().await.map_err(|e| FdbError::from(e))?;
+        let commit_result = txn.commit().await.map_err(|e| FdbError::from(e))?;
         let versionstamp = versionstamp_fut.await?;
 
         // Read changelog
         let mut changelog: HashMap<String, Vec<u32>> = HashMap::new();
         {
-            let txn = self.db.create_trx()?;
+            let committed_version = commit_result.committed_version()?;
+            let txn = commit_result.reset();
+            txn.set_read_version(committed_version);
             for ns in ctx.namespaces {
                 let interval = self
                     .read_interval(

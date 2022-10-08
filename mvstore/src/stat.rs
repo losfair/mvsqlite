@@ -27,10 +27,19 @@ pub struct StatResponse {
 }
 
 impl Server {
-    pub async fn stat(&self, ns_id: [u8; 10], from_version: &str) -> Result<StatResponse> {
+    pub async fn stat(
+        &self,
+        ns_id: [u8; 10],
+        from_version: &str,
+        crr: bool,
+    ) -> Result<StatResponse> {
         let txn = self.db.create_trx()?;
         if self.is_read_only() {
             txn.set_option(TransactionOption::ReadLockAware).unwrap();
+        }
+
+        if crr {
+            txn.set_option(TransactionOption::CausalReadRisky).unwrap();
         }
 
         let rv = txn.get_read_version().await?;
