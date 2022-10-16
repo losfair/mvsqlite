@@ -9,6 +9,7 @@ mod util;
 pub mod vfs;
 
 use std::{
+    collections::HashMap,
     ffi::CString,
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -88,6 +89,18 @@ fn init_with_options_impl(opts: InitOptions) {
         10
     };
 
+    let mut db_name_map: HashMap<String, String> = HashMap::new();
+    if let Ok(s) = std::env::var("MVSQLITE_DB_NAME_MAP") {
+        for mapping in s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            let mut parts = mapping.splitn(2, '=');
+            let from = parts.next().unwrap();
+            let to = parts.next().unwrap();
+            db_name_map.insert(from.to_string(), to.to_string());
+        }
+        tracing::debug!(num_entries = db_name_map.len(), "configuring db name map");
+    }
+    let db_name_map = Arc::new(db_name_map);
+
     let mut builder = reqwest::ClientBuilder::new();
     builder = builder.timeout(Duration::from_secs(timeout_secs));
     if force_http2 {
@@ -104,6 +117,7 @@ fn init_with_options_impl(opts: InitOptions) {
             data_plane: data_plane.clone(),
             sector_size,
             http_client: http_client.clone(),
+            db_name_map: db_name_map.clone(),
         },
     };
 
@@ -116,6 +130,7 @@ fn init_with_options_impl(opts: InitOptions) {
                 data_plane: data_plane.clone(),
                 sector_size,
                 http_client: http_client.clone(),
+                db_name_map: db_name_map.clone(),
             },
         };
         sqlite_vfs::register(&format!("{}-{}", VFS_NAME, sector_size), vfs, false)

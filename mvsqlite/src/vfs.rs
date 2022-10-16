@@ -27,7 +27,7 @@ impl Vfs for MultiVersionVfs {
 
         let conn = self
             .inner
-            .open(db)
+            .open(db, true)
             .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
         Ok(Box::new(Connection {
             io: self.io.clone(),
