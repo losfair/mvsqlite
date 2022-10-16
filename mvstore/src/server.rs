@@ -100,6 +100,9 @@ pub struct CommitGlobalInit<'a> {
     pub allow_skip_idempotency_check: bool,
 
     pub num_namespaces: usize,
+
+    #[serde(default)]
+    pub lock_owner: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1186,6 +1189,7 @@ impl Server {
                         allow_skip_idempotency_check: commit_global_init
                             .allow_skip_idempotency_check,
                         namespaces: &ns_contexts,
+                        lock_owner: commit_global_init.lock_owner,
                     })
                     .await?
                 {
