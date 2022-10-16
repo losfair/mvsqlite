@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use foundationdb::Transaction;
+use foundationdb::{FdbError, Transaction};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,9 @@ pub struct NamespaceMetadata {
 pub struct NamespaceLock {
     pub snapshot_version: String,
     pub owner: String,
+
+    #[serde(default)]
+    pub rolling_back: bool,
 }
 
 pub struct NamespaceMetadataCache {
@@ -37,8 +40,12 @@ impl NamespaceMetadataCache {
         txn: &Transaction,
         key_codec: &KeyCodec,
         ns_id: [u8; 10],
-    ) -> Result<Arc<NamespaceMetadata>> {
-        let metadata_version = txn.get_metadata_version(false).await?.unwrap_or(0);
+    ) -> Result<Arc<NamespaceMetadata>, Arc<FdbError>> {
+        let metadata_version = txn
+            .get_metadata_version(false)
+            .await
+            .map_err(Arc::new)?
+            .unwrap_or(0);
         let cached: Arc<NamespaceMetadata> = self
             .cache
             .try_get_with((metadata_version, ns_id), async {

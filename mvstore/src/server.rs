@@ -37,7 +37,7 @@ use crate::{
     page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
     time2version::time2version,
-    util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
     write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
 };
 
@@ -771,6 +771,12 @@ impl Server {
             Ok(res) => Ok(res),
             Err(e) => {
                 let ns_id_hex = ns_id.map(|x| hex::encode(&x)).unwrap_or_default();
+
+                if e.chain().any(|x| x.downcast_ref::<GoneError>().is_some()) {
+                    tracing::warn!(ns = ns_id_hex, error = %e, "the requested resource is no longer available");
+                    return Ok(Response::builder().status(410).body(Body::empty())?);
+                }
+
                 if e.chain().any(|x| {
                     x.downcast_ref::<FdbError>()
                         .map(|x| x.code() == 1020)
@@ -859,7 +865,11 @@ impl Server {
                     .get("causal_read_risky")
                     .map(|x| x.as_str() == "1")
                     .unwrap_or_default();
-                let stat = self.stat(ns_id, from_version, crr).await?;
+                let lock_owner = query
+                    .get("lock_owner")
+                    .map(|x| x.as_str())
+                    .unwrap_or_default();
+                let stat = self.stat(ns_id, from_version, crr, lock_owner).await?;
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
 

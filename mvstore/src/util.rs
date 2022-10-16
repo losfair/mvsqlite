@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use foundationdb::Transaction;
+use thiserror::Error;
 
 pub async fn get_txn_read_version_as_versionstamp(txn: &Transaction) -> Result<[u8; 10]> {
     let read_version = txn.get_read_version().await? as u64;
@@ -49,3 +50,7 @@ impl ContentIndex {
         Ok(Self { time, versionstamp })
     }
 }
+
+#[derive(Error, Debug)]
+#[error("gone: {0}")]
+pub struct GoneError(pub &'static str);
