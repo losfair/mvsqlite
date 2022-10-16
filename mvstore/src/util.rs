@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use foundationdb::Transaction;
+use foundationdb::{options::ConflictRangeType, FdbError, Transaction};
 use thiserror::Error;
+
+use crate::keys::KeyCodec;
 
 pub async fn get_txn_read_version_as_versionstamp(txn: &Transaction) -> Result<[u8; 10]> {
     let read_version = txn.get_read_version().await? as u64;
@@ -54,3 +56,32 @@ impl ContentIndex {
 #[derive(Error, Debug)]
 #[error("gone: {0}")]
 pub struct GoneError(pub &'static str);
+
+pub fn add_single_key_read_conflict_range(txn: &Transaction, key: &[u8]) -> Result<(), FdbError> {
+    txn.add_conflict_range(
+        key,
+        &key.iter()
+            .copied()
+            .chain(std::iter::once(0u8))
+            .collect::<Vec<u8>>(),
+        ConflictRangeType::Read,
+    )?;
+    Ok(())
+}
+
+pub async fn get_last_write_version(
+    txn: &Transaction,
+    key_codec: &KeyCodec,
+    ns_id: [u8; 10],
+    snapshot: bool,
+) -> Result<[u8; 10], FdbError> {
+    let mut version = [0u8; 10];
+    let last_write_version_key = key_codec.construct_last_write_version_key(ns_id);
+    if let Some(t) = txn.get(&last_write_version_key, snapshot).await? {
+        if t.len() == 16 + 10 {
+            version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
+        }
+    }
+
+    Ok(version)
+}

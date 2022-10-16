@@ -8,17 +8,16 @@ use std::{
 
 use anyhow::{Context, Result};
 use bloom::{BloomFilter, ASMS};
-use foundationdb::{
-    future::FdbKeyValue,
-    options::{ConflictRangeType, StreamingMode},
-    RangeOption,
-};
+use foundationdb::{future::FdbKeyValue, options::StreamingMode, RangeOption};
 
 use crate::{
     fixed::FixedKeyVec,
     lock::DistributedLock,
     server::Server,
-    util::{decode_version, get_txn_read_version_as_versionstamp, ContentIndex},
+    util::{
+        add_single_key_read_conflict_range, decode_version, get_txn_read_version_as_versionstamp,
+        ContentIndex,
+    },
 };
 
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
@@ -437,15 +436,7 @@ impl Server {
                         self.key_codec.construct_delta_referrer_key(ns_id, *hash);
 
                     // 3e. Add the CAM index of the remaining pages to the conflict set.
-                    txn.add_conflict_range(
-                        &ci_key,
-                        &ci_key
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(0u8))
-                            .collect::<Vec<u8>>(),
-                        ConflictRangeType::Read,
-                    )?;
+                    add_single_key_read_conflict_range(&txn, &ci_key)?;
 
                     // 3f. Delete the remaining pages from the CAM.
                     txn.clear(&ci_key);

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::keys::KeyCodec;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct NamespaceMetadata {
     pub lock: Option<NamespaceLock>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NamespaceLock {
     pub snapshot_version: String,
     pub owner: String,

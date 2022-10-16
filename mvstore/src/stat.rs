@@ -3,12 +3,12 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::util::decode_version;
+use crate::util::{decode_version, get_last_write_version};
 use crate::{server::Server, util::GoneError};
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
-    FdbError, RangeOption, Transaction,
+    RangeOption, Transaction,
 };
 use serde::Serialize;
 
@@ -68,15 +68,7 @@ impl Server {
             None => {
                 self.read_version_and_nsid_to_lwv_cache
                     .try_get_with((rv, ns_id), async {
-                        let mut version = [0u8; 10];
-                        let last_write_version_key =
-                            self.key_codec.construct_last_write_version_key(ns_id);
-                        if let Some(t) = txn.get(&last_write_version_key, true).await? {
-                            if t.len() == 16 + 10 {
-                                version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
-                            }
-                        }
-                        Ok::<[u8; 10], FdbError>(version)
+                        get_last_write_version(&txn, &self.key_codec, ns_id, true).await
                     })
                     .await?
             }

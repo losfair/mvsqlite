@@ -7,7 +7,10 @@ use foundationdb::{
     Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
-use hyper::{body::Sender, Body, Request, Response};
+use hyper::{
+    body::{HttpBody, Sender},
+    Body, Request, Response,
+};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +37,7 @@ use crate::{
     keys::KeyCodec,
     lock::DistributedLock,
     metadata::NamespaceMetadataCache,
+    nslock::{acquire_nslock, release_nslock, NslockReleaseMode},
     page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
     time2version::time2version,
@@ -131,6 +135,17 @@ pub struct CommitResponse {
 }
 
 #[derive(Deserialize)]
+pub struct NslockAcquireRequest<'a> {
+    pub owner: &'a str,
+}
+
+#[derive(Deserialize)]
+pub struct NslockReleaseRequest<'a> {
+    pub owner: &'a str,
+    pub mode: NslockReleaseMode,
+}
+
+#[derive(Deserialize)]
 pub struct AdminCreateNamespaceRequest {
     pub key: String,
 }
@@ -220,7 +235,7 @@ impl Server {
         let res: Response<Body>;
         match uri.path() {
             "/api/create_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -265,7 +280,7 @@ impl Server {
             }
 
             "/api/rename_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminRenameNamespaceRequest = serde_json::from_slice(&body)?;
                 let old_nskey_key = self.key_codec.construct_nskey_key(&body.old_key);
                 let new_nskey_key = self.key_codec.construct_nskey_key(&body.new_key);
@@ -310,7 +325,7 @@ impl Server {
             }
 
             "/api/delete_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -359,7 +374,7 @@ impl Server {
             }
 
             "/api/truncate_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -433,7 +448,7 @@ impl Server {
             }
 
             "/api/delete_unreferenced_content" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteUnreferencedContentInNamespaceRequest =
                     serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
@@ -1261,6 +1276,41 @@ impl Server {
                     .header("content-type", "application/json")
                     .body(Body::from(body))?;
             }
+            "/nslock/acquire" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+
+                let body = read_full_body_with_limit(req.into_body()).await?;
+                let body: NslockAcquireRequest = serde_json::from_slice(&body)?;
+                res = acquire_nslock(
+                    &self.db,
+                    &self.key_codec,
+                    &self.ns_metadata_cache,
+                    ns_id,
+                    body.owner,
+                )
+                .await?;
+            }
+            "/nslock/release" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+
+                let body = read_full_body_with_limit(req.into_body()).await?;
+                let body: NslockReleaseRequest = serde_json::from_slice(&body)?;
+                res = release_nslock(
+                    &self.db,
+                    &self.key_codec,
+                    &self.ns_metadata_cache,
+                    ns_id,
+                    body.owner,
+                    body.mode,
+                )
+                .await?;
+            }
             _ => {
                 res = Response::builder().status(404).body("not found".into())?;
             }
@@ -1393,6 +1443,23 @@ fn new_body_reader(
             .new_codec(),
     );
     reader
+}
+
+async fn read_full_body_with_limit<T: HttpBody>(body: T) -> Result<Bytes>
+where
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    let response_content_length = match body.size_hint().upper() {
+        Some(v) => v,
+        None => (MAX_MESSAGE_SIZE as u64) + 1,
+    };
+
+    if response_content_length <= MAX_MESSAGE_SIZE as u64 {
+        let body_bytes = hyper::body::to_bytes(body).await?;
+        Ok(body_bytes)
+    } else {
+        anyhow::bail!("response too large");
+    }
 }
 
 fn prepend_length(data: &[u8]) -> Vec<u8> {
