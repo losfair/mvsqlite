@@ -4,6 +4,7 @@ mod fixed;
 mod gc;
 mod keys;
 mod lock;
+mod metadata;
 mod page;
 mod replica;
 mod server;

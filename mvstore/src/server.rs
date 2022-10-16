@@ -33,6 +33,7 @@ use crate::{
     fixed::FixedString,
     keys::KeyCodec,
     lock::DistributedLock,
+    metadata::NamespaceMetadataCache,
     page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
     time2version::time2version,
@@ -63,6 +64,7 @@ pub struct Server {
     read_version_cache: Cache<[u8; 10], i64>,
     pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
     pub replica_manager: Option<ReplicaManager>,
+    pub ns_metadata_cache: NamespaceMetadataCache,
 }
 
 pub struct ServerConfig {
@@ -128,9 +130,6 @@ pub struct CommitResponse {
 #[derive(Deserialize)]
 pub struct AdminCreateNamespaceRequest {
     pub key: String,
-
-    #[serde(default)]
-    pub metadata: String,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +192,7 @@ impl Server {
                 .time_to_idle(Duration::from_secs(2))
                 .build(),
             replica_manager,
+            ns_metadata_cache: NamespaceMetadataCache::new(),
         }))
     }
 
@@ -234,11 +234,7 @@ impl Server {
                         &self.key_codec.construct_nsmd_key([0u8; 10]),
                     );
                     let nskey_atomic_op_value = [0u8; 14];
-                    txn.atomic_op(
-                        &nsmd_atomic_op_key,
-                        body.metadata.as_bytes(),
-                        MutationType::SetVersionstampedKey,
-                    );
+                    txn.atomic_op(&nsmd_atomic_op_key, &[], MutationType::SetVersionstampedKey);
                     txn.atomic_op(
                         &nskey_key,
                         &nskey_atomic_op_value,
@@ -337,6 +333,7 @@ impl Server {
 
                     let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
+                    txn.update_metadata_version();
                     match txn.commit().await {
                         Ok(_) => {
                             res = Response::builder()

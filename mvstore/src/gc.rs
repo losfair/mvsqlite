@@ -14,7 +14,12 @@ use foundationdb::{
     RangeOption,
 };
 
-use crate::{fixed::FixedKeyVec, lock::DistributedLock, server::Server, util::ContentIndex};
+use crate::{
+    fixed::FixedKeyVec,
+    lock::DistributedLock,
+    server::Server,
+    util::{decode_version, get_txn_read_version_as_versionstamp, ContentIndex},
+};
 
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
@@ -24,9 +29,32 @@ impl Server {
         self: Arc<Self>,
         dry_run: bool,
         ns_id: [u8; 10],
-        before_version: [u8; 10],
+        mut before_version: [u8; 10],
         mut progress_callback: impl FnMut(Option<u64>),
     ) -> Result<()> {
+        // Fix up `before_version` to be the minimum of the three:
+        // - The supplied value
+        // - The cluster's current read version as seen by this snapshot
+        // - The NS lock version in the same snapshot
+        {
+            let txn = self.db.create_trx()?;
+
+            before_version = before_version.min(get_txn_read_version_as_versionstamp(&txn).await?);
+
+            let metadata = self
+                .ns_metadata_cache
+                .get(&txn, &self.key_codec, ns_id)
+                .await?;
+            if let Some(lock) = &metadata.lock {
+                before_version = before_version.min(decode_version(&lock.snapshot_version)?);
+            }
+        }
+
+        tracing::info!(
+            ns = hex::encode(&ns_id),
+            before_version = hex::encode(&before_version),
+            "starting version truncation"
+        );
         let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
         let scan_end = self
             .key_codec
