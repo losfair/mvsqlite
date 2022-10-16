@@ -5,7 +5,7 @@ use foundationdb::{FdbError, Transaction};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 
-use crate::keys::KeyCodec;
+use crate::{keys::KeyCodec, util::add_single_key_read_conflict_range};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct NamespaceMetadata {
@@ -16,6 +16,8 @@ pub struct NamespaceMetadata {
 pub struct NamespaceLock {
     pub snapshot_version: String,
     pub owner: String,
+
+    pub nonce: String,
 
     #[serde(default)]
     pub rolling_back: bool,
@@ -42,16 +44,14 @@ impl NamespaceMetadataCache {
         ns_id: [u8; 10],
     ) -> Result<Arc<NamespaceMetadata>, Arc<FdbError>> {
         let metadata_version = txn
-            .get_metadata_version(false)
+            .get_metadata_version(true)
             .await
             .map_err(Arc::new)?
             .unwrap_or(0);
+        let key = key_codec.construct_nsmd_key(ns_id);
         let cached: Arc<NamespaceMetadata> = self
             .cache
             .try_get_with((metadata_version, ns_id), async {
-                let key = key_codec.construct_nsmd_key(ns_id);
-
-                // Snapshot read is correct here because `metadata_version` read already guards against concurrent mutations
                 let metadata = txn.get(&key, true).await;
 
                 match metadata {
@@ -63,6 +63,7 @@ impl NamespaceMetadataCache {
                 }
             })
             .await?;
+        add_single_key_read_conflict_range(&txn, &key)?;
         Ok(cached)
     }
 

@@ -828,7 +828,8 @@ impl Server {
                 let fdb_rv = txn.get_read_version().await;
                 match fdb_rv {
                     Ok(fdb_rv) => {
-                        if fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
+                        // XXX: We are only checking for primary read here due to performance reasons
+                        if !self.is_read_only() && fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
                             Err(anyhow::anyhow!("fdb read version older than requested version - causal read fault?"))
                         } else {
                             Ok(fdb_rv)

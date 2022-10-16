@@ -15,8 +15,8 @@ use crate::{
     lock::DistributedLock,
     server::Server,
     util::{
-        add_single_key_read_conflict_range, decode_version, get_txn_read_version_as_versionstamp,
-        ContentIndex,
+        add_single_key_read_conflict_range, decode_version, extract_10_byte_suffix,
+        get_txn_read_version_as_versionstamp, truncate_10_byte_suffix, ContentIndex,
     },
 };
 
@@ -470,14 +470,4 @@ impl Server {
         progress_callback(format!("DONE\n"));
         Ok(())
     }
-}
-
-fn truncate_10_byte_suffix(data: &[u8]) -> &[u8] {
-    assert!(data.len() >= 10);
-    &data[..data.len() - 10]
-}
-
-fn extract_10_byte_suffix(data: &[u8]) -> [u8; 10] {
-    assert!(data.len() >= 10);
-    <[u8; 10]>::try_from(&data[data.len() - 10..]).unwrap()
 }

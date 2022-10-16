@@ -85,3 +85,18 @@ pub async fn get_last_write_version(
 
     Ok(version)
 }
+
+pub fn truncate_10_byte_suffix(data: &[u8]) -> &[u8] {
+    assert!(data.len() >= 10);
+    &data[..data.len() - 10]
+}
+
+pub fn extract_10_byte_suffix(data: &[u8]) -> [u8; 10] {
+    assert!(data.len() >= 10);
+    <[u8; 10]>::try_from(&data[data.len() - 10..]).unwrap()
+}
+
+pub fn extract_beu32_suffix(data: &[u8]) -> u32 {
+    assert!(data.len() >= 4);
+    u32::from_be_bytes(<[u8; 4]>::try_from(&data[data.len() - 4..]).unwrap())
+}

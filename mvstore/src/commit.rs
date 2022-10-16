@@ -197,6 +197,10 @@ impl Server {
                         return Ok(CommitResult::Conflict);
                     }
                 }
+            } else {
+                if ctx.lock_owner.is_some() {
+                    return Err(GoneError("you do not own the lock").into());
+                }
             }
 
             let mut written_pages: BTreeSet<u32> = BTreeSet::new();

@@ -12,7 +12,8 @@ use std::{
 };
 
 use mvclient::{
-    CommitOutput, MultiVersionClient, MultiVersionClientConfig, TimeToVersionResponse, Transaction,
+    CommitOutput, MultiVersionClient, MultiVersionClientConfig, StatusCodeError,
+    TimeToVersionResponse, Transaction,
 };
 
 use crate::types::LockKind;
@@ -30,6 +31,7 @@ pub struct MultiVersionVfs {
     pub sector_size: usize,
     pub http_client: reqwest::Client,
     pub db_name_map: Arc<HashMap<String, String>>,
+    pub lock_owner: Option<String>,
 }
 
 impl MultiVersionVfs {
@@ -93,6 +95,7 @@ impl MultiVersionVfs {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                 ns_key: ns_key.to_string(),
                 ns_key_hashproof,
+                lock_owner: self.lock_owner.clone(),
             },
             self.http_client.clone(),
         )?;
@@ -604,6 +607,18 @@ impl Connection {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::error!(ns_key = self.client.config().ns_key, error = %e, "transaction initialization failed");
+
+                    if let Some(sc_err) =
+                        e.chain().find_map(|x| x.downcast_ref::<StatusCodeError>())
+                    {
+                        if sc_err.0.as_u16() == 410 {
+                            tracing::error!(
+                                "this client can no longer start transaction on this database"
+                            );
+                            return Err(std::io::Error::new(std::io::ErrorKind::Other, "error"));
+                        }
+                    }
+
                     return Ok(false);
                 }
             };

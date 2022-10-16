@@ -60,6 +60,10 @@ impl Server {
                     return Err(GoneError("rolling back").into());
                 }
             }
+        } else {
+            if !lock_owner.is_empty() {
+                return Err(GoneError("you do not own the lock").into());
+            }
         }
 
         // If not locked or the client is the lock owner, return LWV
