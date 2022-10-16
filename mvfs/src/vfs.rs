@@ -29,10 +29,17 @@ pub struct MultiVersionVfs {
     pub data_plane: String,
     pub sector_size: usize,
     pub http_client: reqwest::Client,
+    pub db_name_map: Arc<HashMap<String, String>>,
 }
 
 impl MultiVersionVfs {
-    pub fn open(&self, db: &str) -> Result<Connection> {
+    pub fn open(&self, db: &str, map_name: bool) -> Result<Connection> {
+        if map_name {
+            if let Some(mapped) = self.db_name_map.get(db) {
+                return self.open(mapped, false);
+            }
+        }
+
         let (dp, db) = if db.starts_with("http://") || db.starts_with("https://") {
             let url = Url::parse(db)?;
             let dp = Url::parse(&url.origin().ascii_serialization())?;

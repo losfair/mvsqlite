@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         data_plane: opt.data_plane.clone(),
         sector_size: opt.sector_size,
         http_client: reqwest::Client::new(),
+        db_name_map: Arc::new(Default::default()),
     };
     let fuse_fs = FuseFs {
         namespaces,
@@ -372,7 +373,7 @@ impl fuser::Filesystem for FuseFs {
                 .unwrap()
                 .remove(&ino);
             let (ns_name, namespace) = self.namespaces.get_index(inode.ns).unwrap();
-            let conn = match self.vfs.open(namespace) {
+            let conn = match self.vfs.open(namespace, false) {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::error!(ns = ns_name, error = %e, "failed to open namespace");
