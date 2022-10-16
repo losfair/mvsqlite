@@ -16,7 +16,7 @@ jobs:
           profile: minimal
           toolchain: stable
       - name: Rust Build Cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
         with:
           key: cfg-v2
       - name: Install system dependencies
