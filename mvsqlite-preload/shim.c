@@ -91,10 +91,19 @@ int sqlite3_open16(
     abort();
 }
 
+static __thread int in_sqlite3_step = 0;
+
 int sqlite3_step(sqlite3_stmt *pStmt) {
     int ret;
     int autocommit;
-    sqlite3 *db = sqlite3_db_handle(pStmt);
+    sqlite3 *db;
+
+    if(in_sqlite3_step) {
+        return real_sqlite3_step(pStmt);
+    }
+    
+    in_sqlite3_step = 1;
+    db = sqlite3_db_handle(pStmt);
 
     while (1) {
         autocommit = sqlite3_get_autocommit(db);
@@ -102,6 +111,7 @@ int sqlite3_step(sqlite3_stmt *pStmt) {
         if(ret == SQLITE_BUSY && mvsqlite_enabled && autocommit) {
             mvsqlite_autocommit_backoff(db);
         } else {
+            in_sqlite3_step = 0;
             return ret;
         }
     }
