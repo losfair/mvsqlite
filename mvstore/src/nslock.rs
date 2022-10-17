@@ -225,7 +225,7 @@ pub async fn release_nslock(
         if new_rollback_cursor > rollback_cursor {
             txn.atomic_op(
                 &rollback_cursor_key,
-                &rollback_cursor.to_le_bytes(),
+                &new_rollback_cursor.to_le_bytes(),
                 MutationType::Max,
             );
         }
