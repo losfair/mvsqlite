@@ -36,7 +36,7 @@ use crate::{
     fixed::FixedString,
     keys::KeyCodec,
     lock::DistributedLock,
-    metadata::NamespaceMetadataCache,
+    metadata::{NamespaceMetadata, NamespaceMetadataCache, NamespaceOverlayBase},
     nslock::{acquire_nslock, release_nslock, NslockReleaseMode},
     page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
@@ -148,6 +148,9 @@ pub struct NslockReleaseRequest<'a> {
 #[derive(Deserialize)]
 pub struct AdminCreateNamespaceRequest {
     pub key: String,
+
+    #[serde(default)]
+    pub overlay_base: Option<NamespaceOverlayBase>,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +242,19 @@ impl Server {
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
+                let nsmd = NamespaceMetadata {
+                    lock: None,
+                    overlay_base: body.overlay_base,
+                };
+
+                if let Some(base) = &nsmd.overlay_base {
+                    decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
+                    decode_version(&base.snapshot_version)
+                        .with_context(|| "overlay_base: invalid snapshot_version")?;
+                }
+
+                let nsmd = serde_json::to_string(&nsmd)?;
+
                 let mut txn = self.db.create_trx()?;
 
                 loop {
@@ -252,7 +268,11 @@ impl Server {
                         &self.key_codec.construct_nsmd_key([0u8; 10]),
                     );
                     let nskey_atomic_op_value = [0u8; 14];
-                    txn.atomic_op(&nsmd_atomic_op_key, &[], MutationType::SetVersionstampedKey);
+                    txn.atomic_op(
+                        &nsmd_atomic_op_key,
+                        nsmd.as_bytes(),
+                        MutationType::SetVersionstampedKey,
+                    );
                     txn.atomic_op(
                         &nskey_key,
                         &nskey_atomic_op_value,
@@ -932,94 +952,18 @@ impl Server {
                         let sem_permit = sem.clone().acquire_owned().await.unwrap();
                         read_futures.push(tokio::spawn(async move {
                             let _sem_permit = sem_permit;
-                            loop {
-                                let read_req: ReadRequest = match rmp_serde::from_slice(&message) {
-                                    Ok(x) => x,
+                            match rmp_serde::from_slice::<ReadRequest>(&message) {
+                                Ok(read_req) => match me.handle_read_req(ns_id, &ns_id_hex, read_req).await {
+                                    Ok(x) => Ok(x),
                                     Err(e) => {
-                                        tracing::warn!(ns = %ns_id_hex, error = %e, "invalid message");
-                                        break Err(());
+                                        tracing::warn!(ns = %ns_id_hex, error = %e, "read failed");
+                                        Err(())
                                     }
-                                };
-                                let txn: Transaction;
-                                let page = if let Some(hash) = read_req.hash {
-                                    // This path enables read-your-writes in the same transaction. We cannot use the read-version cache,
-                                    // because the snapshotted version may not contain newly written pages.
-                                    //
-                                    // This is a rare case anyway, because the client has its own read cache.
-                                    tracing::debug!(
-                                        ns = ns_id_hex,
-                                        hash = hex::encode(hash),
-                                        "entering read-your-writes logic"
-                                    );
-                                    txn = match me.db.create_trx() {
-                                        Ok(x) => x,
-                                        Err(e) => {
-                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to create transaction");
-                                            break Err(());
-                                        }
-                                    };
-
-                                    if me.is_read_only() {
-                                        txn.set_option(TransactionOption::ReadLockAware).unwrap();
-                                    }
-
-                                    let hash = match <[u8; 32]>::try_from(hash) {
-                                        Ok(x) => x,
-                                        Err(e) => {
-                                            tracing::warn!(ns = ns_id_hex, error = %e, "hash is not 32 bytes");
-                                            break Err(());
-                                        }
-                                    };
-
-
-                                    let reader = DeltaReader {
-                                        txn: &txn,
-                                        ns_id,
-                                        key_codec: &me.key_codec,
-                                        replica_manager: me.replica_manager.as_ref(),
-                                    };
-                                    let content = reader.get_page_content_decoded_snapshot(hash).await;
-                                    match content {
-                                        Ok(Some(x)) => Some(Page {
-                                            version: FixedString::from_str(read_req.version).unwrap_or_default(),
-                                            data: x,
-                                        }),
-                                        Ok(None) => None,
-                                        Err(e) => {
-                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to get content by hash");
-                                            break Err(());
-                                        }
-                                    }
-                                } else {
-                                    txn = match me.create_versioned_read_txn(read_req.version).await {
-                                        Ok(x) => x,
-                                        Err(e) => {
-                                            tracing::warn!(ns = ns_id_hex, error = %e, "failed to create versioned read txn");
-                                            break Err(());
-                                        }
-                                    };
-                                    match me
-                                        .read_page_decoded_snapshot(&txn, ns_id, read_req.page_index, read_req.version)
-                                        .await
-                                    {
-                                        Ok(x) => x,
-                                        Err(e) => {
-                                            tracing::warn!(ns = ns_id_hex, error = %e, page_index = read_req.page_index, version = read_req.version, "error reading page");
-                                            break Err(());
-                                        }
-                                    }
-                                };
-                                let payload = match page {
-                                    Some(x) => ReadResponse {
-                                        version: x.version.clone(),
-                                        data: x.data,
-                                    },
-                                    None => ReadResponse {
-                                        version: "".into(),
-                                        data: Bytes::new(),
-                                    },
-                                };
-                                break Ok(payload);
+                                },
+                                Err(e) => {
+                                    tracing::warn!(ns = %ns_id_hex, error = %e, "invalid message");
+                                    Err(())
+                                }
                             }
                         }));
                     }
@@ -1428,6 +1372,95 @@ impl Server {
             .await
             .with_context(|| "error sending completion")?;
         Ok(())
+    }
+
+    async fn handle_read_req(
+        &self,
+        ns_id: [u8; 10],
+        ns_id_hex: &str,
+        read_req: ReadRequest<'_>,
+    ) -> Result<ReadResponse> {
+        let txn: Transaction;
+        let page = if let Some(hash) = read_req.hash {
+            // This path enables read-your-writes in the same transaction. We cannot use the read-version cache,
+            // because the snapshotted version may not contain newly written pages.
+            //
+            // This is a rare case anyway, because the client has its own read cache.
+            tracing::debug!(
+                ns = ns_id_hex,
+                hash = hex::encode(hash),
+                "entering read-your-writes logic"
+            );
+            txn = self.db.create_trx()?;
+
+            if self.is_read_only() {
+                txn.set_option(TransactionOption::ReadLockAware).unwrap();
+            }
+
+            let hash = <[u8; 32]>::try_from(hash).with_context(|| "hash is not 32 bytes")?;
+
+            let reader = DeltaReader {
+                txn: &txn,
+                ns_id,
+                key_codec: &self.key_codec,
+                replica_manager: self.replica_manager.as_ref(),
+            };
+            let content = reader
+                .get_page_content_decoded_snapshot(hash)
+                .await
+                .with_context(|| "failed to get content by hash")?;
+            match content {
+                Some(x) => Some(Page {
+                    version: FixedString::from_str(read_req.version).unwrap_or_default(),
+                    data: x,
+                }),
+                None => None,
+            }
+        } else {
+            // The normal path.
+
+            txn = self
+                .create_versioned_read_txn(read_req.version)
+                .await
+                .with_context(|| "failed to create versioned read txn")?;
+            let mut page = self
+                .read_page_decoded_snapshot(&txn, ns_id, read_req.page_index, read_req.version)
+                .await
+                .with_context(|| "error reading page")?;
+
+            if page.is_none() {
+                // Overlay
+                let metadata = self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, ns_id)
+                    .await?;
+                if let Some(base) = &metadata.overlay_base {
+                    let base_ns_id = decode_version(&base.ns_id)?;
+                    let base_page = self
+                        .read_page_decoded_snapshot(
+                            &txn,
+                            base_ns_id,
+                            read_req.page_index,
+                            &base.snapshot_version,
+                        )
+                        .await?;
+                    page = base_page;
+                }
+            }
+
+            page
+        };
+        let payload = match page {
+            Some(x) => ReadResponse {
+                version: x.version.clone(),
+                data: x.data,
+            },
+            None => ReadResponse {
+                version: "".into(),
+                data: Bytes::new(),
+            },
+        };
+        Ok(payload)
     }
 }
 
