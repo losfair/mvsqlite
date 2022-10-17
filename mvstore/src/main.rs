@@ -127,6 +127,10 @@ struct Opt {
     /// ADVANCED. Configure the threshold (in number of pages) below which page-level conflict check is enabled (inclusive).
     #[structopt(long, env = "MVSTORE_KNOB_PLCC_READ_SET_SIZE_THRESHOLD")]
     knob_plcc_read_set_size_threshold: Option<usize>,
+
+    /// ADVANCED. Configure the nslock rollback scan batch size.
+    #[structopt(long, env = "MVSTORE_KNOB_NSLOCK_ROLLBACK_SCAN_BATCH_SIZE")]
+    knob_nslock_rollback_scan_batch_size: Option<usize>,
 }
 
 async fn async_main(opt: Opt) -> Result<()> {
@@ -148,6 +152,11 @@ async fn async_main(opt: Opt) -> Result<()> {
     if let Some(x) = opt.knob_plcc_read_set_size_threshold {
         commit::PLCC_READ_SET_SIZE_THRESHOLD.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured plcc read set size threshold");
+    }
+
+    if let Some(x) = opt.knob_nslock_rollback_scan_batch_size {
+        nslock::NSLOCK_ROLLBACK_SCAN_BATCH_SIZE.store(x, Ordering::Relaxed);
+        tracing::info!(value = x, "configured nslock rollback scan batch size");
     }
 
     let server = Server::open(ServerConfig {
