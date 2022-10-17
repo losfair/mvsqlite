@@ -3,8 +3,12 @@ use std::time::SystemTime;
 use crate::{keys::KeyCodec, replica::ReplicaManager};
 use anyhow::Result;
 use foundationdb::{
-    future::FdbValues, options::StreamingMode, tuple::unpack, RangeOption, Transaction,
+    future::{FdbValue},
+    options::StreamingMode,
+    tuple::unpack,
+    RangeOption, Transaction,
 };
+use futures::TryStreamExt;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -54,32 +58,32 @@ pub async fn time2version(
     let upper_bound = key_codec.construct_time2version_key(std::u64::MAX);
     let prefix = key_codec.construct_time2version_prefix();
 
-    let after = txn
-        .get_range(
-            &RangeOption {
+    let after: Vec<_> = txn
+        .get_ranges_keyvalues(
+            RangeOption {
                 limit: Some(1),
                 reverse: true,
                 mode: StreamingMode::Small,
                 ..RangeOption::from(lower_bound.clone()..key.clone())
             },
-            0,
             true,
         )
+        .try_collect()
         .await?;
 
-    let not_after = txn
-        .get_range(
-            &RangeOption {
+    let not_after: Vec<_> = txn
+        .get_ranges_keyvalues(
+            RangeOption {
                 limit: Some(1),
                 reverse: false,
                 mode: StreamingMode::Small,
                 ..RangeOption::from(key.clone()..upper_bound.clone())
             },
-            0,
             true,
         )
+        .try_collect()
         .await?;
-    let map_it = |x: FdbValues| -> Option<TimeToVersionPoint> {
+    let map_it = |x: Vec<FdbValue>| -> Option<TimeToVersionPoint> {
         if x.len() == 0 || x[0].key().len() < prefix.len() {
             None
         } else {

@@ -5,6 +5,7 @@ use foundationdb::{
     options::{ConflictRangeType, StreamingMode},
     RangeOption, Transaction,
 };
+use futures::TryStreamExt;
 use tokio::task::block_in_place;
 
 use crate::{
@@ -40,18 +41,18 @@ impl<'a> DeltaReader<'a> {
         let scan_start = self
             .key_codec
             .construct_page_key(self.ns_id, page_index, [0u8; 10]);
-        let page_vec = self
+        let page_vec: Vec<_> = self
             .txn
-            .get_range(
-                &RangeOption {
+            .get_ranges_keyvalues(
+                RangeOption {
                     limit: Some(1),
                     reverse: true,
                     mode: StreamingMode::Small,
                     ..RangeOption::from(scan_start.as_slice()..=scan_end.as_slice())
                 },
-                0,
                 true,
             )
+            .try_collect()
             .await?;
         assert!(page_vec.len() <= 1);
         if page_vec.is_empty() {
