@@ -52,6 +52,8 @@ pub trait DatabaseHandle: Sync {
         self.lock(lock)
     }
 
+    fn commit_phasetwo(&mut self) {}
+
     /// Check if the database this handle points to holds a [LockKind::Reserved],
     /// [LockKind::Pending] or [LockKind::Exclusive] lock.
     fn reserved(&mut self) -> Result<bool, std::io::Error>;
@@ -1392,7 +1394,10 @@ mod io {
 
             // Sent to the VFS after a transaction has been committed immediately but before the
             // database is unlocked. Silently ignored.
-            ffi::SQLITE_FCNTL_COMMIT_PHASETWO => ffi::SQLITE_OK,
+            ffi::SQLITE_FCNTL_COMMIT_PHASETWO => {
+                state.file.commit_phasetwo();
+                ffi::SQLITE_OK
+            }
 
             // Used for debugging. Swap the file handle with the one pointed to by the pArg
             // argument. This capability is used during testing and only needs to be supported when

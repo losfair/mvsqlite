@@ -114,6 +114,7 @@ impl MultiVersionVfs {
             fixed_version,
             txn: None,
             lock: LockKind::None,
+            commit_confirmed: false,
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
@@ -136,6 +137,7 @@ pub struct Connection {
     fixed_version: Option<String>,
     txn: Option<Transaction>,
     lock: LockKind,
+    commit_confirmed: bool,
     history: TransitionHistory,
     sector_size: usize,
 
@@ -368,7 +370,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn finalize_transaction(&mut self) -> bool {
+    async fn finalize_transaction(&mut self, commit: bool) -> bool {
         if self.write_buffer.len() > WRITE_CHUNK_SIZE.load(Ordering::Relaxed) {
             self.force_flush_write_buffer().await;
         }
@@ -394,15 +396,25 @@ impl Connection {
             .chain(self.write_buffer.keys().copied())
             .collect::<HashSet<_>>();
 
-        if self.fixed_version.is_some() {
+        let mut discard_reason: Option<&'static str> = None;
+
+        if !commit {
+            // sqlite didn't confirm to commit
+            discard_reason = Some("did not receive confirmation from sqlite");
+        } else if self.fixed_version.is_some() {
             // Disallow write to snapshot
+            discard_reason = Some("write to snapshot is dropped");
+        }
+
+        if let Some(discard_reason) = discard_reason {
             for index in &dirty_pages {
                 self.page_cache.invalidate(index);
             }
             self.write_buffer.clear();
             tracing::warn!(
                 dirty_page_count = dirty_pages.len(),
-                "discarding write to snapshot"
+                reason = discard_reason,
+                "discarding transaction"
             );
             return true;
         }
@@ -654,6 +666,7 @@ impl Connection {
             self.virtual_version_counter = self.virtual_version_counter.wrapping_add(2);
         }
         self.lock = lock;
+        assert!(!self.commit_confirmed);
 
         Ok(true)
     }
@@ -669,7 +682,9 @@ impl Connection {
 
         let reserved_level = LockKind::Reserved.level();
         let commit_ok = if prev_lock.level() >= reserved_level && lock.level() < reserved_level {
-            self.finalize_transaction().await
+            let commit_confirmed = self.commit_confirmed;
+            self.commit_confirmed = false;
+            self.finalize_transaction(commit_confirmed).await
         } else {
             true
         };
@@ -681,6 +696,11 @@ impl Connection {
         }
 
         Ok(commit_ok)
+    }
+
+    pub fn confirm_commit(&mut self) {
+        assert!(!self.commit_confirmed);
+        self.commit_confirmed = true;
     }
 
     pub fn reserved(&mut self) -> Result<bool, std::io::Error> {
