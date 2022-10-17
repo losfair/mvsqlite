@@ -9,7 +9,11 @@ use crate::{keys::KeyCodec, util::add_single_key_read_conflict_range};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct NamespaceMetadata {
+    #[serde(default)]
     pub lock: Option<NamespaceLock>,
+
+    #[serde(default)]
+    pub overlay_base: Option<NamespaceOverlayBase>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -21,6 +25,12 @@ pub struct NamespaceLock {
 
     #[serde(default)]
     pub rolling_back: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NamespaceOverlayBase {
+    pub ns_id: String,
+    pub snapshot_version: String,
 }
 
 pub struct NamespaceMetadataCache {
