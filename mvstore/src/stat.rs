@@ -1,17 +1,14 @@
 use std::{
     collections::BTreeSet,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::server::Server;
-use crate::util::decode_version;
+use crate::util::{decode_version, get_last_write_version};
+use crate::{server::Server, util::GoneError};
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
-    FdbError, RangeOption, Transaction,
+    RangeOption, Transaction,
 };
 use serde::Serialize;
 
@@ -32,6 +29,7 @@ impl Server {
         ns_id: [u8; 10],
         from_version: &str,
         crr: bool,
+        lock_owner: &str,
     ) -> Result<StatResponse> {
         let txn = self.db.create_trx()?;
         if self.is_read_only() {
@@ -43,23 +41,42 @@ impl Server {
         }
 
         let rv = txn.get_read_version().await?;
-        let version = self
-            .read_version_and_nsid_to_lwv_cache
-            .try_get_with((rv, ns_id), async {
-                let mut version = [0u8; 10];
-                let last_write_version_key = self.key_codec.construct_last_write_version_key(ns_id);
-                if let Some(t) = txn
-                    .get(&last_write_version_key, false)
-                    .await
-                    .map_err(Arc::new)?
-                {
-                    if t.len() == 16 + 10 {
-                        version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
-                    }
-                }
-                Ok::<[u8; 10], Arc<FdbError>>(version)
-            })
+        let metadata = self
+            .ns_metadata_cache
+            .get(&txn, &self.key_codec, ns_id)
             .await?;
+        let mut version: Option<[u8; 10]> = None;
+
+        if let Some(lock) = &metadata.lock {
+            if lock_owner.is_empty() {
+                // Concurrent read-only transaction, return the latest snapshot
+                version = Some(decode_version(&lock.snapshot_version)?);
+            } else {
+                // Validate lock ownership and state
+                if lock.owner.as_str() != lock_owner {
+                    return Err(GoneError("you no longer own the lock").into());
+                }
+                if lock.rolling_back {
+                    return Err(GoneError("rolling back").into());
+                }
+            }
+        } else {
+            if !lock_owner.is_empty() {
+                return Err(GoneError("you do not own the lock").into());
+            }
+        }
+
+        // If not locked or the client is the lock owner, return LWV
+        let version = match version {
+            Some(x) => x,
+            None => {
+                self.read_version_and_nsid_to_lwv_cache
+                    .try_get_with((rv, ns_id), async {
+                        get_last_write_version(&txn, &self.key_codec, ns_id, true).await
+                    })
+                    .await?
+            }
+        };
 
         let mut interval: Option<Vec<u32>> = None;
         if !from_version.is_empty() {

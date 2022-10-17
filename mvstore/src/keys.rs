@@ -15,6 +15,13 @@ impl KeyCodec {
         key
     }
 
+    pub fn construct_nsrollbackcursor_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
+        let mut key = pack(&(self.metadata_prefix.as_str(), "nsrollbackcursor"));
+        key.push(0x32);
+        key.extend_from_slice(&ns_id);
+        key
+    }
+
     pub fn construct_nstask_key(&self, ns_id: [u8; 10], task: &str) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nstask"));
         key.push(0x32);

@@ -7,7 +7,10 @@ use foundationdb::{
     Database, FdbError, RangeOption, Transaction,
 };
 use futures::StreamExt;
-use hyper::{body::Sender, Body, Request, Response};
+use hyper::{
+    body::{HttpBody, Sender},
+    Body, Request, Response,
+};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,10 +36,12 @@ use crate::{
     fixed::FixedString,
     keys::KeyCodec,
     lock::DistributedLock,
+    metadata::NamespaceMetadataCache,
+    nslock::{acquire_nslock, release_nslock, NslockReleaseMode},
     page::{Page, MAX_PAGE_SIZE},
     replica::ReplicaManager,
     time2version::time2version,
-    util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
     write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
 };
 
@@ -63,6 +68,7 @@ pub struct Server {
     read_version_cache: Cache<[u8; 10], i64>,
     pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
     pub replica_manager: Option<ReplicaManager>,
+    pub ns_metadata_cache: NamespaceMetadataCache,
 }
 
 pub struct ServerConfig {
@@ -98,6 +104,9 @@ pub struct CommitGlobalInit<'a> {
     pub allow_skip_idempotency_check: bool,
 
     pub num_namespaces: usize,
+
+    #[serde(default)]
+    pub lock_owner: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -126,11 +135,19 @@ pub struct CommitResponse {
 }
 
 #[derive(Deserialize)]
+pub struct NslockAcquireRequest<'a> {
+    pub owner: &'a str,
+}
+
+#[derive(Deserialize)]
+pub struct NslockReleaseRequest<'a> {
+    pub owner: &'a str,
+    pub mode: NslockReleaseMode,
+}
+
+#[derive(Deserialize)]
 pub struct AdminCreateNamespaceRequest {
     pub key: String,
-
-    #[serde(default)]
-    pub metadata: String,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +210,7 @@ impl Server {
                 .time_to_idle(Duration::from_secs(2))
                 .build(),
             replica_manager,
+            ns_metadata_cache: NamespaceMetadataCache::new(),
         }))
     }
 
@@ -217,7 +235,7 @@ impl Server {
         let res: Response<Body>;
         match uri.path() {
             "/api/create_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -234,11 +252,7 @@ impl Server {
                         &self.key_codec.construct_nsmd_key([0u8; 10]),
                     );
                     let nskey_atomic_op_value = [0u8; 14];
-                    txn.atomic_op(
-                        &nsmd_atomic_op_key,
-                        body.metadata.as_bytes(),
-                        MutationType::SetVersionstampedKey,
-                    );
+                    txn.atomic_op(&nsmd_atomic_op_key, &[], MutationType::SetVersionstampedKey);
                     txn.atomic_op(
                         &nskey_key,
                         &nskey_atomic_op_value,
@@ -266,7 +280,7 @@ impl Server {
             }
 
             "/api/rename_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminRenameNamespaceRequest = serde_json::from_slice(&body)?;
                 let old_nskey_key = self.key_codec.construct_nskey_key(&body.old_key);
                 let new_nskey_key = self.key_codec.construct_nskey_key(&body.new_key);
@@ -311,7 +325,7 @@ impl Server {
             }
 
             "/api/delete_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -337,6 +351,7 @@ impl Server {
 
                     let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
+                    txn.update_metadata_version();
                     match txn.commit().await {
                         Ok(_) => {
                             res = Response::builder()
@@ -359,7 +374,7 @@ impl Server {
             }
 
             "/api/truncate_namespace" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
 
@@ -433,7 +448,7 @@ impl Server {
             }
 
             "/api/delete_unreferenced_content" => {
-                let body = hyper::body::to_bytes(req.body_mut()).await?;
+                let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteUnreferencedContentInNamespaceRequest =
                     serde_json::from_slice(&body)?;
                 let nskey_key = self.key_codec.construct_nskey_key(&body.key);
@@ -774,6 +789,12 @@ impl Server {
             Ok(res) => Ok(res),
             Err(e) => {
                 let ns_id_hex = ns_id.map(|x| hex::encode(&x)).unwrap_or_default();
+
+                if e.chain().any(|x| x.downcast_ref::<GoneError>().is_some()) {
+                    tracing::warn!(ns = ns_id_hex, error = %e, "the requested resource is no longer available");
+                    return Ok(Response::builder().status(410).body(Body::empty())?);
+                }
+
                 if e.chain().any(|x| {
                     x.downcast_ref::<FdbError>()
                         .map(|x| x.code() == 1020)
@@ -807,7 +828,8 @@ impl Server {
                 let fdb_rv = txn.get_read_version().await;
                 match fdb_rv {
                     Ok(fdb_rv) => {
-                        if fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
+                        // XXX: We are only checking for primary read here due to performance reasons
+                        if !self.is_read_only() && fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
                             Err(anyhow::anyhow!("fdb read version older than requested version - causal read fault?"))
                         } else {
                             Ok(fdb_rv)
@@ -862,7 +884,11 @@ impl Server {
                     .get("causal_read_risky")
                     .map(|x| x.as_str() == "1")
                     .unwrap_or_default();
-                let stat = self.stat(ns_id, from_version, crr).await?;
+                let lock_owner = query
+                    .get("lock_owner")
+                    .map(|x| x.as_str())
+                    .unwrap_or_default();
+                let stat = self.stat(ns_id, from_version, crr, lock_owner).await?;
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
 
@@ -1179,6 +1205,7 @@ impl Server {
                         allow_skip_idempotency_check: commit_global_init
                             .allow_skip_idempotency_check,
                         namespaces: &ns_contexts,
+                        lock_owner: commit_global_init.lock_owner,
                     })
                     .await?
                 {
@@ -1249,6 +1276,41 @@ impl Server {
                     .status(200)
                     .header("content-type", "application/json")
                     .body(Body::from(body))?;
+            }
+            "/nslock/acquire" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+
+                let body = read_full_body_with_limit(req.into_body()).await?;
+                let body: NslockAcquireRequest = serde_json::from_slice(&body)?;
+                res = acquire_nslock(
+                    &self.db,
+                    &self.key_codec,
+                    &self.ns_metadata_cache,
+                    ns_id,
+                    body.owner,
+                )
+                .await?;
+            }
+            "/nslock/release" => {
+                let (ns_id, _) = match require_ns_id() {
+                    Ok(x) => x,
+                    Err(x) => return Ok(x),
+                };
+
+                let body = read_full_body_with_limit(req.into_body()).await?;
+                let body: NslockReleaseRequest = serde_json::from_slice(&body)?;
+                res = release_nslock(
+                    &self.db,
+                    &self.key_codec,
+                    &self.ns_metadata_cache,
+                    ns_id,
+                    body.owner,
+                    body.mode,
+                )
+                .await?;
             }
             _ => {
                 res = Response::builder().status(404).body("not found".into())?;
@@ -1382,6 +1444,23 @@ fn new_body_reader(
             .new_codec(),
     );
     reader
+}
+
+async fn read_full_body_with_limit<T: HttpBody>(body: T) -> Result<Bytes>
+where
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    let response_content_length = match body.size_hint().upper() {
+        Some(v) => v,
+        None => (MAX_MESSAGE_SIZE as u64) + 1,
+    };
+
+    if response_content_length <= MAX_MESSAGE_SIZE as u64 {
+        let body_bytes = hyper::body::to_bytes(body).await?;
+        Ok(body_bytes)
+    } else {
+        anyhow::bail!("response too large");
+    }
 }
 
 fn prepend_length(data: &[u8]) -> Vec<u8> {

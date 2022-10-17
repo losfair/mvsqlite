@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
             data_plane: vec![opt.data_plane.parse()?],
             ns_key: opt.ns_key.clone(),
             ns_key_hashproof: None,
+            lock_owner: None,
         },
         reqwest::Client::new(),
     )?;

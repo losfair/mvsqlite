@@ -41,6 +41,8 @@ pub struct MultiVersionClientConfig {
     pub ns_key: String,
 
     pub ns_key_hashproof: Option<String>,
+
+    pub lock_owner: Option<String>,
 }
 
 impl MultiVersionClientConfig {
@@ -97,6 +99,8 @@ pub struct CommitGlobalInit<'a> {
     pub allow_skip_idempotency_check: bool,
 
     pub num_namespaces: usize,
+
+    pub lock_owner: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -183,6 +187,10 @@ impl MultiVersionClient {
                 .append_pair("from_version", from_version);
         }
 
+        if let Some(lock_owner) = &self.config.lock_owner {
+            url.query_pairs_mut().append_pair("lock_owner", lock_owner);
+        }
+
         let mut boff = RandomizedExponentialBackoff::default();
         let stat_res: StatResponse = loop {
             let resp = request_and_check(self.client.get(url.clone()).decorate(self)).await?;
@@ -259,6 +267,7 @@ impl MultiVersionClient {
                 idempotency_key: &idempotency_key[..],
                 allow_skip_idempotency_check,
                 num_namespaces: intents.len(),
+                lock_owner: self.config.lock_owner.as_deref(),
             };
             allow_skip_idempotency_check = false;
             let mut raw_request: Vec<u8> = Vec::new();
@@ -682,10 +691,15 @@ impl Transaction {
     }
 }
 
+#[derive(Error, Debug)]
+#[error("status {0}")]
+pub struct StatusCodeError(pub StatusCode);
+
 async fn request_and_check(r: RequestBuilder) -> Result<Option<(HeaderMap, Bytes)>> {
     request_and_check_returning_status(r)
         .await
-        .map_err(|e| anyhow::anyhow!("status {}", e))
+        .map_err(StatusCodeError)
+        .map_err(anyhow::Error::from)
 }
 
 async fn request_and_check_returning_status(

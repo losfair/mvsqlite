@@ -34,14 +34,6 @@ impl<'a> DeltaReader<'a> {
             Some(x) => decode_version(x)?,
             None => [0xffu8; 10],
         };
-        if let Some(rm) = self.replica_manager {
-            let current_rv = rm.replica_version(self.txn).await?;
-            let requested_rv = i64::from_be_bytes(page_version[0..8].try_into().unwrap());
-            if current_rv < requested_rv {
-                anyhow::bail!("this replica does not have the requested read version");
-            }
-            tracing::debug!(current_rv, requested_rv, "read_page_hash replica read");
-        }
         let scan_end = self
             .key_codec
             .construct_page_key(self.ns_id, page_index, page_version);

@@ -101,6 +101,14 @@ fn init_with_options_impl(opts: InitOptions) {
     }
     let db_name_map = Arc::new(db_name_map);
 
+    let mut lock_owner: Option<String> = None;
+    if let Ok(s) = std::env::var("MVSQLITE_LOCK_OWNER") {
+        if !s.is_empty() {
+            tracing::debug!(lock_owner = s, "configuring lock owner");
+            lock_owner = Some(s);
+        }
+    }
+
     let mut builder = reqwest::ClientBuilder::new();
     builder = builder.timeout(Duration::from_secs(timeout_secs));
     if force_http2 {
@@ -118,6 +126,7 @@ fn init_with_options_impl(opts: InitOptions) {
             sector_size,
             http_client: http_client.clone(),
             db_name_map: db_name_map.clone(),
+            lock_owner: lock_owner.clone(),
         },
     };
 
@@ -131,6 +140,7 @@ fn init_with_options_impl(opts: InitOptions) {
                 sector_size,
                 http_client: http_client.clone(),
                 db_name_map: db_name_map.clone(),
+                lock_owner: lock_owner.clone(),
             },
         };
         sqlite_vfs::register(&format!("{}-{}", VFS_NAME, sector_size), vfs, false)

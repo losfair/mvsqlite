@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         sector_size: opt.sector_size,
         http_client: reqwest::Client::new(),
         db_name_map: Arc::new(Default::default()),
+        lock_owner: None,
     };
     let fuse_fs = FuseFs {
         namespaces,

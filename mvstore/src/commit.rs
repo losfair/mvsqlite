@@ -16,7 +16,7 @@ use rand::RngCore;
 use crate::{
     delta::reader::DeltaReader,
     server::Server,
-    util::{decode_version, generate_suffix_versionstamp_atomic_op},
+    util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
     util::{get_txn_read_version_as_versionstamp, ContentIndex},
     write::{WriteApplier, WriteApplierContext, WriteRequest},
 };
@@ -39,6 +39,7 @@ pub struct CommitContext<'a> {
     pub idempotency_key: [u8; 16],
     pub allow_skip_idempotency_check: bool,
     pub namespaces: &'a [CommitNamespaceContext<'a>],
+    pub lock_owner: Option<&'a str>,
 }
 
 pub struct CommitNamespaceContext<'a> {
@@ -175,9 +176,31 @@ impl Server {
         // Phase 2 - content index insertion
 
         for ns in ctx.namespaces {
-            if let Some(md) = &ns.metadata {
-                let metadata_key = self.key_codec.construct_nsmd_key(ns.ns_id);
-                txn.set(&metadata_key, md.as_bytes());
+            let metadata = self
+                .ns_metadata_cache
+                .get(&txn, &self.key_codec, ns.ns_id)
+                .await?;
+
+            // Does the client own the lock, if any?
+            if let Some(lock) = &metadata.lock {
+                match ctx.lock_owner {
+                    Some(lock_owner) => {
+                        // Validate lock ownership and state
+                        if lock.owner.as_str() != lock_owner {
+                            return Err(GoneError("you no longer own the lock").into());
+                        }
+                        if lock.rolling_back {
+                            return Err(GoneError("rolling back").into());
+                        }
+                    }
+                    None => {
+                        return Ok(CommitResult::Conflict);
+                    }
+                }
+            } else {
+                if ctx.lock_owner.is_some() {
+                    return Err(GoneError("you do not own the lock").into());
+                }
             }
 
             let mut written_pages: BTreeSet<u32> = BTreeSet::new();
