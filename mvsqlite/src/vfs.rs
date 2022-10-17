@@ -103,6 +103,10 @@ impl DatabaseHandle for Connection {
         self.io.run(async { self.inner.unlock(lock.into()).await })
     }
 
+    fn commit_phasetwo(&mut self) {
+        self.inner.confirm_commit();
+    }
+
     fn reserved(&mut self) -> Result<bool, std::io::Error> {
         Ok(false)
     }
@@ -153,6 +157,10 @@ impl<W: WalIndex + 'static> DatabaseHandle for Box<dyn DatabaseHandle<WalIndex =
 
     fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         (**self).unlock(lock)
+    }
+
+    fn commit_phasetwo(&mut self) {
+        (**self).commit_phasetwo()
     }
 
     fn reserved(&mut self) -> Result<bool, std::io::Error> {
