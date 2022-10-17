@@ -1,6 +1,6 @@
 [package]
 name = "mvclient"
-version = "0.2.1"
+version = "0.3.0-beta.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
