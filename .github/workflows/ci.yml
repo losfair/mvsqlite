@@ -385,7 +385,11 @@ jobs:
             --mountpoint ./fusemnt \
             --namespaces "db=test" &
           sleep 1
-          ./speedtest1 ./fusemnt/db
+          set +e
+          ./speedtest1 ./fusemnt/db 2>&1 | tee log
+          set -e
+          grep "SQL error: no such table: t1" log
+          echo "Got the expected error."
   build-ycsb:
     name: Build ycsb
     runs-on: ubuntu-20.04
