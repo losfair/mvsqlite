@@ -10,6 +10,7 @@ use foundationdb::{
     options::{StreamingMode, TransactionOption},
     RangeOption, Transaction,
 };
+use futures::TryStreamExt;
 use serde::Serialize;
 
 static INTERVAL_SCAN_SIZE: AtomicUsize = AtomicUsize::new(100);
@@ -114,17 +115,17 @@ impl Server {
 
         let start = self.key_codec.construct_changelog_key(ns_id, from_version);
         let end = self.key_codec.construct_changelog_key(ns_id, to_version);
-        let range = txn
-            .get_range(
-                &RangeOption {
+        let range: Vec<_> = txn
+            .get_ranges_keyvalues(
+                RangeOption {
                     limit: Some(INTERVAL_SCAN_SIZE.load(Ordering::Relaxed)),
                     reverse: false,
                     mode: StreamingMode::WantAll,
                     ..RangeOption::from(start.as_slice()..=end.as_slice())
                 },
-                0,
                 true,
             )
+            .try_collect()
             .await?;
         let range = &range[..];
         if range.len() < 2 {

@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use bloom::{BloomFilter, ASMS};
 use foundationdb::{future::FdbKeyValue, options::StreamingMode, RangeOption};
+use futures::TryStreamExt;
 
 use crate::{
     fixed::FixedKeyVec,
@@ -85,17 +86,17 @@ impl Server {
         loop {
             let scan_result = loop {
                 let txn = lock.create_txn_and_check_sync(&self.db).await?;
-                let range = match txn
-                    .get_range(
-                        &RangeOption {
+                let range: Vec<_> = match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
-                        0,
                         true,
                     )
+                    .try_collect()
                     .await
                 {
                     Ok(x) => x,
@@ -197,17 +198,17 @@ impl Server {
         loop {
             let scan_result = loop {
                 let txn = lock.create_txn_and_check_sync(&self.db).await?;
-                let range = match txn
-                    .get_range(
-                        &RangeOption {
+                let range: Vec<_> = match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
-                        0,
                         true,
                     )
+                    .try_collect()
                     .await
                 {
                     Ok(x) => x,
@@ -353,17 +354,17 @@ impl Server {
                         continue;
                     }
                 };
-                let scan_result = match txn
-                    .get_range(
-                        &RangeOption {
+                let scan_result: Vec<_> = match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
                             limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                         },
-                        0,
                         true,
                     )
+                    .try_collect()
                     .await
                 {
                     Ok(x) => x,

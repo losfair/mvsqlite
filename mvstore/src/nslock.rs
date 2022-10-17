@@ -17,6 +17,7 @@ use foundationdb::{
     options::{MutationType, StreamingMode},
     Database, RangeOption, Transaction,
 };
+use futures::TryStreamExt;
 use hyper::{Body, Response};
 use rand::Rng;
 use serde::Deserialize;
@@ -190,17 +191,17 @@ pub async fn release_nslock(
         }
 
         // Snapshot read is correct here because conflict range added by lock_is_still_valid is enough
-        let scan_result = txn
-            .get_range(
-                &RangeOption {
+        let scan_result: Vec<_> = txn
+            .get_ranges_keyvalues(
+                RangeOption {
                     limit: Some(NSLOCK_ROLLBACK_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
                     reverse: false,
                     mode: StreamingMode::WantAll,
                     ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
                 },
-                0,
                 true,
             )
+            .try_collect()
             .await?;
 
         let mut delete_count: usize = 0;

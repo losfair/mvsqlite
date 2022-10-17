@@ -6,7 +6,7 @@ use foundationdb::{
     tuple::unpack,
     Database, FdbError, RangeOption, Transaction,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use hyper::{
     body::{HttpBody, Sender},
     Body, Request, Response,
@@ -549,18 +549,18 @@ impl Server {
                                 break;
                             }
                         };
-                        let range = loop {
+                        let range: Vec<_> = loop {
                             let range = txn
-                                .get_range(
-                                    &RangeOption {
+                                .get_ranges_keyvalues(
+                                    RangeOption {
                                         limit: Some(100),
                                         reverse: false,
                                         mode: StreamingMode::WantAll,
                                         ..RangeOption::from(cursor.clone()..end.clone())
                                     },
-                                    0,
                                     true,
                                 )
+                                .try_collect()
                                 .await;
                             match range {
                                 Ok(x) => break x,
