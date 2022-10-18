@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 
 use anyhow::Result;
 use backtrace::Backtrace;
-use mvfs::{types::LockKind, Connection};
+use mvfs::{types::LockKind, vfs::AbstractHttpClient, Connection};
 use slab::Slab;
 use structopt::StructOpt;
 use tokio::sync::Mutex;
@@ -94,9 +94,10 @@ async fn main() -> Result<()> {
     let vfs = mvfs::MultiVersionVfs {
         data_plane: opt.data_plane.clone(),
         sector_size: opt.sector_size,
-        http_client: reqwest::Client::new(),
+        http_client: AbstractHttpClient::Prebuilt(reqwest::Client::new()),
         db_name_map: Arc::new(Default::default()),
         lock_owner: None,
+        fork_tolerant: false,
     };
     let fuse_fs = FuseFs {
         namespaces,
