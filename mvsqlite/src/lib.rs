@@ -11,18 +11,27 @@ pub mod vfs;
 use std::{
     collections::HashMap,
     ffi::CString,
+    os::raw::c_char,
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
-use crate::{io_engine::IoEngine, util::get_conn, vfs::MultiVersionVfs};
+use io_engine::IoEngineKind;
+use mvfs::vfs::AbstractHttpClient;
+
+use crate::{
+    io_engine::IoEngine,
+    util::get_conn,
+    vfs::{AbstractIoEngine, MultiVersionVfs},
+};
 
 pub static VFS_NAME: &'static str = "mvsqlite";
 
 static GLOBAL_INIT_DONE: std::sync::Once = std::sync::Once::new();
 
 pub struct InitOptions {
-    pub coroutine: bool,
+    pub io_engine_kind: IoEngineKind,
+    pub fork_tolerant: bool,
 }
 
 pub fn init_with_options(opts: InitOptions) {
@@ -109,15 +118,28 @@ fn init_with_options_impl(opts: InitOptions) {
         }
     }
 
-    let mut builder = reqwest::ClientBuilder::new();
-    builder = builder.timeout(Duration::from_secs(timeout_secs));
-    if force_http2 {
-        builder = builder.http2_prior_knowledge();
-    }
+    let build_http_client = move || {
+        let mut builder = reqwest::ClientBuilder::new();
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+        if force_http2 {
+            builder = builder.http2_prior_knowledge();
+        }
+        builder.build().expect("failed to build http client")
+    };
 
     let data_plane = std::env::var("MVSQLITE_DATA_PLANE").expect("MVSQLITE_DATA_PLANE is not set");
-    let io_engine = Arc::new(IoEngine::new(opts.coroutine));
-    let http_client = builder.build().expect("failed to build http client");
+    let io_engine = if opts.fork_tolerant {
+        let kind = opts.io_engine_kind;
+        AbstractIoEngine::Builder(Arc::new(Box::new(move || Arc::new(IoEngine::new(kind)))))
+    } else {
+        AbstractIoEngine::Prebuilt(Arc::new(IoEngine::new(opts.io_engine_kind)))
+    };
+
+    let http_client = if opts.fork_tolerant {
+        AbstractHttpClient::Builder(Arc::new(Box::new(build_http_client)))
+    } else {
+        AbstractHttpClient::Prebuilt(build_http_client())
+    };
 
     let default_vfs = MultiVersionVfs {
         io: io_engine.clone(),
@@ -127,6 +149,7 @@ fn init_with_options_impl(opts: InitOptions) {
             http_client: http_client.clone(),
             db_name_map: db_name_map.clone(),
             lock_owner: lock_owner.clone(),
+            fork_tolerant: opts.fork_tolerant,
         },
     };
 
@@ -141,6 +164,7 @@ fn init_with_options_impl(opts: InitOptions) {
                 http_client: http_client.clone(),
                 db_name_map: db_name_map.clone(),
                 lock_owner: lock_owner.clone(),
+                fork_tolerant: opts.fork_tolerant,
             },
         };
         sqlite_vfs::register(&format!("{}-{}", VFS_NAME, sector_size), vfs, false)
@@ -186,7 +210,21 @@ pub extern "C" fn init_mvsqlite() {
             std::process::abort();
         }));
 
-        init_with_options_impl(InitOptions { coroutine: false });
+        let mut io_engine_kind = IoEngineKind::MultiThread;
+        let mut fork_tolerant = false;
+
+        if let Ok(s) = std::env::var("MVSQLITE_FORK_TOLERANT") {
+            if s.as_str() == "1" {
+                io_engine_kind = IoEngineKind::CurrentThread;
+                fork_tolerant = true;
+                tracing::debug!("enabling fork_tolerant");
+            }
+        }
+
+        init_with_options_impl(InitOptions {
+            io_engine_kind,
+            fork_tolerant,
+        });
     });
 }
 
@@ -199,7 +237,7 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
-        mv_last_known_version_name.as_ptr() as *const i8,
+        mv_last_known_version_name.as_ptr() as *const c_char,
         1,
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
@@ -212,7 +250,7 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
-        mv_time2version_name.as_ptr() as *const i8,
+        mv_time2version_name.as_ptr() as *const c_char,
         2,
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
@@ -225,7 +263,7 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
-        mv_pin_version_name.as_ptr() as *const i8,
+        mv_pin_version_name.as_ptr() as *const c_char,
         2,
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
@@ -238,7 +276,7 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
-        mv_unpin_version_name.as_ptr() as *const i8,
+        mv_unpin_version_name.as_ptr() as *const c_char,
         1,
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
@@ -258,7 +296,7 @@ unsafe extern "C" fn mv_last_known_version(
     assert_eq!(argc, 1);
     let db = sqlite_c::sqlite3_context_db_handle(ctx);
     let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
-    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const c_char)
         .to_str()
         .unwrap();
     let conn = get_conn(db, selected_db);
@@ -284,7 +322,7 @@ unsafe extern "C" fn mv_time2version(
     assert_eq!(argc, 2);
     let db = sqlite_c::sqlite3_context_db_handle(ctx);
     let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
-    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const c_char)
         .to_str()
         .unwrap();
     let mut conn = get_conn(db, selected_db);
@@ -312,13 +350,13 @@ unsafe extern "C" fn mv_pin_version(
     assert_eq!(argc, 2);
     let db = sqlite_c::sqlite3_context_db_handle(ctx);
     let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
-    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const c_char)
         .to_str()
         .unwrap();
     let mut conn = get_conn(db, selected_db);
 
     let version = sqlite_c::sqlite3_value_text(*argv.add(1));
-    let version = std::ffi::CStr::from_ptr(version as *const i8)
+    let version = std::ffi::CStr::from_ptr(version as *const c_char)
         .to_str()
         .unwrap();
     match conn.inner.pin_version(version.to_string()) {
@@ -340,7 +378,7 @@ unsafe extern "C" fn mv_unpin_version(
     assert_eq!(argc, 1);
     let db = sqlite_c::sqlite3_context_db_handle(ctx);
     let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
-    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const i8)
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const c_char)
         .to_str()
         .unwrap();
     let mut conn = get_conn(db, selected_db);

@@ -9,8 +9,14 @@ use crate::{
 pub use mvfs::vfs::{PAGE_CACHE_SIZE, PREFETCH_DEPTH, WRITE_CHUNK_SIZE};
 
 pub struct MultiVersionVfs {
-    pub io: Arc<IoEngine>,
+    pub io: AbstractIoEngine,
     pub inner: mvfs::MultiVersionVfs,
+}
+
+#[derive(Clone)]
+pub enum AbstractIoEngine {
+    Prebuilt(Arc<IoEngine>),
+    Builder(Arc<Box<dyn Fn() -> Arc<IoEngine> + Send + Sync + 'static>>),
 }
 
 impl Vfs for MultiVersionVfs {
@@ -30,7 +36,10 @@ impl Vfs for MultiVersionVfs {
             .open(db, true)
             .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
         Ok(Box::new(Connection {
-            io: self.io.clone(),
+            io: match &self.io {
+                AbstractIoEngine::Prebuilt(io) => io.clone(),
+                AbstractIoEngine::Builder(io) => io(),
+            },
             inner: conn,
         }))
     }
@@ -54,9 +63,10 @@ impl Vfs for MultiVersionVfs {
     }
 
     fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
-        self.io.run(async {
-            tokio::time::sleep(duration).await;
-        });
+        match &self.io {
+            AbstractIoEngine::Prebuilt(io) => io.run(tokio::time::sleep(duration)),
+            _ => std::thread::sleep(duration),
+        }
         duration
     }
 

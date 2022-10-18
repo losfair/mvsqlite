@@ -26,12 +26,19 @@ pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
 pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
+pub enum AbstractHttpClient {
+    Prebuilt(reqwest::Client),
+    Builder(Arc<Box<dyn Fn() -> reqwest::Client + Send + Sync + 'static>>),
+}
+
 pub struct MultiVersionVfs {
     pub data_plane: String,
     pub sector_size: usize,
-    pub http_client: reqwest::Client,
+    pub http_client: AbstractHttpClient,
     pub db_name_map: Arc<HashMap<String, String>>,
     pub lock_owner: Option<String>,
+    pub fork_tolerant: bool,
 }
 
 impl MultiVersionVfs {
@@ -97,7 +104,10 @@ impl MultiVersionVfs {
                 ns_key_hashproof,
                 lock_owner: self.lock_owner.clone(),
             },
-            self.http_client.clone(),
+            match &self.http_client {
+                AbstractHttpClient::Prebuilt(c) => c.clone(),
+                AbstractHttpClient::Builder(f) => f(),
+            },
         )?;
 
         let first_page = match self.sector_size {
@@ -118,7 +128,10 @@ impl MultiVersionVfs {
             history: TransitionHistory::default(),
             sector_size: self.sector_size,
             first_page,
-            page_cache: Cache::new(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64),
+            page_cache: Cache::builder()
+                .max_capacity(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64)
+                .thread_pool_enabled(!self.fork_tolerant)
+                .build(),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,

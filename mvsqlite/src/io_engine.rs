@@ -4,19 +4,31 @@ pub struct IoEngine {
     rt: Option<tokio::runtime::Runtime>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IoEngineKind {
+    Coroutine,
+    MultiThread,
+    CurrentThread,
+}
+
 impl IoEngine {
-    pub fn new(coroutine: bool) -> IoEngine {
+    pub fn new(kind: IoEngineKind) -> IoEngine {
         IoEngine {
-            rt: if coroutine {
-                None
-            } else {
-                Some(
+            rt: match kind {
+                IoEngineKind::Coroutine => None,
+                IoEngineKind::MultiThread => Some(
                     tokio::runtime::Builder::new_multi_thread()
                         .worker_threads(2)
                         .enable_all()
                         .build()
                         .unwrap(),
-                )
+                ),
+                IoEngineKind::CurrentThread => Some(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap(),
+                ),
             },
         }
     }
