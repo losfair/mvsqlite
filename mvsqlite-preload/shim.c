@@ -84,13 +84,6 @@ int sqlite3_open(
     return sqlite3_open_v2(filename, ppDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
 }
 
-int sqlite3_open16(
-    const void *filename,   /* Database filename (UTF-16) */
-    sqlite3 **ppDb          /* OUT: SQLite db handle */
-) {
-    abort();
-}
-
 static __thread int in_sqlite3_step = 0;
 
 int sqlite3_step(sqlite3_stmt *pStmt) {
