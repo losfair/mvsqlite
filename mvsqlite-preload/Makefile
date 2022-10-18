@@ -13,7 +13,6 @@ build-lib: shim.o
 build-patched-sqlite3:
 	$(CC) -O2 -fPIC -shared -o libsqlite3.so \
 		-Wl,-z,noexecstack \
-		-DSQLITE_OMIT_UTF16 \
 		-DSQLITE_ENABLE_FTS3 \
 		-DSQLITE_ENABLE_FTS4 \
 		-DSQLITE_ENABLE_FTS5 \
