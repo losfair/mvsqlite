@@ -96,13 +96,9 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
 
-    /// Path to the content cache. A directory for LMDB will be created with this path.
-    #[structopt(long, env = "MVSTORE_CONTENT_CACHE")]
-    content_cache: Option<String>,
-
-    /// Content cache threshold size ("half size") in bytes.
-    #[structopt(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "100000000")]
-    content_cache_size: u64,
+    /// Content cache size in number of pages.
+    #[structopt(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "0")]
+    content_cache_size: usize,
 
     /// Whether this instance is read-only. This enables replica-read from FDB DR replica.
     #[structopt(long)]
@@ -159,12 +155,20 @@ async fn async_main(opt: Opt) -> Result<()> {
         tracing::info!(value = x, "configured nslock rollback scan batch size");
     }
 
+    if opt.content_cache_size != 0 {
+        tracing::info!(
+            value = opt.content_cache_size,
+            "configured content cache size"
+        );
+    }
+
     let server = Server::open(ServerConfig {
         cluster: opt.cluster.clone(),
         raw_data_prefix: opt.raw_data_prefix.clone(),
         metadata_prefix: opt.metadata_prefix.clone(),
         read_only: opt.read_only,
         dr_tag: opt.dr_tag,
+        content_cache_size: opt.content_cache_size,
     })
     .await
     .with_context(|| "failed to initialize server")?;

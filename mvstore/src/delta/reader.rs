@@ -6,6 +6,8 @@ use foundationdb::{
     RangeOption, Transaction,
 };
 use futures::TryStreamExt;
+use moka::future::Cache;
+use thiserror::Error;
 use tokio::task::block_in_place;
 
 use crate::{
@@ -22,6 +24,7 @@ pub struct DeltaReader<'a> {
     pub ns_id: [u8; 10],
     pub key_codec: &'a KeyCodec,
     pub replica_manager: Option<&'a ReplicaManager>,
+    pub content_cache: Option<&'a Cache<[u8; 32], Bytes>>,
 }
 
 impl<'a> DeltaReader<'a> {
@@ -109,15 +112,51 @@ impl<'a> DeltaReader<'a> {
     pub(super) async fn get_page_content_undecoded_snapshot(
         &self,
         hash: [u8; 32],
-    ) -> Result<Option<impl AsRef<[u8]> + Send + Sync + 'static>> {
-        let key = self.key_codec.construct_content_key(self.ns_id, hash);
-        let undecoded = self.txn.get(&key, true).await?;
-        let undecoded = match undecoded {
-            Some(x) => x,
-            None => return Ok(None),
+    ) -> Result<Option<Bytes>> {
+        let fetch_fut = async {
+            let key = self.key_codec.construct_content_key(self.ns_id, hash);
+            let undecoded = self.txn.get(&key, true).await;
+            undecoded.map(|x| match x {
+                Some(x) => Some(Bytes::from(x[..].to_vec())),
+                None => None,
+            })
         };
 
-        Ok(Some(undecoded))
+        let undecoded = match self.content_cache {
+            Some(cache) => {
+                #[derive(Error, Debug)]
+                #[error("not found")]
+                struct NotFoundError;
+
+                let res = cache
+                    .try_get_with(hash, async {
+                        fetch_fut
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|x| x.ok_or_else(|| anyhow::Error::from(NotFoundError)))
+                    })
+                    .await;
+
+                match res {
+                    Ok(x) => Some(x),
+                    Err(e) => {
+                        if e.chain()
+                            .any(|x| x.downcast_ref::<NotFoundError>().is_some())
+                        {
+                            None
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "failed to load page content into cache: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+            None => fetch_fut.await?,
+        };
+
+        Ok(undecoded)
     }
 
     pub(super) async fn decode_page_no_delta<T: AsRef<[u8]> + Send + Sync + 'static>(

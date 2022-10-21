@@ -416,6 +416,7 @@ jobs:
     strategy:
       matrix:
         workload: [workloada, workloadb, workloadc]
+        content_cache_size: ["0", "10000"]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -442,7 +443,8 @@ jobs:
           set -e
           chmod +x ./build/mvstore
           chmod +x ./go-ycsb/go-ycsb
-          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
+            --content-cache-size "${{ matrix.content_cache_size }}" &
           sleep 1
 
           # Preload mode

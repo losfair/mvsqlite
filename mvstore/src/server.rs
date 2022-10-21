@@ -69,6 +69,8 @@ pub struct Server {
     pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
     pub replica_manager: Option<ReplicaManager>,
     pub ns_metadata_cache: NamespaceMetadataCache,
+
+    pub content_cache: Option<Cache<[u8; 32], Bytes>>,
 }
 
 pub struct ServerConfig {
@@ -77,6 +79,7 @@ pub struct ServerConfig {
     pub metadata_prefix: String,
     pub read_only: bool,
     pub dr_tag: String,
+    pub content_cache_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +217,15 @@ impl Server {
                 .build(),
             replica_manager,
             ns_metadata_cache: NamespaceMetadataCache::new(),
+            content_cache: if config.content_cache_size > 0 {
+                Some(
+                    Cache::builder()
+                        .max_capacity(config.content_cache_size as u64)
+                        .build(),
+                )
+            } else {
+                None
+            },
         }))
     }
 
@@ -1276,6 +1288,7 @@ impl Server {
             ns_id,
             key_codec: &self.key_codec,
             replica_manager: self.replica_manager.as_ref(),
+            content_cache: self.content_cache.as_ref(),
         };
         let (version, hash) = match reader
             .read_page_hash(page_index, Some(page_version_hex), true)
@@ -1342,6 +1355,7 @@ impl Server {
             ns_id,
             key_codec: &self.key_codec,
             now,
+            content_cache: self.content_cache.as_ref(),
         });
         let res = applier.apply_write(&write_reqs).await;
         let res = match res {
@@ -1404,6 +1418,7 @@ impl Server {
                 ns_id,
                 key_codec: &self.key_codec,
                 replica_manager: self.replica_manager.as_ref(),
+                content_cache: self.content_cache.as_ref(),
             };
             let content = reader
                 .get_page_content_decoded_snapshot(hash)
