@@ -101,28 +101,17 @@ impl<'a> DeltaReader<'a> {
     }
 
     pub async fn get_page_content_decoded_snapshot(&self, hash: [u8; 32]) -> Result<Option<Bytes>> {
-        let undecoded = match self.get_page_content_undecoded_snapshot(hash).await? {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-        let decoded = self.decode_page_with_delta(undecoded).await?;
-        Ok(Some(decoded))
-    }
-
-    pub(super) async fn get_page_content_undecoded_snapshot(
-        &self,
-        hash: [u8; 32],
-    ) -> Result<Option<Bytes>> {
         let fetch_fut = async {
-            let key = self.key_codec.construct_content_key(self.ns_id, hash);
-            let undecoded = self.txn.get(&key, true).await;
-            undecoded.map(|x| match x {
-                Some(x) => Some(Bytes::from(x[..].to_vec())),
-                None => None,
-            })
+            match self.get_page_content_undecoded_snapshot(hash).await? {
+                Some(x) => match self.decode_page_with_delta(x).await {
+                    Ok(x) => Ok(Some(x)),
+                    Err(e) => Err(e),
+                },
+                None => Ok(None),
+            }
         };
 
-        let undecoded = match self.content_cache {
+        let out = match self.content_cache {
             Some(cache) => {
                 #[derive(Error, Debug)]
                 #[error("not found")]
@@ -146,7 +135,7 @@ impl<'a> DeltaReader<'a> {
                             None
                         } else {
                             return Err(anyhow::anyhow!(
-                                "failed to load page content into cache: {}",
+                                "failed to load decoded page content into cache: {}",
                                 e
                             ));
                         }
@@ -156,7 +145,21 @@ impl<'a> DeltaReader<'a> {
             None => fetch_fut.await?,
         };
 
-        Ok(undecoded)
+        Ok(out)
+    }
+
+    pub(super) async fn get_page_content_undecoded_snapshot(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<impl AsRef<[u8]> + Send + Sync + 'static>> {
+        let key = self.key_codec.construct_content_key(self.ns_id, hash);
+        let undecoded = self.txn.get(&key, true).await?;
+        let undecoded = match undecoded {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+
+        Ok(Some(undecoded))
     }
 
     pub(super) async fn decode_page_no_delta<T: AsRef<[u8]> + Send + Sync + 'static>(
