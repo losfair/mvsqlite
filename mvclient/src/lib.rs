@@ -483,7 +483,7 @@ impl Transaction {
                 let data: ReadResponse = rmp_serde::from_slice(serialized)?;
 
                 let payload = if data.zstd {
-                    zstd::bulk::decompress(data.data, 1048575)?
+                    zstd::bulk::decompress(data.data, 1048576)?
                 } else {
                     data.data.to_vec()
                 };
