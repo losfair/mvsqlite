@@ -118,6 +118,7 @@ impl Server {
                     ns_id: ns.ns_id,
                     key_codec: &self.key_codec,
                     now,
+                    content_cache: self.content_cache.as_ref(),
                 });
                 let res = applier.apply_write(&ns.page_writes).await;
                 match res {
@@ -259,6 +260,7 @@ impl Server {
                     key_codec: &self.key_codec,
                     ns_id: ns.ns_id,
                     replica_manager: None,
+                    content_cache: self.content_cache.as_ref(),
                 };
                 let mut fut_list = FuturesOrdered::new();
                 for &page in &ns.read_set {

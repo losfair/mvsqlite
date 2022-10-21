@@ -5,9 +5,11 @@ use std::{
 };
 
 use blake3::Hash;
+use bytes::Bytes;
 use foundationdb::{options::MutationType, Transaction};
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
+use moka::future::Cache;
 
 use crate::{
     delta::writer::DeltaWriter,
@@ -38,6 +40,7 @@ pub struct WriteApplier<'a> {
     key_codec: &'a KeyCodec,
     now: Duration,
     seen_hashes: HashSet<Hash>,
+    content_cache: Option<&'a Cache<[u8; 32], Bytes>>,
 }
 
 pub struct WriteApplierContext<'a> {
@@ -45,6 +48,7 @@ pub struct WriteApplierContext<'a> {
     pub ns_id: [u8; 10],
     pub key_codec: &'a KeyCodec,
     pub now: Duration,
+    pub content_cache: Option<&'a Cache<[u8; 32], Bytes>>,
 }
 
 struct WriteContext<'a> {
@@ -63,6 +67,7 @@ impl<'a> WriteApplier<'a> {
             key_codec: ctx.key_codec,
             now: ctx.now,
             seen_hashes: HashSet::new(),
+            content_cache: ctx.content_cache,
         }
     }
 
@@ -152,6 +157,7 @@ impl<'a> WriteApplier<'a> {
                         txn: self.txn,
                         ns_id: self.ns_id,
                         key_codec: self.key_codec,
+                        content_cache: self.content_cache,
                     };
                     if let Some(delta_base_index) = req.req.delta_base {
                         match writer.delta_encode(delta_base_index, &req.req.data).await {

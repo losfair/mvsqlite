@@ -1,4 +1,6 @@
+use bytes::Bytes;
 use foundationdb::Transaction;
+use moka::future::Cache;
 
 use crate::{
     delta::reader::DeltaReader, keys::KeyCodec, page::PAGE_ENCODING_DELTA,
@@ -10,6 +12,7 @@ pub struct DeltaWriter<'a> {
     pub txn: &'a Transaction,
     pub ns_id: [u8; 10],
     pub key_codec: &'a KeyCodec,
+    pub content_cache: Option<&'a Cache<[u8; 32], Bytes>>,
 }
 
 impl<'a> DeltaWriter<'a> {
@@ -23,6 +26,7 @@ impl<'a> DeltaWriter<'a> {
             ns_id: self.ns_id,
             key_codec: self.key_codec,
             replica_manager: None,
+            content_cache: self.content_cache,
         };
         let version_hex = hex::encode(&get_txn_read_version_as_versionstamp(self.txn).await?);
 
