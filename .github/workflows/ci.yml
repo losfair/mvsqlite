@@ -415,9 +415,16 @@ jobs:
     - build-ycsb
     strategy:
       matrix:
-        workload: [workloada, workloadb, workloadc]
+        workload: [workloadb]
         content_cache_size: ["0", "10000"]
         wire_zstd: ["", "--wire-zstd"]
+        include:
+          - workload: workloada
+            content_cache_size: "0"
+            wire_zstd: ""
+          - workload: workloadc
+            content_cache_size: "0"
+            wire_zstd: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v2
