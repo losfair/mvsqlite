@@ -100,11 +100,14 @@ impl<'a> DeltaReader<'a> {
         }
     }
 
-    pub async fn get_page_content_decoded_snapshot(&self, hash: [u8; 32]) -> Result<Option<Bytes>> {
+    pub async fn get_page_content_decoded_snapshot_compressed(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<Bytes>> {
         let fetch_fut = async {
             match self.get_page_content_undecoded_snapshot(hash).await? {
                 Some(x) => match self.decode_page_with_delta(x).await {
-                    Ok(x) => Ok(Some(x)),
+                    Ok(x) => Ok(Some(Bytes::from(zstd::bulk::compress(&x, 0)?))),
                     Err(e) => Err(e),
                 },
                 None => Ok(None),

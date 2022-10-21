@@ -90,12 +90,16 @@ pub struct ReadRequest<'a> {
     #[serde(default)]
     #[serde(with = "serde_bytes")]
     pub hash: Option<&'a [u8]>,
+
+    #[serde(default)]
+    pub accept_zstd: bool,
 }
 
 #[derive(Serialize)]
 pub struct ReadResponse {
     pub version: FixedString,
     pub data: Bytes,
+    pub zstd: bool,
 }
 
 #[derive(Deserialize)]
@@ -1276,7 +1280,7 @@ impl Server {
         Ok(res)
     }
 
-    async fn read_page_decoded_snapshot(
+    async fn read_page_decoded_snapshot_compressed(
         &self,
         txn: &Transaction,
         ns_id: [u8; 10],
@@ -1298,7 +1302,7 @@ impl Server {
             None => return Ok(None),
         };
         let data = reader
-            .get_page_content_decoded_snapshot(hash)
+            .get_page_content_decoded_snapshot_compressed(hash)
             .await?
             .with_context(|| "cannot find content for the provided hash")?;
         Ok(Some(Page { version, data }))
@@ -1421,7 +1425,7 @@ impl Server {
                 content_cache: self.content_cache.as_ref(),
             };
             let content = reader
-                .get_page_content_decoded_snapshot(hash)
+                .get_page_content_decoded_snapshot_compressed(hash)
                 .await
                 .with_context(|| "failed to get content by hash")?;
             match content {
@@ -1439,7 +1443,12 @@ impl Server {
                 .await
                 .with_context(|| "failed to create versioned read txn")?;
             let mut page = self
-                .read_page_decoded_snapshot(&txn, ns_id, read_req.page_index, read_req.version)
+                .read_page_decoded_snapshot_compressed(
+                    &txn,
+                    ns_id,
+                    read_req.page_index,
+                    read_req.version,
+                )
                 .await
                 .with_context(|| "error reading page")?;
 
@@ -1452,7 +1461,7 @@ impl Server {
                 if let Some(base) = &metadata.overlay_base {
                     let base_ns_id = decode_version(&base.ns_id)?;
                     let base_page = self
-                        .read_page_decoded_snapshot(
+                        .read_page_decoded_snapshot_compressed(
                             &txn,
                             base_ns_id,
                             read_req.page_index,
@@ -1468,11 +1477,17 @@ impl Server {
         let payload = match page {
             Some(x) => ReadResponse {
                 version: x.version.clone(),
-                data: x.data,
+                data: if read_req.accept_zstd {
+                    x.data
+                } else {
+                    Bytes::from(zstd::bulk::decompress(&x.data, 1048576)?)
+                },
+                zstd: read_req.accept_zstd,
             },
             None => ReadResponse {
                 version: "".into(),
                 data: Bytes::new(),
+                zstd: false,
             },
         };
         Ok(payload)
