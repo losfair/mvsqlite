@@ -100,6 +100,10 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "0")]
     content_cache_size: usize,
 
+    /// Enable ZSTD compression over the wire.
+    #[structopt(long)]
+    wire_zstd: bool,
+
     /// Whether this instance is read-only. This enables replica-read from FDB DR replica.
     #[structopt(long)]
     read_only: bool,
@@ -160,6 +164,11 @@ async fn async_main(opt: Opt) -> Result<()> {
             value = opt.content_cache_size,
             "configured content cache size"
         );
+    }
+
+    if opt.wire_zstd {
+        delta::reader::WIRE_ZSTD.store(true, Ordering::Relaxed);
+        tracing::info!("enabled wire zstd");
     }
 
     let server = Server::open(ServerConfig {

@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     str::FromStr,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -32,7 +32,7 @@ use tokio_util::{
 
 use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
-    delta::reader::DeltaReader,
+    delta::reader::{DeltaReader, WIRE_ZSTD},
     fixed::FixedString,
     keys::KeyCodec,
     lock::DistributedLock,
@@ -1474,15 +1474,20 @@ impl Server {
 
             page
         };
+        let wire_zstd = WIRE_ZSTD.load(Ordering::Relaxed);
         let payload = match page {
             Some(x) => ReadResponse {
                 version: x.version.clone(),
-                data: if read_req.accept_zstd {
-                    x.data
+                data: if wire_zstd {
+                    if read_req.accept_zstd {
+                        x.data
+                    } else {
+                        Bytes::from(zstd::bulk::decompress(&x.data, 1048576)?)
+                    }
                 } else {
-                    Bytes::from(zstd::bulk::decompress(&x.data, 1048576)?)
+                    x.data
                 },
-                zstd: read_req.accept_zstd,
+                zstd: wire_zstd && read_req.accept_zstd,
             },
             None => ReadResponse {
                 version: "".into(),
