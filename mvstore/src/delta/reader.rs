@@ -1,4 +1,7 @@
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use bytes::Bytes;
 use foundationdb::{
@@ -18,6 +21,8 @@ use crate::{
     util::decode_version,
 };
 use anyhow::{Context, Result};
+
+pub static WIRE_ZSTD: AtomicBool = AtomicBool::new(false);
 
 pub struct DeltaReader<'a> {
     pub txn: &'a Transaction,
@@ -100,11 +105,18 @@ impl<'a> DeltaReader<'a> {
         }
     }
 
-    pub async fn get_page_content_decoded_snapshot(&self, hash: [u8; 32]) -> Result<Option<Bytes>> {
+    pub async fn get_page_content_decoded_snapshot_compressed(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<Bytes>> {
         let fetch_fut = async {
             match self.get_page_content_undecoded_snapshot(hash).await? {
                 Some(x) => match self.decode_page_with_delta(x).await {
-                    Ok(x) => Ok(Some(x)),
+                    Ok(x) => Ok(Some(if WIRE_ZSTD.load(Ordering::Relaxed) {
+                        Bytes::from(zstd::bulk::compress(&x, 0)?)
+                    } else {
+                        x
+                    })),
                     Err(e) => Err(e),
                 },
                 None => Ok(None),

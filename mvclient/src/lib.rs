@@ -68,6 +68,9 @@ pub struct ReadRequest<'a> {
     #[serde(default)]
     #[serde(with = "serde_bytes")]
     pub hash: Option<&'a [u8]>,
+
+    #[serde(default)]
+    pub accept_zstd: bool,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +78,8 @@ pub struct ReadResponse<'a> {
     pub version: &'a str,
     #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
+    #[serde(default)]
+    pub zstd: bool,
 }
 
 #[derive(Serialize)]
@@ -444,6 +449,7 @@ impl Transaction {
                 page_index,
                 version: self.version.as_str(),
                 hash: buffered,
+                accept_zstd: true,
             };
             let serialized = rmp_serde::to_vec_named(&req)?;
             raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
@@ -475,7 +481,13 @@ impl Transaction {
                 raw_response = &raw_response[len..];
 
                 let data: ReadResponse = rmp_serde::from_slice(serialized)?;
-                out.push(data.data.to_vec());
+
+                let payload = if data.zstd {
+                    zstd::bulk::decompress(data.data, 1048576)?
+                } else {
+                    data.data.to_vec()
+                };
+                out.push(payload);
                 self.seen_hashes
                     .lock()
                     .unwrap()
