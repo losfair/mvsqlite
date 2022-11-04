@@ -8,7 +8,7 @@ use crate::{
     keys::KeyCodec,
     metadata::{NamespaceLock, NamespaceMetadataCache},
     util::{
-        extract_10_byte_suffix, extract_beu32_suffix, get_last_write_version,
+        decode_version, extract_10_byte_suffix, extract_beu32_suffix, get_last_write_version,
         truncate_10_byte_suffix,
     },
 };
@@ -38,6 +38,7 @@ pub async fn acquire_nslock(
     ns_metadata_cache: &NamespaceMetadataCache,
     ns_id: [u8; 10],
     owner: &str,
+    version: Option<&str>,
 ) -> Result<Response<Body>> {
     if owner.is_empty() || owner.as_bytes().len() > MAX_OWNER_STR_BYTE_SIZE {
         return Ok(Response::builder()
@@ -62,13 +63,17 @@ pub async fn acquire_nslock(
             }
         }
 
-        let lwv = get_last_write_version(&txn, key_codec, ns_id, false).await?;
+        let snapshot_version = if let Some(version) = version {
+            decode_version(version)?
+        } else {
+            get_last_write_version(&txn, key_codec, ns_id, false).await?
+        };
 
         let mut nonce: [u8; 16] = [0u8; 16];
         rand::thread_rng().fill(&mut nonce);
 
         metadata.lock = Some(NamespaceLock {
-            snapshot_version: hex::encode(&lwv),
+            snapshot_version: hex::encode(&snapshot_version),
             owner: owner.to_string(),
             nonce: hex::encode(&nonce),
             rolling_back: false,

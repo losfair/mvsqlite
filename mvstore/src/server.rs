@@ -144,6 +144,8 @@ pub struct CommitResponse {
 #[derive(Deserialize)]
 pub struct NslockAcquireRequest<'a> {
     pub owner: &'a str,
+    #[serde(default)]
+    pub version: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -1251,6 +1253,7 @@ impl Server {
                     &self.ns_metadata_cache,
                     ns_id,
                     body.owner,
+                    body.version,
                 )
                 .await?;
             }
