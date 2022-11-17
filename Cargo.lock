@@ -1184,9 +1184,9 @@ dependencies = [
 
 [[package]]
 name = "moka"
-version = "0.9.4"
+version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd8256cf9fa396576521e5e94affadb95818ec48f5dbedca36714387688aea29"
+checksum = "7b49a05f67020456541f4f29cbaa812016a266a86ec76f96d3873d459c68fe5e"
 dependencies = [
  "async-io",
  "async-lock",
@@ -1198,6 +1198,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "quanta",
+ "rustc_version 0.4.0",
  "scheduled-thread-pool",
  "skeptic",
  "smallvec",
