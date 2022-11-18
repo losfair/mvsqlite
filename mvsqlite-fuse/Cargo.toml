@@ -13,7 +13,7 @@ log = "0.4"
 rand = "0.8.5"
 mvclient = { path = "../mvclient" }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "tracing-log", "json"] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "tracing-log", "json"] }
 libc = "0.2"
 backtrace = "0.3.66"
 serde = { version = "1", features = ["derive"] }

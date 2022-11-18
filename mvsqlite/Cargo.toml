@@ -20,7 +20,7 @@ stackful = "0.1.5"
 mvclient = { path = "../mvclient" }
 tracing = "0.1"
 ctor = "0.1.22"
-tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "json"], optional = true }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "json"], optional = true }
 libc = "0.2"
 backtrace = "0.3.66"
 serde = { version = "1", features = ["derive"] }

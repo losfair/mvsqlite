@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["full"] }
 log = "0.4"
 tracing = "0.1"
 rand = "0.8.5"
-tracing-subscriber = { version = "0.3.15", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "json"] }
 foundationdb = "0.7.0"
 structopt = "0.3.26"
 hyper = { version = "0.14.20", features = ["full"] }
