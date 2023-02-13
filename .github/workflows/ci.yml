@@ -26,11 +26,11 @@ jobs:
           sudo dpkg -i fdb-client.deb
           sudo apt update && sudo apt install -y libfuse3-dev execstack
       - name: Build (mvstore)
-        run: cargo build --release -p mvstore
+        run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
-        run: cargo build --release -p mvsqlite
+        run: cargo build --locked --release -p mvsqlite
       - name: Build (mvsqlite-fuse)
-        run: cargo build --release -p mvsqlite-fuse
+        run: cargo build --locked --release -p mvsqlite-fuse
       - name: Build (shared libraries)
         run: make -C ./mvsqlite-preload build-preload && make -C ./mvsqlite-preload build-lib
       - name: Build (patched libsqlite3)
@@ -43,7 +43,7 @@ jobs:
           patch -p1 ./sqlite3.c < ./sqlite-3390300.patch
           make build-patched-sqlite3
       - name: Build (mvstore-stress)
-        run: cargo build --release -p mvstore-stress
+        run: cargo build --locked --release -p mvstore-stress
       - name: Collect binaries
         run: |
           set -e
