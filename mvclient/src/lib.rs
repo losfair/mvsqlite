@@ -430,8 +430,8 @@ impl Transaction {
     }
 
     pub async fn read_many_nomark(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
-        // wait for async completion
-        self.async_ctx.background_completion.write().await;
+        // Read-your-writes: wait for completion of asynchronous writes.
+        let _ = self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
 
         let mut raw_request: Vec<u8> = Vec::new();
@@ -631,8 +631,8 @@ impl Transaction {
         metadata: Option<String>,
         fast_writes: &HashMap<u32, Bytes>,
     ) -> Result<Option<NamespaceCommitIntent>> {
-        // wait for async completion
-        self.async_ctx.background_completion.write().await;
+        // Wait for all pages in the page buffer to be flushed.
+        let _ = self.async_ctx.background_completion.write().await;
         self.check_async_error()?;
 
         if self.page_buffer.is_empty() && metadata.is_none() && fast_writes.is_empty() {

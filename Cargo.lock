@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "mvclient"
-version = "0.3.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "mvfs"
-version = "0.3.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "mvsqlite"
-version = "0.3.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "mvstore"
-version = "0.3.0-beta.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",

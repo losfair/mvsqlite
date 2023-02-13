@@ -11,7 +11,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 rand = "0.8.5"
-mvclient = { path = "../mvclient" }
+mvclient = { path = "../mvclient", version = "0.3.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "tracing-log", "json"] }
 libc = "0.2"
@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lazy_static = "1.4.0"
 reqwest = { version = "0.11.11", default-features = false, features = ["rustls-tls"] }
-mvfs = { path = "../mvfs" }
+mvfs = { path = "../mvfs", version = "0.3.0" }
 fuser = "0.11.0"
 structopt = "0.3.26"
 indexmap = "1.9.1"
