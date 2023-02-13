@@ -1,6 +1,6 @@
 [package]
 name = "mvsqlite"
-version = "0.3.0-beta.1"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full"] }
 log = "0.4"
 rand = "0.8.5"
 stackful = "0.1.5"
-mvclient = { path = "../mvclient" }
+mvclient = { path = "../mvclient", version = "0.3.0" }
 tracing = "0.1"
 ctor = "0.1.22"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "json"], optional = true }
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lazy_static = "1.4.0"
 reqwest = { version = "0.11.11", default-features = false }
-mvfs = { path = "../mvfs" }
+mvfs = { path = "../mvfs", version = "0.3.0" }
 
 [features]
 default = ["loadext", "syscall", "rustls-tls", "global-init"]
