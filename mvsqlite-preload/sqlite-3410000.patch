@@ -1,6 +1,6 @@
---- sqlite3.c   2022-09-05 11:28:58.000000000 +0000
-+++ sqlite3-mv.c        2022-10-07 08:03:02.699008373 +0000
-@@ -3931,7 +3931,7 @@
+--- sqlite3.c	2023-02-22 03:38:31.000000000 +0800
++++ sqlite3-mv.c	2023-02-23 17:11:57.364365186 +0800
+@@ -3992,7 +3992,7 @@
    const void *filename,   /* Database filename (UTF-16) */
    sqlite3 **ppDb          /* OUT: SQLite db handle */
  );
@@ -9,7 +9,7 @@
    const char *filename,   /* Database filename (UTF-8) */
    sqlite3 **ppDb,         /* OUT: SQLite db handle */
    int flags,              /* Flags */
-@@ -5132,6 +5132,7 @@
+@@ -5193,6 +5193,7 @@
  ** by sqlite3_step().  The use of the "vX" interfaces is recommended.
  */
  SQLITE_API int sqlite3_step(sqlite3_stmt*);
@@ -17,7 +17,7 @@
  
  /*
  ** CAPI3REF: Number of columns in a result set
-@@ -86778,7 +86779,7 @@
+@@ -88534,7 +88535,7 @@
  ** sqlite3Step() to do most of the work.  If a schema error occurs,
  ** call sqlite3Reprepare() and try again.
  */
@@ -26,7 +26,7 @@
    int rc = SQLITE_OK;      /* Result from sqlite3Step() */
    Vdbe *v = (Vdbe*)pStmt;  /* the prepared statement */
    int cnt = 0;             /* Counter to prevent infinite loop of reprepares */
-@@ -130545,7 +130546,7 @@
+@@ -133019,7 +133020,7 @@
    sqlite3_mutex_leave,
    sqlite3_mutex_try,
  #endif
@@ -35,7 +35,7 @@
    sqlite3_release_memory,
    sqlite3_result_error_nomem,
    sqlite3_result_error_toobig,
-@@ -174158,17 +174159,7 @@
+@@ -177430,17 +177431,7 @@
  }
  
  

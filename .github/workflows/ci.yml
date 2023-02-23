@@ -36,11 +36,11 @@ jobs:
       - name: Build (patched libsqlite3)
         run: |
           set -e
-          curl -fL -o sqlite.zip https://www.sqlite.org/2022/sqlite-amalgamation-3390300.zip
+          curl -fL -o sqlite.zip https://www.sqlite.org/2023/sqlite-amalgamation-3410000.zip
           unzip sqlite.zip
-          cp sqlite-amalgamation-3390300/sqlite3.c ./mvsqlite-preload/
+          cp sqlite-amalgamation-3410000/sqlite3.c ./mvsqlite-preload/
           cd mvsqlite-preload
-          patch -p1 ./sqlite3.c < ./sqlite-3390300.patch
+          patch -p1 ./sqlite3.c < ./sqlite-3410000.patch
           make build-patched-sqlite3
       - name: Build (mvstore-stress)
         run: cargo build --locked --release -p mvstore-stress
