@@ -65,9 +65,9 @@ curl http://localhost:7001/api/create_namespace -i -d '{"key":"test"}'
 Build `libsqlite3` and the `sqlite3` CLI: (note that a custom build is only needed here because the `sqlite3` binary shipped on most systems are statically linked to `libsqlite3` and `LD_PRELOAD` don't work)
 
 ```bash
-wget https://www.sqlite.org/2022/sqlite-amalgamation-3390300.zip
-unzip sqlite-amalgamation-3390300.zip
-cd sqlite-amalgamation-3390300
+wget https://www.sqlite.org/2023/sqlite-amalgamation-3410000.zip
+unzip sqlite-amalgamation-3410000.zip
+cd sqlite-amalgamation-3410000
 gcc -O2 -fPIC --shared -o libsqlite3.so ./sqlite3.c -lpthread -ldl -lm
 gcc -O2 -o sqlite3 ./shell.c -L. -lsqlite3
 ```
