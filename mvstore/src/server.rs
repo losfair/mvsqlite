@@ -13,6 +13,7 @@ use hyper::{
 };
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -59,10 +60,12 @@ enum GetError {
     Other(anyhow::Error),
 }
 
-enum CreateNamespaceError {
+enum CreateNamespaceState {
+    Done,
     AlreadyExist,
-    Other(anyhow::Error),
+    OtherError(anyhow::Error),
 }
+
 
 pub struct Server {
     pub db: Database,
@@ -76,6 +79,8 @@ pub struct Server {
     pub ns_metadata_cache: NamespaceMetadataCache,
 
     pub content_cache: Option<Cache<[u8; 32], Bytes>>,
+
+    pub auto_create_ns: bool,
 }
 
 pub struct ServerConfig {
@@ -85,6 +90,7 @@ pub struct ServerConfig {
     pub read_only: bool,
     pub dr_tag: String,
     pub content_cache_size: usize,
+    pub auto_create_ns: bool,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +243,7 @@ impl Server {
             } else {
                 None
             },
+            auto_create_ns: config.auto_create_ns,
         }))
     }
 
@@ -258,13 +265,13 @@ impl Server {
 
     async fn create_namespace(
         &self,
-        key: String,
+        key: &str,
         overlay_base: Option<NamespaceOverlayBase>,
-    ) -> Result<(), CreateNamespaceError> {
+    ) -> Result<CreateNamespaceState> {
         let nskey_key = self.key_codec.construct_nskey_key(&key);
         let nsmd = NamespaceMetadata {
             lock: None,
-            overlay_base: overlay_base,
+            overlay_base,
         };
         if let Some(base) = &nsmd.overlay_base {
             decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
@@ -276,7 +283,7 @@ impl Server {
 
         loop {
             if txn.get(&nskey_key, false).await?.is_some() {
-                return Err(CreateNamespaceError::AlreadyExist)
+                return Ok(CreateNamespaceState::AlreadyExist);
             }
 
             let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
@@ -295,19 +302,18 @@ impl Server {
             );
             match txn.commit().await {
                 Ok(_) => {
-                    return Ok(())
+                    return Ok(CreateNamespaceState::Done);
                 }
                 Err(e) => {
                     txn = match e.on_error().await {
                         Ok(x) => x,
                         Err(e) => {
-                            return Err(CreateNamespaceError::Other(e))
+                            return Ok(CreateNamespaceState::OtherError(e.into()));
                         }
                     };
                 }
             }
         }
-        Ok(())
     }
 
     async fn do_serve_admin_api(self: Arc<Self>, mut req: Request<Body>) -> Result<Response<Body>> {
@@ -317,18 +323,23 @@ impl Server {
             "/api/create_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
-                match self.create_namespace(&body.key, &body.overlay_base).await {
-                    Ok(_) => {
+                match self.create_namespace(&body.key, body.overlay_base).await {
+                    Ok(CreateNamespaceState::Done) => {
                         return Ok(Response::builder()
                                   .status(201)
                                   .body(Body::from("created\n"))?);
                     }
-                    Err(CreateNamespaceError::AlreadyExist) => {
+                    Ok(CreateNamespaceState::AlreadyExist) => {
                         return Ok(Response::builder()
                                   .status(422)
                                   .body(Body::from("this key already exists\n"))?);
                     }
-                    Err(CreateNamespaceError::Other(e)) => {
+                    Ok(CreateNamespaceState::OtherError(e)) => {
+                        return Ok(Response::builder()
+                                  .status(400)
+                                  .body(Body::from(format!("{}", e)))?);
+                    }
+                    Err(e) => {
                         return Ok(Response::builder()
                                   .status(400)
                                   .body(Body::from(format!("{}", e)))?);
@@ -810,23 +821,6 @@ impl Server {
         }
     }
 
-    async fn prepare_lookup_nskey_response(
-        &self,
-        nskey: &str,
-        hashproof: Option<&str>,
-    ) -> Result<Option<[u8; 10]>> {
-        let ns_id = self.lookup_nskey(nskey, hashproof).await?;
-        let ns_id = match ns_id {
-            Some(x) => x,
-            None => {
-                return Ok(Response::builder()
-                    .status(404)
-                    .body(Body::from("namespace not found"))?)
-            }
-        };
-        ns_id
-    }
-
     async fn do_serve_data_plane_stage1(
         self: Arc<Self>,
         req: Request<Body>,
@@ -845,9 +839,36 @@ impl Server {
                 .headers()
                 .get("x-namespace-hashproof")
                 .map(|x| x.to_str().unwrap_or_default());
-            let ns_id = self
-                .prepare_lookup_nskey_response(ns_key, hashproof)
-                .await?;
+            let ns_id = self.lookup_nskey(ns_key, hashproof).await?;
+            let ns_id = match ns_id {
+                Some(x) => x,
+                None => {
+                    if self.auto_create_ns {
+                        match self.create_namespace(ns_key, None).await? {
+                            CreateNamespaceState::Done => {
+                                match self.lookup_nskey(ns_key, None).await? {
+                                    Some(x) => x,
+                                    None => {
+                                        return Ok(Response::builder()
+                                            .status(500)
+                                            .body(Body::from("namespace could not be created"))?)
+                                        }
+                                }
+                            }
+                            _ => {
+                                warn!("namespace could not be created");
+                                return Ok(Response::builder()
+                                    .status(500)
+                                    .body(Body::from("namespace could not be created"))?)
+                            }
+                        }
+                    } else { 
+                        return Ok(Response::builder()
+                            .status(404)
+                            .body(Body::from("namespace not found"))?)
+                    }
+                }
+            };
             Some(ns_id)
         } else {
             None
@@ -1125,9 +1146,38 @@ impl Server {
                     }
                     total_page_count += init.num_pages as usize;
 
-                    let ns_id = self
-                        .prepare_lookup_nskey_response(init.ns_key, init.ns_key_hashproof)
-                        .await?;
+                    let ns_id = match self
+                        .lookup_nskey(init.ns_key, init.ns_key_hashproof)
+                        .await?
+                    {
+                        Some(x) => x,
+                        None => {
+                            if self.auto_create_ns {
+                                match self.create_namespace(init.ns_key, None).await? {
+                                    CreateNamespaceState::Done => {
+                                        match self.lookup_nskey(init.ns_key, None).await? {
+                                            Some(x) => x,
+                                            None => {
+                                                return Ok(Response::builder()
+                                                    .status(500)
+                                                    .body(Body::from("namespace could not be created"))?)
+                                                }
+                                        }
+                                    }
+                                    _ => {
+                                        warn!("namespace could not be created");
+                                        return Ok(Response::builder()
+                                            .status(500)
+                                            .body(Body::from("namespace could not be created"))?)
+                                    }
+                                }
+                            } else { 
+                                return Ok(Response::builder()
+                                    .status(404)
+                                    .body(Body::from("namespace not found"))?)
+                            }
+                        }
+                    };
                     let client_assumed_version = decode_version(&init.version)?;
 
                     let mut ns_ctx = CommitNamespaceContext {
