@@ -96,7 +96,6 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
 
-
     /// Auto create namespace on request
     #[structopt(long)]
     auto_create_namespace: bool,

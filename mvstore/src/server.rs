@@ -59,7 +59,6 @@ enum GetError {
     Other(anyhow::Error),
 }
 
-
 #[derive(Debug)]
 enum CreateNamespaceState {
     AlreadyExist,
@@ -72,7 +71,6 @@ impl std::fmt::Display for CreateNamespaceState {
 }
 
 impl std::error::Error for CreateNamespaceState {}
-
 
 pub struct Server {
     pub db: Database,
@@ -333,23 +331,21 @@ impl Server {
                 match self.create_namespace(&body.key, body.overlay_base).await {
                     Ok(_) => {
                         return Ok(Response::builder()
-                                  .status(201)
-                                  .body(Body::from("created\n"))?);
+                            .status(201)
+                            .body(Body::from("created\n"))?);
                     }
-                    Err(e) => {
-                        match e.downcast_ref() {
-                            Some(CreateNamespaceState::AlreadyExist) => {
-                                return Ok(Response::builder()
-                                          .status(422)
-                                          .body(Body::from("this key already exists\n"))?);
-                            },
-                            _ => {
-                                return Ok(Response::builder()
-                                          .status(400)
-                                          .body(Body::from(format!("{}", e)))?);
-                            }
+                    Err(e) => match e.downcast_ref() {
+                        Some(CreateNamespaceState::AlreadyExist) => {
+                            return Ok(Response::builder()
+                                .status(422)
+                                .body(Body::from("this key already exists\n"))?);
                         }
-                    }
+                        _ => {
+                            return Ok(Response::builder()
+                                .status(400)
+                                .body(Body::from(format!("{}", e)))?);
+                        }
+                    },
                 }
             }
 
@@ -855,7 +851,7 @@ impl Server {
                     } else {
                         return Ok(Response::builder()
                             .status(404)
-                            .body(Body::from("namespace not found"))?)
+                            .body(Body::from("namespace not found"))?);
                     }
                 }
             };
@@ -1148,7 +1144,7 @@ impl Server {
                             } else {
                                 return Ok(Response::builder()
                                     .status(404)
-                                    .body(Body::from("namespace not found"))?)
+                                    .body(Body::from("namespace not found"))?);
                             }
                         }
                     };
