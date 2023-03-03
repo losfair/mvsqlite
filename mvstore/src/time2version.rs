@@ -3,10 +3,7 @@ use std::time::SystemTime;
 use crate::{keys::KeyCodec, replica::ReplicaManager};
 use anyhow::Result;
 use foundationdb::{
-    future::{FdbValue},
-    options::StreamingMode,
-    tuple::unpack,
-    RangeOption, Transaction,
+    future::FdbValue, options::StreamingMode, tuple::unpack, RangeOption, Transaction,
 };
 use futures::TryStreamExt;
 use serde::Serialize;
