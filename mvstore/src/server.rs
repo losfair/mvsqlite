@@ -60,17 +60,17 @@ enum GetError {
 }
 
 #[derive(Debug)]
-enum CreateNamespaceState {
+enum CreateNamespaceError {
     AlreadyExist,
 }
 
-impl std::fmt::Display for CreateNamespaceState {
+impl std::fmt::Display for CreateNamespaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl std::error::Error for CreateNamespaceState {}
+impl std::error::Error for CreateNamespaceError {}
 
 pub struct Server {
     pub db: Database,
@@ -288,7 +288,7 @@ impl Server {
 
         loop {
             if txn.get(&nskey_key, false).await?.is_some() {
-                return Err(anyhow::Error::new(CreateNamespaceState::AlreadyExist));
+                return Err(anyhow::Error::new(CreateNamespaceError::AlreadyExist));
             }
 
             let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
@@ -335,7 +335,7 @@ impl Server {
                             .body(Body::from("created\n"))?);
                     }
                     Err(e) => match e.downcast_ref() {
-                        Some(CreateNamespaceState::AlreadyExist) => {
+                        Some(CreateNamespaceError::AlreadyExist) => {
                             return Ok(Response::builder()
                                 .status(422)
                                 .body(Body::from("this key already exists\n"))?);
