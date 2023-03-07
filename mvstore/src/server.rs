@@ -1138,14 +1138,9 @@ impl Server {
                     {
                         Some(x) => x,
                         None => {
-                            if self.auto_create_ns {
-                                self.create_namespace(init.ns_key, None).await?;
-                                self.lookup_nskey(init.ns_key, None).await?.unwrap()
-                            } else {
-                                return Ok(Response::builder()
-                                    .status(404)
-                                    .body(Body::from("namespace not found"))?);
-                            }
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Body::from("namespace not found"))?);
                         }
                     };
                     let client_assumed_version = decode_version(&init.version)?;
