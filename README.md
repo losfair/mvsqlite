@@ -56,7 +56,7 @@ RUST_LOG=info ./mvstore \
   --raw-data-prefix m
 ```
 
-You can autocreate namespaces by passing the flag `--auto-create-namespace` to `mvstore` or manually reate a namespace with the admin API:
+You can autocreate namespaces by passing the flag `--auto-create-namespace` to `mvstore` or manually create a namespace with the admin API:
 
 ```bash
 curl http://localhost:7001/api/create_namespace -i -d '{"key":"test"}'
