@@ -96,6 +96,10 @@ struct Opt {
     #[structopt(long, env = "MVSTORE_METADATA_PREFIX")]
     metadata_prefix: String,
 
+    /// Auto create namespace on request
+    #[structopt(long)]
+    auto_create_namespace: bool,
+
     /// Content cache size in number of pages.
     #[structopt(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "0")]
     content_cache_size: usize,
@@ -178,6 +182,7 @@ async fn async_main(opt: Opt) -> Result<()> {
         read_only: opt.read_only,
         dr_tag: opt.dr_tag,
         content_cache_size: opt.content_cache_size,
+        auto_create_ns: opt.auto_create_namespace,
     })
     .await
     .with_context(|| "failed to initialize server")?;

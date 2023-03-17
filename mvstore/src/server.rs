@@ -59,6 +59,19 @@ enum GetError {
     Other(anyhow::Error),
 }
 
+#[derive(Debug)]
+enum CreateNamespaceError {
+    AlreadyExist,
+}
+
+impl std::fmt::Display for CreateNamespaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for CreateNamespaceError {}
+
 pub struct Server {
     pub db: Database,
 
@@ -71,6 +84,8 @@ pub struct Server {
     pub ns_metadata_cache: NamespaceMetadataCache,
 
     pub content_cache: Option<Cache<[u8; 32], Bytes>>,
+
+    pub auto_create_ns: bool,
 }
 
 pub struct ServerConfig {
@@ -80,6 +95,7 @@ pub struct ServerConfig {
     pub read_only: bool,
     pub dr_tag: String,
     pub content_cache_size: usize,
+    pub auto_create_ns: bool,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +248,7 @@ impl Server {
             } else {
                 None
             },
+            auto_create_ns: config.auto_create_ns,
         }))
     }
 
@@ -251,6 +268,59 @@ impl Server {
         }
     }
 
+    async fn create_namespace(
+        &self,
+        key: &str,
+        overlay_base: Option<NamespaceOverlayBase>,
+    ) -> Result<()> {
+        let nskey_key = self.key_codec.construct_nskey_key(&key);
+        let nsmd = NamespaceMetadata {
+            lock: None,
+            overlay_base,
+        };
+        if let Some(base) = &nsmd.overlay_base {
+            decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
+            decode_version(&base.snapshot_version)
+                .with_context(|| "overlay_base: invalid snapshot_version")?;
+        }
+        let nsmd = serde_json::to_string(&nsmd)?;
+        let mut txn = self.db.create_trx()?;
+
+        loop {
+            if txn.get(&nskey_key, false).await?.is_some() {
+                return Err(anyhow::Error::new(CreateNamespaceError::AlreadyExist));
+            }
+
+            let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                &self.key_codec.construct_nsmd_key([0u8; 10]),
+            );
+            let nskey_atomic_op_value = [0u8; 14];
+            txn.atomic_op(
+                &nsmd_atomic_op_key,
+                nsmd.as_bytes(),
+                MutationType::SetVersionstampedKey,
+            );
+            txn.atomic_op(
+                &nskey_key,
+                &nskey_atomic_op_value,
+                MutationType::SetVersionstampedValue,
+            );
+            match txn.commit().await {
+                Ok(_) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    txn = match e.on_error().await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            return Err(e.into());
+                        }
+                    };
+                }
+            }
+        }
+    }
+
     async fn do_serve_admin_api(self: Arc<Self>, mut req: Request<Body>) -> Result<Response<Body>> {
         let uri = req.uri();
         let res: Response<Body>;
@@ -258,62 +328,24 @@ impl Server {
             "/api/create_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
-
-                let nsmd = NamespaceMetadata {
-                    lock: None,
-                    overlay_base: body.overlay_base,
-                };
-
-                if let Some(base) = &nsmd.overlay_base {
-                    decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
-                    decode_version(&base.snapshot_version)
-                        .with_context(|| "overlay_base: invalid snapshot_version")?;
-                }
-
-                let nsmd = serde_json::to_string(&nsmd)?;
-
-                let mut txn = self.db.create_trx()?;
-
-                loop {
-                    if txn.get(&nskey_key, false).await?.is_some() {
+                match self.create_namespace(&body.key, body.overlay_base).await {
+                    Ok(_) => {
                         return Ok(Response::builder()
-                            .status(422)
-                            .body(Body::from("this key already exists\n"))?);
+                            .status(201)
+                            .body(Body::from("created\n"))?);
                     }
-
-                    let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
-                        &self.key_codec.construct_nsmd_key([0u8; 10]),
-                    );
-                    let nskey_atomic_op_value = [0u8; 14];
-                    txn.atomic_op(
-                        &nsmd_atomic_op_key,
-                        nsmd.as_bytes(),
-                        MutationType::SetVersionstampedKey,
-                    );
-                    txn.atomic_op(
-                        &nskey_key,
-                        &nskey_atomic_op_value,
-                        MutationType::SetVersionstampedValue,
-                    );
-                    match txn.commit().await {
-                        Ok(_) => {
-                            res = Response::builder()
-                                .status(201)
-                                .body(Body::from("created\n"))?;
-                            break;
+                    Err(e) => match e.downcast_ref() {
+                        Some(CreateNamespaceError::AlreadyExist) => {
+                            return Ok(Response::builder()
+                                .status(422)
+                                .body(Body::from("this key already exists\n"))?);
                         }
-                        Err(e) => {
-                            txn = match e.on_error().await {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    return Ok(Response::builder()
-                                        .status(400)
-                                        .body(Body::from(format!("{}", e)))?)
-                                }
-                            };
+                        _ => {
+                            return Ok(Response::builder()
+                                .status(400)
+                                .body(Body::from(format!("{}", e)))?);
                         }
-                    }
+                    },
                 }
             }
 
@@ -813,9 +845,14 @@ impl Server {
             let ns_id = match ns_id {
                 Some(x) => x,
                 None => {
-                    return Ok(Response::builder()
-                        .status(404)
-                        .body(Body::from("namespace not found"))?)
+                    if self.auto_create_ns {
+                        self.create_namespace(ns_key, None).await?;
+                        self.lookup_nskey(ns_key, None).await?.unwrap()
+                    } else {
+                        return Ok(Response::builder()
+                            .status(404)
+                            .body(Body::from("namespace not found"))?);
+                    }
                 }
             };
             Some(ns_id)
@@ -1106,7 +1143,6 @@ impl Server {
                                 .body(Body::from("namespace not found"))?);
                         }
                     };
-
                     let client_assumed_version = decode_version(&init.version)?;
 
                     let mut ns_ctx = CommitNamespaceContext {
