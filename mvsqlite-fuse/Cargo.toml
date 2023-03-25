@@ -23,6 +23,6 @@ reqwest = { version = "0.11.11", default-features = false, features = ["rustls-t
 mvfs = { path = "../mvfs", version = "0.3.0" }
 fuser = "0.11.0"
 structopt = "0.3.26"
-indexmap = "1.9.1"
+indexmap = "1.9.3"
 slab = "0.4.7"
 regex = "1.6"
