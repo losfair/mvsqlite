@@ -42,7 +42,7 @@ serde_bytes = "0.11"
 zstd = "0.11.2"
 moka = { version = "0.9.4", features = ["future"] }
 bloom = "0.3.2"
-constant_time_eq = "0.2.4"
+constant_time_eq = "0.3.0"
 heapless = { version = "0.7", features = ["serde"] }
 lmdb-rkv = "0.14.0"
 bumpalo = "3.11.1"
