@@ -28,7 +28,7 @@ rand = "0.8.5"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "json"] }
 foundationdb = "0.7.0"
 structopt = "0.3.26"
-hyper = { version = "0.14.20", features = ["full"] }
+hyper = { version = "0.14.28", features = ["full"] }
 url = "2.3.1"
 hex = "0.4.3"
 serde = { version = "1", features = ["derive"] }
