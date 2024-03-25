@@ -26,7 +26,7 @@ backtrace = "0.3.66"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lazy_static = "1.4.0"
-reqwest = { version = "0.11.11", default-features = false }
+reqwest = { version = "0.12.2", default-features = false }
 mvfs = { path = "../mvfs", version = "0.3.0" }
 
 [features]
