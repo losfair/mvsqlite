@@ -24,7 +24,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo brew update && sudo brew install macfuse
+          brew update && brew install macfuse
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
@@ -83,7 +83,7 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
           cargo install cargo-deb
-          sudo brew update && sudo brew install --cask macfuse # stop cargo from complaining, not really needed
+          brew update && brew install --cask macfuse # stop cargo from complaining, not really needed
       - name: Build mvstore
         run: cd mvstore && cargo deb && cd .. && mkdir deb && cp ./target/debian/*.deb ./deb/
       - name: Push
@@ -367,7 +367,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo brew update && sudo brew install macfuse
+          brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -441,7 +441,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo brew update && sudo brew install macfuse
+          brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v2
         with:
