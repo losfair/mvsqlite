@@ -2,7 +2,7 @@ name: build
 on:
   push:
   schedule:
-  - cron: '10 * * * *'
+    - cron: "10 * * * *"
 jobs:
   build:
     name: Build
@@ -24,7 +24,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo apt update && sudo apt install -y libfuse3-dev execstack
+          sudo brew update && sudo brew install macfuse
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
@@ -83,7 +83,7 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
           cargo install cargo-deb
-          sudo apt update && sudo apt install -y libfuse3-dev # stop cargo from complaining, not really needed
+          sudo brew update && sudo brew install --cask macfuse # stop cargo from complaining, not really needed
       - name: Build mvstore
         run: cd mvstore && cargo deb && cd .. && mkdir deb && cp ./target/debian/*.deb ./deb/
       - name: Push
@@ -95,7 +95,7 @@ jobs:
     name: mvstore stress test
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -122,7 +122,7 @@ jobs:
     name: mvstore stress test
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -148,7 +148,7 @@ jobs:
     name: mvstore stress test (disable read set)
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -175,7 +175,7 @@ jobs:
     name: mvstore stress test (small gc batch)
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -203,7 +203,7 @@ jobs:
     name: mvstore stress test (gc without fresh time check)
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -232,7 +232,7 @@ jobs:
     name: mvstore stress test (gc without fresh time check + multi phase commit)
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -261,7 +261,7 @@ jobs:
     name: mvstore stress test (buggify)
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -292,7 +292,7 @@ jobs:
     name: SQLite benchmark (speedtest1), default page size
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -325,7 +325,7 @@ jobs:
     name: SQLite benchmark (speedtest1), 16K pages
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -358,7 +358,7 @@ jobs:
     name: SQLite benchmark (speedtest1), default page size, fuse
     runs-on: ubuntu-20.04
     needs:
-    - build
+      - build
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -367,7 +367,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo apt update && sudo apt install -y libfuse3-dev
+          sudo brew update && sudo brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -402,25 +402,25 @@ jobs:
     name: Build ycsb
     runs-on: ubuntu-20.04
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-    - name: Build
-      run: |
-        git clone https://github.com/losfair/go-ycsb
-        cd go-ycsb
-        git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
-        make
-    - name: Push binaries
-      uses: actions/upload-artifact@v3
-      with:
-        name: go-ycsb
-        path: ./go-ycsb/bin/go-ycsb
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Build
+        run: |
+          git clone https://github.com/losfair/go-ycsb
+          cd go-ycsb
+          git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
+          make
+      - name: Push binaries
+        uses: actions/upload-artifact@v3
+        with:
+          name: go-ycsb
+          path: ./go-ycsb/bin/go-ycsb
   ycsb:
     name: ycsb
     runs-on: ubuntu-20.04
     needs:
-    - build
-    - build-ycsb
+      - build
+      - build-ycsb
     strategy:
       matrix:
         workload: [workloadb]
@@ -441,7 +441,7 @@ jobs:
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
           installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
-          sudo apt update && sudo apt install -y libfuse3-3
+          sudo brew update && sudo brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v2
         with:
@@ -472,32 +472,32 @@ jobs:
   release:
     name: Release
     needs:
-    - build
-    - stress
-    - stress-buggify
-    - stress-small-gc-batch
-    - stress-gc-nofresh
-    - stress-commit-multi-phase
-    - stress-disable-read-set
-    - build-deb
+      - build
+      - stress
+      - stress-buggify
+      - stress-small-gc-batch
+      - stress-gc-nofresh
+      - stress-commit-multi-phase
+      - stress-disable-read-set
+      - build-deb
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/download-artifact@v3
-      with:
-        name: build
-        path: ./build
-    - uses: actions/download-artifact@v3
-      with:
-        name: deb
-        path: ./deb
-    - uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          build/mvstore
-          build/mvsqlite-fuse
-          build/libmvsqlite_preload.so
-          build/libmvsqlite.a
-          build/libsqlite3.so
-          deb/*.deb
-        prerelease: true
+      - uses: actions/download-artifact@v3
+        with:
+          name: build
+          path: ./build
+      - uses: actions/download-artifact@v3
+        with:
+          name: deb
+          path: ./deb
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/mvstore
+            build/mvsqlite-fuse
+            build/libmvsqlite_preload.so
+            build/libmvsqlite.a
+            build/libsqlite3.so
+            deb/*.deb
+          prerelease: true
