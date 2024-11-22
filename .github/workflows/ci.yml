@@ -35,11 +35,11 @@ jobs:
           eval "$(/opt/homebrew/bin/brew shellenv)"
           brew update && brew install macfuse
       - name: Build (mvstore)
-        run: cargo build --locked --release -p mvstore
+        run: RUST_BACKTRACE=1 cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
-        run: cargo build --locked --release -p mvsqlite
+        run: RUST_BACKTRACE=1 cargo build --locked --release -p mvsqlite
       - name: Build (mvsqlite-fuse)
-        run: cargo build --locked --release -p mvsqlite-fuse
+        run: RUST_BACKTRACE=1 cargo build --locked --release -p mvsqlite-fuse
       - name: Build (shared libraries)
         run: make -C ./mvsqlite-preload build-preload && make -C ./mvsqlite-preload build-lib
       - name: Build (patched libsqlite3)
@@ -52,7 +52,7 @@ jobs:
           patch -p1 ./sqlite3.c < ./sqlite-3410000.patch
           make build-patched-sqlite3
       - name: Build (mvstore-stress)
-        run: cargo build --locked --release -p mvstore-stress
+        run: RUST_BACKTRACE=1 cargo build --locked --release -p mvstore-stress
       - name: Collect binaries
         run: |
           set -e
