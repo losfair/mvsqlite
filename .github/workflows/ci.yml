@@ -23,8 +23,8 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
           brew update && brew install macfuse
+          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
