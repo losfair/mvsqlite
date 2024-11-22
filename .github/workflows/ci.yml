@@ -75,7 +75,7 @@ jobs:
           path: ./build
   build-deb:
     name: Build DEB
-    runs-on: ubuntu-20.04
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v3
