@@ -23,8 +23,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           brew update && brew install macfuse
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
@@ -82,8 +81,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           cargo install cargo-deb
           brew update && brew install --cask macfuse # stop cargo from complaining, not really needed
       - name: Build mvstore
@@ -105,8 +103,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -133,8 +130,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -160,8 +156,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -188,8 +183,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -217,8 +211,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -247,8 +240,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -277,8 +269,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -309,8 +300,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -343,8 +333,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -377,8 +366,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v3
@@ -452,8 +440,7 @@ jobs:
         run: |
           set -e
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
-          mkdir -p /usr/local/lib/
-          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v2
