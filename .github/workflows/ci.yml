@@ -25,6 +25,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo >> /Users/runner/.bash_profile
           echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> /Users/runner/.bash_profile
@@ -88,6 +92,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
           cargo install cargo-deb
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo >> /Users/runner/.bash_profile
@@ -115,6 +123,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -143,6 +155,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -170,6 +186,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -198,6 +218,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -227,6 +251,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -257,6 +285,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -287,6 +319,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -319,6 +355,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -353,6 +393,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -387,6 +431,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo >> /Users/runner/.bash_profile
           echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> /Users/runner/.bash_profile
@@ -466,6 +514,10 @@ jobs:
           curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
           sudo mkdir -p /usr/local/lib/
           sudo mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
+          sudo mkdir -p /usr/local/include/
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/foundationdb.zip --output foundationdb.zip
+          sudo mv ./foundationdb.zip /usr/local/include/foundationdb.zip
+          sudo unzip /usr/local/include/foundationdb.zip
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo >> /Users/runner/.bash_profile
           echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> /Users/runner/.bash_profile
