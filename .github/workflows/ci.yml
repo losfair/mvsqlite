@@ -478,6 +478,11 @@ jobs:
         uses: actions/checkout@v2
       - name: Build
         run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo >> /Users/runner/.bash_profile
+          echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> /Users/runner/.bash_profile
+          eval "$(/opt/homebrew/bin/brew shellenv)"
+          brew update && brew install go
           git clone https://github.com/losfair/go-ycsb
           cd go-ycsb
           git checkout e6bad4a1af10fbd4d921c5f578d7d57cf80b08ea
