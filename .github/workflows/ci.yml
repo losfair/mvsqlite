@@ -80,8 +80,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           cargo install cargo-deb
           brew update && brew install --cask macfuse # stop cargo from complaining, not really needed
       - name: Build mvstore
@@ -102,8 +102,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -129,8 +129,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -155,8 +155,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -182,8 +182,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -210,8 +210,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -239,8 +239,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -268,8 +268,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -299,8 +299,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -332,8 +332,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
       - name: Fetch binaries
         uses: actions/download-artifact@v3
         with:
@@ -365,8 +365,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v3
@@ -439,8 +439,8 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.3.43/FoundationDB-7.3.43_arm64.pkg --output FoundationDB.pkg
-          installer -pkg FoundationDB.pkg -target CurrentUserHomeDirectory
+          curl -L https://github.com/pnewell/foundationdb_mac_binary/releases/download/1/libfdb_c.dylib --output libfdb_c.dylib
+          mv ./libfdb_c.dylib /usr/local/lib/libfdb_c.dylib
           brew update && brew install macfuse
       - name: Fetch binaries
         uses: actions/download-artifact@v2
