@@ -77,8 +77,8 @@ impl NamespaceMetadataCache {
         Ok(cached)
     }
 
-    pub fn run_pending_tasks(&self) {
-        self.cache.run_pending_tasks();
+    pub async fn run_pending_tasks(&self) {
+        self.cache.run_pending_tasks().await;
     }
 
     pub fn set(

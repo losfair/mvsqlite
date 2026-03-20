@@ -702,12 +702,14 @@ impl Server {
     async fn globaltask_cache_maintenance(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            self.nskey_cache.run_pending_tasks();
-            self.read_version_cache.run_pending_tasks();
-            self.read_version_and_nsid_to_lwv_cache.run_pending_tasks();
-            self.ns_metadata_cache.run_pending_tasks();
+            self.nskey_cache.run_pending_tasks().await;
+            self.read_version_cache.run_pending_tasks().await;
+            self.read_version_and_nsid_to_lwv_cache
+                .run_pending_tasks()
+                .await;
+            self.ns_metadata_cache.run_pending_tasks().await;
             if let Some(cache) = &self.content_cache {
-                cache.run_pending_tasks();
+                cache.run_pending_tasks().await;
             }
         }
     }
