@@ -696,6 +696,20 @@ impl Server {
 
     pub fn spawn_background_tasks(self: Arc<Self>) {
         tokio::spawn(self.clone().globaltask_timekeeper());
+        tokio::spawn(self.clone().globaltask_cache_maintenance());
+    }
+
+    async fn globaltask_cache_maintenance(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            self.nskey_cache.run_pending_tasks();
+            self.read_version_cache.run_pending_tasks();
+            self.read_version_and_nsid_to_lwv_cache.run_pending_tasks();
+            self.ns_metadata_cache.run_pending_tasks();
+            if let Some(cache) = &self.content_cache {
+                cache.run_pending_tasks();
+            }
+        }
     }
 
     async fn globaltask_timekeeper(self: Arc<Self>) {
@@ -1529,7 +1543,7 @@ impl Server {
                 zstd: wire_zstd && read_req.accept_zstd,
             },
             None => ReadResponse {
-                version: "".into(),
+                version: FixedString::new(),
                 data: Bytes::new(),
                 zstd: false,
             },

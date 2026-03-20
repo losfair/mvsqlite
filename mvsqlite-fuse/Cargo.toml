@@ -7,10 +7,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
-rand = "0.8.5"
+rand = "0.9"
 mvclient = { path = "../mvclient", version = "0.3.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "tracing-log", "json"] }
@@ -19,10 +19,10 @@ backtrace = "0.3.66"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lazy_static = "1.4.0"
-reqwest = { version = "0.11.11", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 mvfs = { path = "../mvfs", version = "0.3.0" }
-fuser = "0.11.0"
+fuser = "0.14"
 structopt = "0.3.26"
-indexmap = "1.9.1"
+indexmap = "2"
 slab = "0.4.7"
 regex = "1.6"

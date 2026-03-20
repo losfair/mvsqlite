@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use foundationdb::{Database, FdbError, Transaction};
-use rand::{thread_rng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -24,7 +24,7 @@ pub struct DistributedLock {
 impl DistributedLock {
     pub fn new(key: Vec<u8>, description: String) -> Self {
         let mut owner_id = [0u8; 16];
-        thread_rng().fill_bytes(&mut owner_id);
+        rand::rng().fill_bytes(&mut owner_id);
         Self {
             key,
             description,

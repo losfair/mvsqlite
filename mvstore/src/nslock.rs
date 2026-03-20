@@ -70,7 +70,7 @@ pub async fn acquire_nslock(
         };
 
         let mut nonce: [u8; 16] = [0u8; 16];
-        rand::thread_rng().fill(&mut nonce);
+        rand::rng().fill(&mut nonce);
 
         metadata.lock = Some(NamespaceLock {
             snapshot_version: hex::encode(&snapshot_version),

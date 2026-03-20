@@ -77,6 +77,10 @@ impl NamespaceMetadataCache {
         Ok(cached)
     }
 
+    pub fn run_pending_tasks(&self) {
+        self.cache.run_pending_tasks();
+    }
+
     pub fn set(
         &self,
         txn: &Transaction,

@@ -27,10 +27,10 @@ impl RandomizedExponentialBackoff {
     }
 
     pub fn next(&mut self) -> Duration {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let random_delay = (self.delay.as_millis() as f64 * self.random_factor) as i64;
         let dur = Duration::from_millis(
-            (self.delay.as_millis() as i64 + rng.gen_range(-random_delay..=random_delay)) as u64,
+            (self.delay.as_millis() as i64 + rng.random_range(-random_delay..=random_delay)) as u64,
         );
 
         self.delay = self.delay * 3 / 2;

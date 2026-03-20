@@ -47,7 +47,7 @@ pub struct MultiVersionClientConfig {
 
 impl MultiVersionClientConfig {
     fn random_data_plane(&self) -> &Url {
-        let index = rand::thread_rng().gen_range(0..self.data_plane.len());
+        let index = rand::rng().random_range(0..self.data_plane.len());
         &self.data_plane[index]
     }
 }
@@ -262,7 +262,7 @@ impl MultiVersionClient {
         url.set_path("/batch/commit");
 
         let mut idempotency_key: [u8; 16] = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut idempotency_key);
+        rand::rng().fill_bytes(&mut idempotency_key);
 
         let mut boff = RandomizedExponentialBackoff::default();
         let mut allow_skip_idempotency_check = true; // only for the first attempt

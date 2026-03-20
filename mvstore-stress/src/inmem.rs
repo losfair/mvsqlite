@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use rpds::RedBlackTreeMapSync;
 
 pub struct Inmem {
@@ -135,7 +135,7 @@ impl Inmem {
         if self.version_list.is_empty() {
             None
         } else {
-            let index = thread_rng().gen_range(0..self.version_list.len());
+            let index = rand::rng().random_range(0..self.version_list.len());
             Some(&self.version_list[index])
         }
     }

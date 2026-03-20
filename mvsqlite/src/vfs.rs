@@ -59,7 +59,7 @@ impl Vfs for MultiVersionVfs {
     }
 
     fn random(&self, buffer: &mut [i8]) {
-        rand::Rng::fill(&mut rand::thread_rng(), buffer);
+        rand::Rng::fill(&mut rand::rng(), buffer);
     }
 
     fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {

@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use anyhow::Result;
 use mvclient::{CommitError, CommitOutput, MultiVersionClient, Transaction};
-use rand::{thread_rng, Rng, RngCore};
+use rand::{Rng, RngCore};
 
 use crate::inmem::Inmem;
 
@@ -56,7 +56,7 @@ impl Tester {
     async fn truncate_worker(self: Arc<Self>) {
         let rc = reqwest::Client::new();
         loop {
-            let sleep_dur_ms = rand::thread_rng().gen_range(1..1000);
+            let sleep_dur_ms = rand::rng().random_range(1..1000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
             tokio::time::sleep(sleep_dur).await;
 
@@ -69,7 +69,7 @@ impl Tester {
                 if versions.len() == 0 {
                     continue;
                 }
-                let split_point = rand::thread_rng().gen_range(0..versions.len());
+                let split_point = rand::rng().random_range(0..versions.len());
                 remove_point = versions[split_point].clone();
 
                 if let Some((k, _)) = self.busy_versions.lock().unwrap().iter().next() {
@@ -121,7 +121,7 @@ impl Tester {
     async fn delete_unreferenced_content_worker(self: Arc<Self>) {
         let rc = reqwest::Client::new();
         loop {
-            let sleep_dur_ms = rand::thread_rng().gen_range(1..5000);
+            let sleep_dur_ms = rand::rng().random_range(1..5000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
             tokio::time::sleep(sleep_dur).await;
             let payload = serde_json::json!({
@@ -181,13 +181,13 @@ impl Tester {
 
         let mut last_writes: Vec<Option<Vec<u8>>> = vec![None; self.config.num_pages as usize];
         for it in 0..iterations {
-            let mode = rand::thread_rng().gen_range(0..11);
+            let mode = rand::rng().random_range(0..11);
             tracing::debug!(task = task_id, iteration = it, mode = mode, "iteration");
             match mode {
                 0..=5 => {
-                    let num_reads_requested = rand::thread_rng().gen_range(1..=10);
+                    let num_reads_requested = rand::rng().random_range(1..=10);
                     let reads = (0..num_reads_requested)
-                        .map(|_| rand::thread_rng().gen_range::<u32, _>(0..self.config.num_pages))
+                        .map(|_| rand::rng().random_range::<u32, _>(0..self.config.num_pages))
                         .filter(|x| !self.config.disable_ryw || !txn.page_is_written(*x))
                         .collect::<Vec<_>>();
                     if reads.len() == 0 {
@@ -211,19 +211,19 @@ impl Tester {
                     }
                 }
                 6..=7 => {
-                    let num_writes = rand::thread_rng().gen_range(1..=10);
+                    let num_writes = rand::rng().random_range(1..=10);
                     let writes = (0..num_writes)
                         .map(|_| {
-                            let mut rng = rand::thread_rng();
-                            let index = rng.gen_range::<u32, _>(0..self.config.num_pages);
+                            let mut rng = rand::rng();
+                            let index = rng.random_range::<u32, _>(0..self.config.num_pages);
 
                             // Test delta encoding
                             let data = {
                                 let last_write = &last_writes[index as usize];
-                                if last_write.is_some() && rng.gen_bool(0.2) {
+                                if last_write.is_some() && rng.random_bool(0.2) {
                                     let mut data = last_write.as_ref().unwrap().clone();
-                                    let start = rng.gen_range(0..data.len());
-                                    let end = rng.gen_range(start..data.len());
+                                    let start = rng.random_range(0..data.len());
+                                    let end = rng.random_range(start..data.len());
                                     rng.fill_bytes(&mut data[start..end]);
                                     data
                                 } else {
@@ -232,7 +232,7 @@ impl Tester {
                                     data
                                 }
                             };
-                            if rng.gen_bool(0.5) {
+                            if rng.random_bool(0.5) {
                                 last_writes[index as usize] = Some(data.clone());
                             }
 
@@ -304,7 +304,7 @@ impl Tester {
                     tracing::debug!(version = txn.version(), "created txn");
                 }
                 10 => {
-                    let dur_millis = rand::thread_rng().gen_range(1..100);
+                    let dur_millis = rand::rng().random_range(1..100);
                     tokio::time::sleep(Duration::from_millis(dur_millis)).await;
                 }
                 _ => unreachable!(),
@@ -317,14 +317,14 @@ impl Tester {
     async fn create_transaction_random_base(&self) -> Result<(Transaction, u64)> {
         let mut mem = self.mem.write().await;
 
-        if thread_rng().gen_bool(0.5) {
+        if rand::rng().random_bool(0.5) {
             if let Some(version) = mem.pick_random_version() {
                 let mut txn = self
                     .client
                     .create_transaction_at_version(None, version, false);
                 let txn_id = mem.start_transaction(txn.version());
                 self.acquire_version(txn.version());
-                if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
+                if !self.config.disable_read_set && rand::rng().random_bool(0.5) {
                     txn.enable_read_set();
                 }
                 return Ok((txn, txn_id));
@@ -334,7 +334,7 @@ impl Tester {
         let mut txn = self.client.create_transaction(None).await?;
         let txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
-        if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
+        if !self.config.disable_read_set && rand::rng().random_bool(0.5) {
             txn.enable_read_set();
         }
         Ok((txn, txn_id))

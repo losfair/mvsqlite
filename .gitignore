@@ -4,4 +4,8 @@ target/
 *.a
 /work/
 /mvsqlite-preload/sqlite3.c
+/mvsqlite-preload/sqlite3.h
 *.so.0
+/sqlite-amalgamation-*/
+/sqlite.zip
+/sqlite3

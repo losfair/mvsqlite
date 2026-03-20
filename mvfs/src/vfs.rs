@@ -130,7 +130,6 @@ impl MultiVersionVfs {
             first_page,
             page_cache: Cache::builder()
                 .max_capacity(PAGE_CACHE_SIZE.load(Ordering::Relaxed) as u64)
-                .thread_pool_enabled(!self.fork_tolerant)
                 .build(),
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
