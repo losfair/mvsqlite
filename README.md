@@ -32,10 +32,10 @@ Check the single-page [mvSQLite Quick Reference](https://blob.univalent.net/mvsq
 Install FoundationDB:
 
 ```bash
-wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb-clients_7.1.15-1_amd64.deb
-sudo dpkg -i foundationdb-clients_7.1.15-1_amd64.deb
-wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb-server_7.1.15-1_amd64.deb
-sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
+wget https://github.com/apple/foundationdb/releases/download/7.3.69/foundationdb-clients_7.3.69-1_amd64.deb
+sudo dpkg -i foundationdb-clients_7.3.69-1_amd64.deb
+wget https://github.com/apple/foundationdb/releases/download/7.3.69/foundationdb-server_7.3.69-1_amd64.deb
+sudo dpkg -i foundationdb-server_7.3.69-1_amd64.deb
 ```
 
 Download the binaries:
