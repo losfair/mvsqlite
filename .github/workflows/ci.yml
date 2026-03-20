@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -68,7 +68,7 @@ jobs:
           path: ./build
   build-deb:
     name: Build DEB
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -93,7 +93,7 @@ jobs:
           path: ./deb
   stress:
     name: mvstore stress test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -122,7 +122,7 @@ jobs:
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   stress-auto-create-namespace:
     name: mvstore stress test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -150,7 +150,7 @@ jobs:
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   stress-disable-read-set:
     name: mvstore stress test (disable read set)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -179,7 +179,7 @@ jobs:
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000 --disable-read-set
   stress-small-gc-batch:
     name: mvstore stress test (small gc batch)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -209,7 +209,7 @@ jobs:
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
   stress-gc-nofresh:
     name: mvstore stress test (gc without fresh time check)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -240,7 +240,7 @@ jobs:
             --disable-ryw --permit-410
   stress-commit-multi-phase:
     name: mvstore stress test (gc without fresh time check + multi phase commit)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -271,7 +271,7 @@ jobs:
             --disable-ryw --permit-410
   stress-buggify:
     name: mvstore stress test (buggify)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -304,7 +304,7 @@ jobs:
           RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 500 --ns-key stress --pages 1000
   sqlite-speedtest1-default-page-size:
     name: SQLite benchmark (speedtest1), default page size
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -339,7 +339,7 @@ jobs:
           LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 RUST_LOG=error ./speedtest1 test
   sqlite-speedtest1-16k-page:
     name: SQLite benchmark (speedtest1), 16K pages
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -374,7 +374,7 @@ jobs:
           LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 MVSQLITE_SECTOR_SIZE=16384 RUST_LOG=error ./speedtest1 test
   sqlite-speedtest1-default-page-size-fuse:
     name: SQLite benchmark (speedtest1), default page size, fuse
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     steps:
@@ -420,7 +420,7 @@ jobs:
           echo "Got the expected error."
   build-ycsb:
     name: Build ycsb
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout
       uses: actions/checkout@v2
@@ -437,7 +437,7 @@ jobs:
         path: ./go-ycsb/bin/go-ycsb
   ycsb:
     name: ycsb
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
     - build
     - build-ycsb
@@ -503,7 +503,7 @@ jobs:
     - stress-disable-read-set
     - build-deb
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/download-artifact@v3
       with:
