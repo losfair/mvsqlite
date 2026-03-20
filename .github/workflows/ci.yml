@@ -417,7 +417,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v6
     - name: Build
       run: |
         git clone https://github.com/losfair/go-ycsb
@@ -449,7 +449,7 @@ jobs:
             wire_zstd: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v6
       - name: Install system dependencies
         run: |
           set -e
