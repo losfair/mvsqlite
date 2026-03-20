@@ -71,11 +71,21 @@ impl Server {
         let version = match version {
             Some(x) => x,
             None => {
-                self.read_version_and_nsid_to_lwv_cache
+                let lwv = self.read_version_and_nsid_to_lwv_cache
                     .try_get_with((rv, ns_id), async {
                         get_last_write_version(&txn, &self.key_codec, ns_id, true).await
                     })
-                    .await?
+                    .await?;
+                // If LWV is zero (no writes yet), use ns_id as the version
+                // floor. ns_id is the FDB versionstamp from namespace creation,
+                // so a transaction at that version can see the namespace
+                // metadata (including overlay_base). Without this, a version-
+                // pinned read at FDB version 0 would fail to see the metadata.
+                if lwv == [0u8; 10] {
+                    ns_id
+                } else {
+                    lwv
+                }
             }
         };
 

@@ -1,4 +1,4 @@
-CFLAGS += -O2 -fPIC
+CFLAGS += -O2 -fPIC -I.
 
 build-preload: preload.o shim.o
 	$(CC) -O2 -shared \
@@ -11,7 +11,7 @@ build-lib: shim.o
 	ar rcs libmvsqlite.a shim.o
 
 build-patched-sqlite3:
-	$(CC) -O2 -fPIC -shared -o libsqlite3.so \
+	$(CC) -O2 -fPIC -I. -shared -o libsqlite3.so \
 		-Wl,-z,noexecstack \
 		-DSQLITE_ENABLE_FTS3 \
 		-DSQLITE_ENABLE_FTS4 \
