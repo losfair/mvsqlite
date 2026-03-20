@@ -459,12 +459,12 @@ jobs:
           sudo dpkg -i fdb-server.deb
           sudo apt update && sudo apt install -y libfuse3-3
       - name: Fetch binaries
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v8
         with:
           name: build
           path: ./build
       - name: Fetch go-ycsb
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v8
         with:
           name: go-ycsb
           path: ./go-ycsb
