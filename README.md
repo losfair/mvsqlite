@@ -5,11 +5,12 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 [Documentation](https://github.com/losfair/mvsqlite/wiki/)
 
 - [mvSQLite](#mvsqlite)
-  - [Features](#features)
-  - [Releases](#releases)
-  - [Quick reference](#quick-reference)
-  - [Try it](#try-it)
-  - [Contributing](#contributing)
+    - [Features](#features)
+    - [Experimental Features](#experimental-features)
+    - [Releases](#releases)
+    - [Quick reference](#quick-reference)
+    - [Try it](#try-it)
+    - [Contributing](#contributing)
 
 ## Features
 
@@ -18,6 +19,50 @@ Distributed, MVCC SQLite that runs on top of [FoundationDB](https://github.com/a
 - **Lock-free, scalable reads and writes**: Optimistic fine-grained concurrency with [BEGIN CONCURRENT](https://www.sqlite.org/cgi/src/doc/begin-concurrent/doc/begin_concurrent.md)-like semantics. mvSQLite inherits FoundationDB's lock-free property - not a single distributed lock is acquired during data plane operation.
 - **Get the nice properties from FoundationDB, without its limits**: [Correctness](https://apple.github.io/foundationdb/testing.html), [really fast and scalable](https://apple.github.io/foundationdb/performance.html) distributed transactions, synchronous and asynchronous replication, integrated backup and restore. Meanwhile, there's no [five-second transaction limit](https://apple.github.io/foundationdb/known-limitations.html) any more, and a SQLite transaction can be ~39x larger than FDB's native transaction.
 - **Drop-in addition**: Use `LD_PRELOAD` or a patched `libsqlite3.so` to plug mvSQLite into your existing apps. [Read the docs](https://github.com/losfair/mvsqlite/wiki/Integration)
+
+## Experimental Features
+
+These features are not considered stable yet and should not be used in production without validation.
+
+### Commit Groups
+
+Commit groups let you batch writes from multiple mvSQLite databases into a single FoundationDB commit.
+
+Enable the SQL functions with:
+
+```bash
+export MVSQLITE_EXPERIMENTAL_COMMIT_GROUP=1
+```
+
+Available SQL functions:
+
+- `mv_commit_group_begin()`
+- `mv_commit_group_commit(db_name)`
+- `mv_commit_group_rollback(db_name)`
+
+Example:
+
+```sql
+ATTACH 'orders' AS orders;
+
+SELECT mv_commit_group_begin();
+
+BEGIN;
+INSERT INTO main.accounts(id, balance) VALUES (1, 100);
+COMMIT;
+
+BEGIN;
+INSERT INTO orders.invoices(id, account_id) VALUES (1, 1);
+COMMIT;
+
+SELECT mv_commit_group_commit('main');
+```
+
+Notes:
+
+- `mv_commit_group_commit(db_name)` and `mv_commit_group_rollback(db_name)` require an explicit SQLite database name such as `'main'` or an attached database name.
+- A commit-group conflict is returned as a SQLite `SQLITE_PERM` error.
+- After the first grouped commit is staged, no new transaction may begin in the same group.
 
 ## Releases
 

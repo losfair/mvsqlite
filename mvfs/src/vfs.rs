@@ -16,7 +16,10 @@ use mvclient::{
     TimeToVersionResponse, Transaction,
 };
 
-use crate::types::LockKind;
+use crate::{
+    commit_group::{self, TransactionStart},
+    types::LockKind,
+};
 const TRANSITION_HISTORY_SIZE: usize = 10;
 static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template_4k.db");
 static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
@@ -431,6 +434,30 @@ impl Connection {
             return true;
         }
 
+        if commit_group::is_active() {
+            let intent = txn
+                .commit_intent(None, &self.write_buffer)
+                .await
+                .expect("transaction commit intent failed");
+            self.write_buffer.clear();
+
+            // Staged commit-group writes must not survive in the local cache if the group later
+            // rolls back or conflicts.
+            for index in &dirty_pages {
+                self.page_cache.invalidate(index);
+            }
+
+            if let Some(intent) = intent {
+                commit_group::append_intent(&self.client, self.dp.as_ref(), intent)
+                    .expect("failed to append to commit group");
+                tracing::info!("added intent to commit group");
+            } else {
+                tracing::info!("transaction is empty (commit group)");
+            }
+
+            return true;
+        }
+
         let fast_write_size = self.write_buffer.len();
         let result = txn.commit(None, &self.write_buffer).await;
         self.write_buffer.clear();
@@ -612,19 +639,33 @@ impl Connection {
                     .client
                     .create_transaction_at_version(self.dp.as_ref(), version, true))
             } else {
-                let client = self.client.clone();
-                let res = client
-                    .create_transaction_with_info(
-                        self.dp.as_ref(),
-                        self.last_known_write_version.as_ref().map(|x| x.as_str()),
-                    )
-                    .await;
-                match res {
-                    Ok((txn, info)) => {
-                        interval = info.interval;
-                        Ok(txn)
+                match commit_group::transaction_start() {
+                    TransactionStart::Reject => {
+                        tracing::error!(
+                            "no new transaction can begin after the first commit in a commit group"
+                        );
+                        return Ok(false);
                     }
-                    Err(e) => Err(e),
+                    TransactionStart::UseVersion(version) => Ok(self
+                        .client
+                        .create_transaction_at_version(self.dp.as_ref(), &version, false)),
+                    TransactionStart::Normal => {
+                        let client = self.client.clone();
+                        let res = client
+                            .create_transaction_with_info(
+                                self.dp.as_ref(),
+                                self.last_known_write_version.as_ref().map(|x| x.as_str()),
+                            )
+                            .await;
+                        match res {
+                            Ok((txn, info)) => {
+                                interval = info.interval;
+                                commit_group::set_current_version(txn.version());
+                                Ok(txn)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
                 }
             };
             let mut txn = match txn_info {

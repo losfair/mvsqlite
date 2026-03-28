@@ -1,0 +1,187 @@
+use std::{cell::RefCell, future::Future, pin::Pin, sync::Arc};
+
+use anyhow::{bail, Context, Result};
+use futures::future::FutureExt;
+use mvclient::{CommitResult, MultiVersionClient, NamespaceCommitIntent};
+use reqwest::Url;
+
+pub struct CommitGroup {
+    intents: Vec<NamespaceCommitIntent>,
+    client: Option<Arc<MultiVersionClient>>,
+    dp: Option<Url>,
+    pub current_version: Option<String>,
+}
+
+impl Default for CommitGroup {
+    fn default() -> Self {
+        Self {
+            intents: Vec::new(),
+            client: None,
+            dp: None,
+            current_version: None,
+        }
+    }
+}
+
+pub enum TransactionStart {
+    Normal,
+    UseVersion(String),
+    Reject,
+}
+
+pub enum CommitOutput {
+    Empty,
+    Committed(CommitResult),
+    Conflict,
+}
+
+thread_local! {
+    static CURRENT_COMMIT_GROUP: RefCell<Option<CommitGroup>> = RefCell::new(None);
+}
+
+pub fn begin() -> Result<()> {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        let mut cg = cg.borrow_mut();
+        if cg.is_some() {
+            bail!("mv_commit_group_begin called recursively in a commit group");
+        }
+        *cg = Some(CommitGroup::default());
+        Ok(())
+    })
+}
+
+pub fn is_active() -> bool {
+    CURRENT_COMMIT_GROUP.with(|cg| cg.borrow().is_some())
+}
+
+pub fn transaction_start() -> TransactionStart {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        let cg = cg.borrow();
+        match &*cg {
+            Some(cg) if !cg.intents.is_empty() => TransactionStart::Reject,
+            Some(cg) => match &cg.current_version {
+                Some(version) => TransactionStart::UseVersion(version.clone()),
+                None => TransactionStart::Normal,
+            },
+            None => TransactionStart::Normal,
+        }
+    })
+}
+
+pub fn set_current_version(version: &str) {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        if let Some(cg) = &mut *cg.borrow_mut() {
+            cg.current_version
+                .get_or_insert_with(|| version.to_string());
+        }
+    });
+}
+
+pub fn append_intent(
+    client: &Arc<MultiVersionClient>,
+    dp: Option<&Url>,
+    intent: NamespaceCommitIntent,
+) -> Result<()> {
+    CURRENT_COMMIT_GROUP.with(|cg| {
+        let mut cg = cg.borrow_mut();
+        let cg = cg
+            .as_mut()
+            .context("transaction commit attempted without a commit group open")?;
+
+        if cg.client.is_none() {
+            cg.client = Some(client.clone());
+        }
+        if cg.dp.is_none() {
+            cg.dp = dp.cloned();
+        }
+
+        cg.intents.push(intent);
+        Ok(())
+    })
+}
+
+pub fn commit(
+    run: impl for<'a> FnOnce(
+        Pin<Box<dyn Future<Output = Result<Option<CommitResult>>> + Send + 'a>>,
+    ) -> Result<Option<CommitResult>>,
+) -> Result<CommitOutput> {
+    let cg = CURRENT_COMMIT_GROUP.with(|cg| cg.borrow_mut().take());
+    let mut cg = cg.context("mv_commit_group_commit called without a commit group open")?;
+
+    if cg.intents.is_empty() {
+        return Ok(CommitOutput::Empty);
+    }
+
+    let client = cg
+        .client
+        .take()
+        .context("mv_commit_group_commit called without a client")?;
+    let result = run(client
+        .apply_commit_intents(cg.dp.as_ref(), &cg.intents)
+        .boxed())?;
+
+    Ok(match result {
+        Some(result) => CommitOutput::Committed(result),
+        None => CommitOutput::Conflict,
+    })
+}
+
+pub fn rollback() -> Result<()> {
+    let cg = CURRENT_COMMIT_GROUP.with(|cg| cg.borrow_mut().take());
+    let _cg = cg.context("mv_commit_group_rollback called without a commit group open")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mvclient::MultiVersionClientConfig;
+
+    fn test_client() -> Arc<MultiVersionClient> {
+        MultiVersionClient::new(
+            MultiVersionClientConfig {
+                data_plane: vec![Url::parse("http://localhost:7000").unwrap()],
+                ns_key: "test".into(),
+                ns_key_hashproof: None,
+                lock_owner: None,
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap()
+    }
+
+    fn test_intent() -> NamespaceCommitIntent {
+        NamespaceCommitIntent {
+            init: mvclient::CommitNamespaceInit {
+                ns_key: "test".into(),
+                ns_key_hashproof: None,
+                version: "v1".into(),
+                metadata: None,
+                num_pages: 1,
+                read_set: None,
+            },
+            requests: vec![mvclient::CommitRequest {
+                page_index: 1,
+                hash: vec![0; 32],
+                data: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn rollback_clears_active_group_with_intents() {
+        begin().unwrap();
+        append_intent(&test_client(), None, test_intent()).unwrap();
+
+        rollback().unwrap();
+        assert!(!is_active());
+    }
+
+    #[test]
+    fn rollback_clears_empty_active_group() {
+        begin().unwrap();
+
+        rollback().unwrap();
+        assert!(!is_active());
+    }
+}
