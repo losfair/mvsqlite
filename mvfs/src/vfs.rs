@@ -646,9 +646,6 @@ impl Connection {
                         );
                         return Ok(false);
                     }
-                    TransactionStart::UseVersion(version) => Ok(self
-                        .client
-                        .create_transaction_at_version(self.dp.as_ref(), &version, false)),
                     TransactionStart::Normal => {
                         let client = self.client.clone();
                         let res = client
@@ -660,7 +657,6 @@ impl Connection {
                         match res {
                             Ok((txn, info)) => {
                                 interval = info.interval;
-                                commit_group::set_current_version(txn.version());
                                 Ok(txn)
                             }
                             Err(e) => Err(e),

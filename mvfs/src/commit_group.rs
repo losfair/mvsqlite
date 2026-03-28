@@ -9,7 +9,6 @@ pub struct CommitGroup {
     intents: Vec<NamespaceCommitIntent>,
     client: Option<Arc<MultiVersionClient>>,
     dp: Option<Url>,
-    pub current_version: Option<String>,
 }
 
 impl Default for CommitGroup {
@@ -18,14 +17,12 @@ impl Default for CommitGroup {
             intents: Vec::new(),
             client: None,
             dp: None,
-            current_version: None,
         }
     }
 }
 
 pub enum TransactionStart {
     Normal,
-    UseVersion(String),
     Reject,
 }
 
@@ -59,22 +56,10 @@ pub fn transaction_start() -> TransactionStart {
         let cg = cg.borrow();
         match &*cg {
             Some(cg) if !cg.intents.is_empty() => TransactionStart::Reject,
-            Some(cg) => match &cg.current_version {
-                Some(version) => TransactionStart::UseVersion(version.clone()),
-                None => TransactionStart::Normal,
-            },
+            Some(_) => TransactionStart::Normal,
             None => TransactionStart::Normal,
         }
     })
-}
-
-pub fn set_current_version(version: &str) {
-    CURRENT_COMMIT_GROUP.with(|cg| {
-        if let Some(cg) = &mut *cg.borrow_mut() {
-            cg.current_version
-                .get_or_insert_with(|| version.to_string());
-        }
-    });
 }
 
 pub fn append_intent(
@@ -183,5 +168,16 @@ mod tests {
 
         rollback().unwrap();
         assert!(!is_active());
+    }
+
+    #[test]
+    fn transaction_start_stays_normal_until_first_intent() {
+        begin().unwrap();
+        assert!(matches!(transaction_start(), TransactionStart::Normal));
+
+        append_intent(&test_client(), None, test_intent()).unwrap();
+        assert!(matches!(transaction_start(), TransactionStart::Reject));
+
+        rollback().unwrap();
     }
 }
