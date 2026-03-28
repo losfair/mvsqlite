@@ -61,6 +61,11 @@ SELECT mv_commit_group_commit('main');
 Notes:
 
 - `mv_commit_group_commit(db_name)` and `mv_commit_group_rollback(db_name)` require an explicit SQLite database name such as `'main'` or an attached database name.
+- A commit group commits atomically across all databases that staged an intent in the group: either all staged transactions commit, or none of them do.
+- Staged commit-group writes are not made visible until `mv_commit_group_commit(...)` succeeds.
+- Conflict detection is still performed per database against that database's own read set / last-write version, so ordinary concurrent write conflicts on touched rows or pages still abort the group.
+- Commit groups do not provide a shared cross-database snapshot. Different databases in the same group may read from different committed versions before staging their writes.
+- As a result, commit groups are suitable for "all-or-nothing across databases" workflows such as debit in one database and credit in another, but they do not provide cross-database serializability for invariants that depend on reading multiple databases from one coherent snapshot.
 - A commit-group conflict is returned as a SQLite `SQLITE_PERM` error.
 - After the first grouped commit is staged, no new transaction may begin in the same group.
 
