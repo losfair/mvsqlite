@@ -213,18 +213,8 @@ impl Connection {
         let predicted_next = predicted_next
             .iter()
             .filter(|x| {
-                // Exclude pages already cached or locally dirty (write_buffer).
-                // Without the write_buffer check, prefetch could re-fetch the
-                // pre-write version from the server (unflushed pages have no
-                // hash in page_buffer, so read-your-writes doesn't apply) and
-                // inject stale data into page_cache.
-                //
-                // The page_is_written() check is an optimisation: flushed pages
-                // ARE protected server-side by content-hash read-your-writes,
-                // but skipping them here avoids a needless round-trip.
                 !self.page_cache.contains_key(*x)
                     && !self.write_buffer.contains_key(*x)
-                    && !txn.page_is_written(**x)
             })
             .copied()
             .collect::<Vec<_>>();
@@ -266,7 +256,6 @@ impl Connection {
         self.insert_to_page_cache(page_offset, Bytes::copy_from_slice(&*buf));
 
         for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
-            // Guard: never overwrite a locally-written page with server data.
             if *their_index != 0
                 && !maybe_other_page.is_empty()
                 && !self.write_buffer.contains_key(their_index)
@@ -309,13 +298,6 @@ impl Connection {
                 .expect("unrecoverable write failure")
         }
 
-        // Re-insert every flushed page into page_cache to refresh its recency
-        // before clearing write_buffer.  Flushed pages are protected server-side
-        // by content-hash read-your-writes, so this is an optimisation to avoid
-        // unnecessary round-trips if the page is re-read later.
-        for (page_id, data) in &self.write_buffer {
-            self.page_cache.insert(*page_id, data.clone());
-        }
         self.write_buffer.clear();
     }
 
