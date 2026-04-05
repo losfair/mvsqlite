@@ -212,7 +212,10 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains_key(*x))
+            .filter(|x| {
+                !self.page_cache.contains_key(*x)
+                    && !self.write_buffer.contains_key(*x)
+            })
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -253,7 +256,10 @@ impl Connection {
         self.insert_to_page_cache(page_offset, Bytes::copy_from_slice(&*buf));
 
         for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
-            if *their_index != 0 && !maybe_other_page.is_empty() {
+            if *their_index != 0
+                && !maybe_other_page.is_empty()
+                && !self.write_buffer.contains_key(their_index)
+            {
                 self.insert_to_page_cache(
                     *their_index,
                     Bytes::copy_from_slice(&maybe_other_page[..]),
@@ -291,6 +297,7 @@ impl Connection {
                 .await
                 .expect("unrecoverable write failure")
         }
+
         self.write_buffer.clear();
     }
 
