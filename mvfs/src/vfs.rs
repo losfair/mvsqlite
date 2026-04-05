@@ -18,9 +18,9 @@ use mvclient::{
 
 use crate::{
     commit_group::{self, TransactionStart},
+    prefetch::PrefetchPredictor,
     types::LockKind,
 };
-const TRANSITION_HISTORY_SIZE: usize = 10;
 static FIRST_PAGE_TEMPLATE_4K: &'static [u8; 4096] = include_bytes!("../template_4k.db");
 static FIRST_PAGE_TEMPLATE_8K: &'static [u8; 8192] = include_bytes!("../template_8k.db");
 static FIRST_PAGE_TEMPLATE_16K: &'static [u8; 16384] = include_bytes!("../template_16k.db");
@@ -128,7 +128,7 @@ impl MultiVersionVfs {
             txn: None,
             lock: LockKind::None,
             commit_confirmed: false,
-            history: TransitionHistory::default(),
+            predictor: PrefetchPredictor::new(),
             sector_size: self.sector_size,
             first_page,
             page_cache: Cache::builder()
@@ -154,7 +154,7 @@ pub struct Connection {
     txn: Option<Transaction>,
     lock: LockKind,
     commit_confirmed: bool,
-    history: TransitionHistory,
+    predictor: PrefetchPredictor,
     sector_size: usize,
 
     first_page: Vec<u8>,
@@ -171,60 +171,6 @@ pub struct Connection {
     pending_commit_group_result: Option<Arc<commit_group::CommitGroupResultSlot>>,
 }
 
-#[derive(Default)]
-struct TransitionHistory {
-    history: [i64; TRANSITION_HISTORY_SIZE],
-    prev_index: u32,
-}
-
-impl TransitionHistory {
-    fn predict(&self, current_index: u32) -> Vec<u32> {
-        let mut count: HashMap<i64, u32> = HashMap::with_capacity(TRANSITION_HISTORY_SIZE);
-        for &destination in self.history.iter() {
-            *count.entry(destination).or_insert(0) += 1;
-        }
-
-        let mut items = count
-            .iter()
-            .filter_map(|(&destination, &count)| {
-                let probability = (count as f64) / (TRANSITION_HISTORY_SIZE as f64);
-                if probability >= 0.2 && destination != 0 {
-                    Some((destination, count))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        items.sort_by_key(|x| -(x.1 as i64));
-        items
-            .iter()
-            .filter_map(|x| u32::try_from(current_index as i64 + x.0).ok())
-            .collect()
-    }
-
-    fn record(&mut self, current_index: u32) {
-        let diff = current_index as i64 - self.prev_index as i64;
-        self.history.rotate_right(1);
-        self.history[0] = diff;
-        self.prev_index = current_index;
-    }
-
-    fn multi_predict(&self, current_index: u32, depth: usize) -> HashSet<u32> {
-        let mut predictions: HashSet<u32> = HashSet::with_capacity(depth * 2);
-        let mut last = current_index;
-        for _ in 0..depth {
-            let local_pred = self.predict(last);
-            if local_pred.is_empty() || predictions.contains(&local_pred[0]) {
-                break;
-            } else {
-                last = local_pred[0];
-                predictions.extend(local_pred);
-            }
-        }
-        predictions.remove(&current_index);
-        predictions
-    }
-}
 
 impl Connection {
     pub fn last_known_version(&self) -> Option<&str> {
@@ -238,7 +184,7 @@ impl Connection {
         let num_pages = buf.len() / self.sector_size;
         let page_offset = u32::try_from(offset as usize / self.sector_size).unwrap();
         self.txn.as_mut().unwrap().mark_read(page_offset);
-        self.history.record(page_offset);
+        self.predictor.record(page_offset);
 
         if let Some(x) = &self.page_cache.get(&page_offset) {
             buf.copy_from_slice(x);
@@ -263,7 +209,7 @@ impl Connection {
 
         let predict_depth: usize = 10;
         let prefetch_depth: usize = PREFETCH_DEPTH.load(Ordering::Relaxed);
-        let mut predicted_next = self.history.multi_predict(page_offset, predict_depth);
+        let mut predicted_next = self.predictor.multi_predict(page_offset, predict_depth);
 
         // Prefetch until the target depth
         {
@@ -584,7 +530,7 @@ impl Connection {
         assert!(buf.len() == self.sector_size);
 
         let mut buf = buf.to_vec();
-        self.history.prev_index = 0;
+        self.predictor.reset();
 
         let page_offset = offset as usize / self.sector_size;
 
@@ -783,7 +729,7 @@ impl Connection {
         if lock == LockKind::None {
             // All locks dropped
             self.txn = None;
-            self.history.prev_index = 0;
+            self.predictor.reset();
         }
 
         Ok(commit_ok)
