@@ -632,6 +632,37 @@ impl Connection {
         }
 
         if self.txn.is_none() {
+            // If a commit group recently succeeded and this connection
+            // participated, apply the changelog and advance
+            // last_known_write_version so the subsequent interval request
+            // covers only changes *after* the commit group.
+            if let Some((committed_version, changelog)) =
+                commit_group::take_commit_group_result_for_ns(
+                    self.client.config().ns_key.as_str(),
+                )
+            {
+                match changelog {
+                    Some(pages) => {
+                        if !pages.is_empty() {
+                            for &index in &pages {
+                                self.page_cache.invalidate(&index);
+                            }
+                            tracing::info!(
+                                count = pages.len(),
+                                "applied commit group changelog, performed partial cache flush"
+                            );
+                        }
+                    }
+                    None => {
+                        self.page_cache.invalidate_all();
+                        tracing::warn!(
+                            "commit group changelog unavailable, invalidating cache"
+                        );
+                    }
+                }
+                self.last_known_write_version = Some(committed_version);
+            }
+
             let mut interval: Option<Vec<u32>> = None;
 
             let txn_info = if let Some(version) = &self.fixed_version {

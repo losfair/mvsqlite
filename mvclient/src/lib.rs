@@ -639,19 +639,10 @@ impl Transaction {
             return Ok(None);
         }
 
-        let total_num_pages = self.page_buffer.len() + fast_writes.len();
-
-        let mut out = NamespaceCommitIntent {
-            init: CommitNamespaceInit {
-                version: self.version.clone(),
-                metadata,
-                num_pages: total_num_pages as u32,
-                ns_key: self.c.config.ns_key.clone(),
-                ns_key_hashproof: self.c.config.ns_key_hashproof.clone(),
-                read_set: self.read_set.as_ref().map(|x| x.lock().unwrap().clone()),
-            },
-            requests: Vec::with_capacity(total_num_pages),
-        };
+        // Build the request list first, deduplicating pages that appear in both
+        // fast_writes and page_buffer, then derive num_pages from the actual count.
+        let mut requests =
+            Vec::with_capacity(self.page_buffer.len() + fast_writes.len());
 
         for (&page_index, data) in fast_writes {
             let req = CommitRequest {
@@ -659,7 +650,7 @@ impl Transaction {
                 hash: blake3::hash(data).as_bytes().to_vec(),
                 data: Some(data.clone()),
             };
-            out.requests.push(req);
+            requests.push(req);
         }
 
         for (&page_index, hash) in self.page_buffer.iter() {
@@ -672,8 +663,20 @@ impl Transaction {
                 hash: hash.to_vec(),
                 data: None,
             };
-            out.requests.push(req);
+            requests.push(req);
         }
+
+        let out = NamespaceCommitIntent {
+            init: CommitNamespaceInit {
+                version: self.version.clone(),
+                metadata,
+                num_pages: requests.len() as u32,
+                ns_key: self.c.config.ns_key.clone(),
+                ns_key_hashproof: self.c.config.ns_key_hashproof.clone(),
+                read_set: self.read_set.as_ref().map(|x| x.lock().unwrap().clone()),
+            },
+            requests,
+        };
 
         Ok(Some(out))
     }

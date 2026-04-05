@@ -1,4 +1,10 @@
-use std::{cell::RefCell, future::Future, pin::Pin, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
 use anyhow::{bail, Context, Result};
 use futures::future::FutureExt;
@@ -32,8 +38,22 @@ pub enum CommitOutput {
     Conflict,
 }
 
+/// Stores the result of the last successful commit group so that participating
+/// connections can update their page caches and `last_known_write_version` when
+/// they next acquire a lock.
+struct CommitGroupResult {
+    version: String,
+    /// Namespace keys that staged intents in this commit group.
+    ns_keys: Vec<String>,
+    /// Per-namespace changelog of pages modified by *concurrent* transactions
+    /// between each namespace's assumed version and the committed version.
+    /// A missing entry means the interval was too large to compute.
+    changelog: HashMap<String, Vec<u32>>,
+}
+
 thread_local! {
     static CURRENT_COMMIT_GROUP: RefCell<Option<CommitGroup>> = RefCell::new(None);
+    static LAST_COMMIT_GROUP_RESULT: RefCell<Option<CommitGroupResult>> = RefCell::new(None);
 }
 
 pub fn begin() -> Result<()> {
@@ -44,7 +64,11 @@ pub fn begin() -> Result<()> {
         }
         *cg = Some(CommitGroup::default());
         Ok(())
-    })
+    })?;
+    LAST_COMMIT_GROUP_RESULT.with(|r| {
+        *r.borrow_mut() = None;
+    });
+    Ok(())
 }
 
 pub fn is_active() -> bool {
@@ -97,6 +121,8 @@ pub fn commit(
         return Ok(CommitOutput::Empty);
     }
 
+    let ns_keys: Vec<String> = cg.intents.iter().map(|i| i.init.ns_key.clone()).collect();
+
     let client = cg
         .client
         .take()
@@ -106,7 +132,16 @@ pub fn commit(
         .boxed())?;
 
     Ok(match result {
-        Some(result) => CommitOutput::Committed(result),
+        Some(result) => {
+            LAST_COMMIT_GROUP_RESULT.with(|r| {
+                *r.borrow_mut() = Some(CommitGroupResult {
+                    version: result.version.clone(),
+                    ns_keys,
+                    changelog: result.changelog.clone(),
+                });
+            });
+            CommitOutput::Committed(result)
+        }
         None => CommitOutput::Conflict,
     })
 }
@@ -115,6 +150,24 @@ pub fn rollback() -> Result<()> {
     let cg = CURRENT_COMMIT_GROUP.with(|cg| cg.borrow_mut().take());
     let _cg = cg.context("mv_commit_group_rollback called without a commit group open")?;
     Ok(())
+}
+
+/// If a commit group recently succeeded and `ns_key` participated in it,
+/// returns `(committed_version, changelog)`.  `changelog` is `None` when
+/// the server could not compute the interval (too many concurrent changes);
+/// in that case the caller should do a full cache invalidation.
+pub fn take_commit_group_result_for_ns(ns_key: &str) -> Option<(String, Option<Vec<u32>>)> {
+    LAST_COMMIT_GROUP_RESULT.with(|r| {
+        let r = r.borrow();
+        r.as_ref().and_then(|result| {
+            if result.ns_keys.iter().any(|k| k == ns_key) {
+                let changelog = result.changelog.get(ns_key).cloned();
+                Some((result.version.clone(), changelog))
+            } else {
+                None
+            }
+        })
+    })
 }
 
 #[cfg(test)]
