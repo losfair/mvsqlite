@@ -88,14 +88,17 @@ On each page read (`record()` is called):
 4. Update the stride detector
 5. Push delta into the ring buffer
 
-On a cache miss (`multi_predict()` is called):
-1. If fewer than 4 samples recorded, use frequency fallback
-2. Otherwise, collect stride predictions (if confidence >= 0.5) and Markov
-   predictions (if probability >= 15%), merge with max-confidence dedup
-3. Chain Markov lookups up to `depth` steps to predict further ahead
-4. Return the union of all predicted pages
+On a cache miss (`multi_predict(current_page, max_pages)` is called):
+1. If `max_pages` is 0, return immediately (prefetch disabled)
+2. If fewer than 4 samples recorded, use frequency fallback
+3. Otherwise, collect stride predictions (if confidence >= 0.5) and Markov
+   predictions (if probability >= 15%), merge with max-confidence dedup,
+   truncate to `max_pages`
+4. Chain Markov lookups starting from the best one-step prediction, adding
+   pages until `max_pages` is reached or a cycle is detected
+5. Return the union of all predicted pages (never exceeds `max_pages`)
 
-The caller (in `mvfs/src/vfs.rs`) then:
+The caller (in `mvfs/src/vfs.rs`) passes `PREFETCH_DEPTH` as `max_pages`, then:
 - Fills remaining `PREFETCH_DEPTH` slots with sequential pages (fallback)
 - Filters out pages already in the local cache
 - Issues a single batched `read_many` request for the target page + all predictions

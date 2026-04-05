@@ -347,17 +347,23 @@ impl PrefetchPredictor {
     }
 
     /// Predict next pages from the current page. Returns (page, confidence) pairs
-    /// sorted by confidence descending.
-    fn predict(&self, current_page: u32) -> Vec<(u32, f32)> {
+    /// sorted by confidence descending, limited to `max_pages` entries.
+    fn predict(&self, current_page: u32, max_pages: usize) -> Vec<(u32, f32)> {
+        if max_pages == 0 {
+            return Vec::new();
+        }
+
         // Cold-start: fall back to frequency counting
         if self.history.len < 4 {
-            return self.history.frequency_predict(current_page);
+            let mut preds = self.history.frequency_predict(current_page);
+            preds.truncate(max_pages);
+            return preds;
         }
 
         let mut predictions: Vec<(u32, f32)> = Vec::new();
 
-        // 1. Stride predictions
-        let stride_preds = self.stride.predict(current_page, 16);
+        // 1. Stride predictions (capped to max_pages)
+        let stride_preds = self.stride.predict(current_page, max_pages);
         for (page, conf) in &stride_preds {
             predictions.push((*page, *conf));
         }
@@ -391,46 +397,51 @@ impl PrefetchPredictor {
         // Remove current page if present
         predictions.retain(|p| p.0 != current_page);
 
+        // Enforce hard cap
+        predictions.truncate(max_pages);
+
         predictions
     }
 
-    /// Multi-step prediction chaining. Returns a set of predicted page IDs.
-    /// Compatible with the existing `multi_predict` interface.
-    pub fn multi_predict(&mut self, current_page: u32, depth: usize) -> HashSet<u32> {
-        let mut result: HashSet<u32> = HashSet::with_capacity(depth * 2);
+    /// Multi-step prediction chaining. Returns a set of predicted page IDs,
+    /// containing at most `max_pages` entries.
+    pub fn multi_predict(&mut self, current_page: u32, max_pages: usize) -> HashSet<u32> {
+        let mut result: HashSet<u32> = HashSet::with_capacity(max_pages);
 
-        // Get initial predictions
-        let initial = self.predict(current_page);
+        // Get initial one-step predictions (already capped)
+        let initial = self.predict(current_page, max_pages);
         for (page, _) in &initial {
             result.insert(*page);
         }
 
-        // Chain: use the top prediction to generate further predictions via Markov
-        let mut last_page = current_page;
-        let mut last_delta = self.history.last_delta().unwrap_or(0);
+        // Chain further predictions via Markov, starting from the best
+        // one-step prediction so we advance past the first hop.
+        if let Some(&(first_page, _)) = initial.first() {
+            let mut last_page = first_page;
+            // The delta that led to first_page
+            let mut last_delta = first_page as i64 - current_page as i64;
 
-        for _ in 0..depth {
-            // Find best next_delta for current last_delta
-            let transitions = self.markov.lookup(last_delta);
-            if transitions.is_empty() {
-                break;
-            }
-
-            // Pick the highest-count transition
-            let best = transitions.iter().max_by_key(|t| t.1);
-            let Some((next_delta, _)) = best else {
-                break;
-            };
-
-            if let Ok(next_page) = u32::try_from(last_page as i64 + next_delta) {
-                if next_page == current_page || !result.insert(next_page) {
-                    // Cycle detected or already predicted
+            while result.len() < max_pages {
+                let transitions = self.markov.lookup(last_delta);
+                if transitions.is_empty() {
                     break;
                 }
-                last_page = next_page;
-                last_delta = *next_delta;
-            } else {
-                break;
+
+                // Pick the highest-count transition
+                let best = transitions.iter().max_by_key(|t| t.1);
+                let Some((next_delta, _)) = best else {
+                    break;
+                };
+
+                if let Ok(next_page) = u32::try_from(last_page as i64 + next_delta) {
+                    if next_page == current_page || !result.insert(next_page) {
+                        break;
+                    }
+                    last_page = next_page;
+                    last_delta = *next_delta;
+                } else {
+                    break;
+                }
             }
         }
 
@@ -488,8 +499,9 @@ mod tests {
             pred.record(20);
             pred.record(30);
         }
-        // After seeing 30, should predict 10 (delta -20 follows delta +10)
-        let predictions = pred.multi_predict(30, 5);
+        // After seeing 30, should predict 10 (delta -20 follows delta +10).
+        // Use a larger budget so Markov predictions aren't crowded out by stride.
+        let predictions = pred.multi_predict(30, 15);
         assert!(predictions.contains(&10), "should predict page 10 after 30 in repeating pattern");
     }
 
@@ -684,5 +696,60 @@ mod tests {
         sd.record(0);
         // Zero delta should not build confidence
         assert!(sd.confidence < STRIDE_MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn test_max_pages_enforced() {
+        let mut pred = PrefetchPredictor::new();
+        // Build a warm sequential pattern
+        for i in 1..=20 {
+            pred.record(i);
+        }
+        // Request at most 3 predictions
+        let predictions = pred.multi_predict(20, 3);
+        assert!(
+            predictions.len() <= 3,
+            "multi_predict must respect max_pages cap, got {}",
+            predictions.len()
+        );
+    }
+
+    #[test]
+    fn test_zero_max_pages_returns_empty() {
+        let mut pred = PrefetchPredictor::new();
+        for i in 1..=10 {
+            pred.record(i);
+        }
+        let predictions = pred.multi_predict(10, 0);
+        assert!(
+            predictions.is_empty(),
+            "max_pages=0 should return no predictions"
+        );
+    }
+
+    #[test]
+    fn test_chaining_advances_past_first_hop() {
+        let mut pred = PrefetchPredictor::new();
+        // Build a repeating 3-step cycle: deltas +10, +10, +10, ...
+        // so Markov learns (+10 -> +10) strongly
+        for i in 0..10 {
+            pred.record(100 + i * 10);
+        }
+        // With max_pages=5, chaining should produce multiple hops:
+        // 190 -> 200 -> 210 -> 220 -> 230
+        let predictions = pred.multi_predict(190, 5);
+        assert!(
+            predictions.contains(&200),
+            "should predict first hop (200)"
+        );
+        // Chaining should extend beyond the first hop
+        assert!(
+            predictions.contains(&210),
+            "chaining should reach second hop (210)"
+        );
+        assert!(
+            predictions.contains(&220),
+            "chaining should reach third hop (220)"
+        );
     }
 }

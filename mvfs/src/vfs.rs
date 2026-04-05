@@ -207,11 +207,10 @@ impl Connection {
             "read_exact_at"
         );
 
-        let predict_depth: usize = 10;
         let prefetch_depth: usize = PREFETCH_DEPTH.load(Ordering::Relaxed);
-        let mut predicted_next = self.predictor.multi_predict(page_offset, predict_depth);
+        let mut predicted_next = self.predictor.multi_predict(page_offset, prefetch_depth);
 
-        // Prefetch until the target depth
+        // Fill remaining slots with sequential pages if predictions are insufficient
         {
             let mut i: u32 = 1;
             while predicted_next.len() < prefetch_depth {
