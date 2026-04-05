@@ -16,9 +16,9 @@ export MVSQLITE_PREFETCH_DEPTH=10
 
 When a page read misses the local cache, the predictor generates up to
 `PREFETCH_DEPTH` page predictions. If the predictor produces fewer predictions
-than the configured depth, the remaining slots are filled with sequential pages
-(page N+1, N+2, ...). All predicted pages that are not already cached are
-fetched together with the requested page in one `read_many` HTTP call.
+than the configured depth, only those predictions are used — no sequential
+padding is applied. All predicted pages that are not already cached are fetched
+together with the requested page in one `read_many` HTTP call.
 
 ## Architecture
 

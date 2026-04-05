@@ -179,6 +179,7 @@ struct RecentHistory {
     len: usize,
     prev_page: u32,
     has_prev_page: bool,
+    last_delta_valid: bool,
 }
 
 impl Default for RecentHistory {
@@ -189,6 +190,7 @@ impl Default for RecentHistory {
             len: 0,
             prev_page: 0,
             has_prev_page: false,
+            last_delta_valid: false,
         }
     }
 }
@@ -200,15 +202,23 @@ impl RecentHistory {
         if self.len < HISTORY_SIZE {
             self.len += 1;
         }
+        self.last_delta_valid = true;
     }
 
-    /// Get the most recent delta, if any.
+    /// Get the most recent delta, if any. Returns None if no deltas recorded
+    /// or if the last delta was invalidated (e.g., by a write boundary).
     fn last_delta(&self) -> Option<i64> {
-        if self.len == 0 {
+        if self.len == 0 || !self.last_delta_valid {
             None
         } else {
             Some(self.deltas[(self.pos - 1) % HISTORY_SIZE])
         }
+    }
+
+    /// Invalidate the last delta so it won't be used as a Markov conditioning
+    /// key. The history contents are preserved for frequency-based prediction.
+    fn invalidate_last_delta(&mut self) {
+        self.last_delta_valid = false;
     }
 
     /// Cold-start fallback: frequency count over the ring buffer.
@@ -252,6 +262,7 @@ impl RecentHistory {
         self.len = 0;
         self.prev_page = 0;
         self.has_prev_page = false;
+        self.last_delta_valid = false;
     }
 }
 
@@ -358,10 +369,15 @@ impl PrefetchPredictor {
     }
 
     /// Mark the previous page reference as invalid without clearing learned state.
-    /// Called on writes to avoid computing a bogus delta from the last-read page
-    /// to the written page offset.
+    /// Called on writes so the predictor treats the write as an opaque boundary:
+    /// no delta is computed across it, stride state is broken, and the next
+    /// Markov bigram won't bridge pre-write and post-write deltas.
     pub fn skip_next_delta(&mut self) {
         self.history.has_prev_page = false;
+        self.stride.reset();
+        // Clear the ring buffer's notion of "last delta" so the next record()
+        // after the boundary won't feed a stale prev_delta into the Markov table.
+        self.history.invalidate_last_delta();
     }
 
     /// Predict next pages from the current page. Returns (page, confidence) pairs
@@ -796,32 +812,73 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_next_delta_preserves_state() {
+    fn test_skip_next_delta_creates_clean_boundary() {
         let mut pred = PrefetchPredictor::new();
         // Build sequential pattern
         for i in 1..=10 {
             pred.record(i);
         }
         let history_len_before = pred.history.len;
-        let stride_conf_before = pred.stride.confidence;
 
-        // Simulate a write — should only invalidate prev_page, not clear state
+        // Simulate a write — preserves history buffer but breaks stride and
+        // invalidates last delta so no bogus Markov bigram bridges the write.
         pred.skip_next_delta();
 
-        assert_eq!(pred.history.len, history_len_before, "history should be preserved");
-        assert_eq!(pred.stride.confidence, stride_conf_before, "stride should be preserved");
+        assert_eq!(pred.history.len, history_len_before, "history buffer should be preserved");
+        assert_eq!(pred.stride.confidence, 0.0, "stride should be reset across write boundary");
+        assert!(!pred.history.has_prev_page, "prev_page should be invalidated");
+        assert!(!pred.history.last_delta_valid, "last_delta should be invalidated");
 
-        // Next read after the write: first record sets prev_page only
+        // Record Markov state before post-write reads
+        let markov_sum_before: u32 = pred
+            .markov
+            .entries
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| e.count as u32)
+            .sum();
+
+        // First read after write: just sets prev_page (no delta computed)
         pred.record(50);
-        // Second read after write: computes real delta
+        // Second read after write: computes delta +1 from 50->51, but does NOT
+        // record a Markov bigram because last_delta was invalidated by the skip
         pred.record(51);
 
-        // History and stride should still be largely functional
-        let predictions = pred.multi_predict(51, 5);
-        // Should still predict sequential (delta +1 is dominant in history)
+        let markov_sum_after: u32 = pred
+            .markov
+            .entries
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| e.count as u32)
+            .sum();
+
+        // The second read records delta +1 into the ring buffer, but there's no
+        // valid prev_delta to form a bigram. So no new Markov entry should appear.
+        assert_eq!(
+            markov_sum_before, markov_sum_after,
+            "no Markov bigram should bridge across write boundary"
+        );
+
+        // Third read: now both prev_page and last_delta are valid, so Markov
+        // training resumes normally
+        pred.record(52);
+        let markov_sum_final: u32 = pred
+            .markov
+            .entries
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| e.count as u32)
+            .sum();
         assert!(
-            predictions.contains(&52),
-            "predictions should work after skip_next_delta"
+            markov_sum_final > markov_sum_after,
+            "Markov training should resume after clean boundary"
+        );
+
+        // Predictions should work using the history buffer (delta +1 dominant)
+        let predictions = pred.multi_predict(52, 5);
+        assert!(
+            predictions.contains(&53),
+            "predictions should work after write boundary"
         );
     }
 
