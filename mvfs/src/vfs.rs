@@ -137,6 +137,7 @@ impl MultiVersionVfs {
             write_buffer: HashMap::new(),
             virtual_version_counter: 0,
             last_known_write_version: None,
+            pending_commit_group_result: None,
         };
         Ok(conn)
     }
@@ -163,6 +164,11 @@ pub struct Connection {
     virtual_version_counter: u32,
 
     last_known_write_version: Option<String>,
+
+    /// Shared slot populated by `commit_group::commit()` after a successful
+    /// commit group.  Consumed on the next `lock()` call to apply the
+    /// changelog and advance `last_known_write_version`.
+    pending_commit_group_result: Option<Arc<commit_group::CommitGroupResultSlot>>,
 }
 
 #[derive(Default)]
@@ -448,8 +454,10 @@ impl Connection {
             }
 
             if let Some(intent) = intent {
-                commit_group::append_intent(&self.client, self.dp.as_ref(), intent)
-                    .expect("failed to append to commit group");
+                let result_slot =
+                    commit_group::append_intent(&self.client, self.dp.as_ref(), intent)
+                        .expect("failed to append to commit group");
+                self.pending_commit_group_result = Some(result_slot);
                 tracing::info!("added intent to commit group");
             } else {
                 tracing::info!("transaction is empty (commit group)");
@@ -636,11 +644,14 @@ impl Connection {
             // participated, apply the changelog and advance
             // last_known_write_version so the subsequent interval request
             // covers only changes *after* the commit group.
-            if let Some((committed_version, changelog)) =
-                commit_group::take_commit_group_result_for_ns(
-                    self.client.config().ns_key.as_str(),
-                )
+            if let Some((committed_version, changelog)) = self
+                .pending_commit_group_result
+                .as_ref()
+                .and_then(|slot| {
+                    slot.get_for_ns(self.client.config().ns_key.as_str())
+                })
             {
+                self.pending_commit_group_result = None;
                 match changelog {
                     Some(pages) => {
                         if !pages.is_empty() {
