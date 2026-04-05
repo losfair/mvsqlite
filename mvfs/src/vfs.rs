@@ -216,11 +216,15 @@ impl Connection {
         let predicted_next = predicted_next
             .iter()
             .filter(|x| {
-                // Exclude pages already cached, locally dirty (write_buffer),
-                // or previously flushed to the server (page_buffer) in this
-                // transaction.  Without these checks, prefetch could re-fetch
-                // the pre-write version from the server and inject stale data
-                // into page_cache.
+                // Exclude pages already cached or locally dirty (write_buffer).
+                // Without the write_buffer check, prefetch could re-fetch the
+                // pre-write version from the server (unflushed pages have no
+                // hash in page_buffer, so read-your-writes doesn't apply) and
+                // inject stale data into page_cache.
+                //
+                // The page_is_written() check is an optimisation: flushed pages
+                // ARE protected server-side by content-hash read-your-writes,
+                // but skipping them here avoids a needless round-trip.
                 !self.page_cache.contains_key(*x)
                     && !self.write_buffer.contains_key(*x)
                     && !txn.page_is_written(**x)
@@ -309,10 +313,9 @@ impl Connection {
         }
 
         // Re-insert every flushed page into page_cache to refresh its recency
-        // before clearing write_buffer.  After the clear, write_buffer no longer
-        // guards these pages, so they must survive in page_cache until the
-        // transaction ends.  (The prefetch filter also excludes pages tracked by
-        // txn.page_is_written(), providing a second line of defence.)
+        // before clearing write_buffer.  Flushed pages are protected server-side
+        // by content-hash read-your-writes, so this is an optimisation to avoid
+        // unnecessary round-trips if the page is re-read later.
         for (page_id, data) in &self.write_buffer {
             self.page_cache.insert(*page_id, data.clone());
         }
