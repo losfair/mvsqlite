@@ -186,15 +186,18 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.predictor.record(page_offset);
 
-        if let Some(x) = &self.page_cache.get(&page_offset) {
-            buf.copy_from_slice(x);
-            tracing::trace!("page cache hit");
-            return Ok(());
-        }
-
+        // Check write_buffer first: it holds uncommitted writes that are
+        // authoritative for this transaction.  Checking it before page_cache
+        // prevents stale prefetch data from shadowing local writes.
         if let Some(x) = &self.write_buffer.get(&page_offset) {
             buf.copy_from_slice(x);
             tracing::trace!("write buffer hit");
+            return Ok(());
+        }
+
+        if let Some(x) = &self.page_cache.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("page cache hit");
             return Ok(());
         }
 
@@ -212,7 +215,16 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| !self.page_cache.contains_key(*x))
+            .filter(|x| {
+                // Exclude pages already cached, locally dirty (write_buffer),
+                // or previously flushed to the server (page_buffer) in this
+                // transaction.  Without these checks, prefetch could re-fetch
+                // the pre-write version from the server and inject stale data
+                // into page_cache.
+                !self.page_cache.contains_key(*x)
+                    && !self.write_buffer.contains_key(*x)
+                    && !txn.page_is_written(**x)
+            })
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -253,7 +265,11 @@ impl Connection {
         self.insert_to_page_cache(page_offset, Bytes::copy_from_slice(&*buf));
 
         for (maybe_other_page, their_index) in pages.iter().skip(1).zip(read_vec.iter().skip(1)) {
-            if *their_index != 0 && !maybe_other_page.is_empty() {
+            // Guard: never overwrite a locally-written page with server data.
+            if *their_index != 0
+                && !maybe_other_page.is_empty()
+                && !self.write_buffer.contains_key(their_index)
+            {
                 self.insert_to_page_cache(
                     *their_index,
                     Bytes::copy_from_slice(&maybe_other_page[..]),
@@ -290,6 +306,15 @@ impl Connection {
             txn.write_many(chunk)
                 .await
                 .expect("unrecoverable write failure")
+        }
+
+        // Re-insert every flushed page into page_cache to refresh its recency
+        // before clearing write_buffer.  After the clear, write_buffer no longer
+        // guards these pages, so they must survive in page_cache until the
+        // transaction ends.  (The prefetch filter also excludes pages tracked by
+        // txn.page_is_written(), providing a second line of defence.)
+        for (page_id, data) in &self.write_buffer {
+            self.page_cache.insert(*page_id, data.clone());
         }
         self.write_buffer.clear();
     }
@@ -545,7 +570,15 @@ impl Connection {
                 buf[92..96].copy_from_slice(&[0u8; 4]);
             }
 
-            if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
+            // Check write_buffer first (authoritative for dirty pages), then
+            // fall back to page_cache.  This avoids comparing against stale
+            // prefetch data that could have been injected into page_cache.
+            let cached = self
+                .write_buffer
+                .get(&(page_offset as u32))
+                .cloned()
+                .or_else(|| self.page_cache.get(&(page_offset as u32)));
+            if let Some(x) = cached {
                 if &x[..] == buf {
                     tracing::info!(page = page_offset, "identity write ignored");
                     return Ok(());
