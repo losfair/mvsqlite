@@ -297,7 +297,7 @@ impl PredictorMetrics {
     }
 
     fn record_predictions(&mut self, pages: &[u32]) {
-        self.predictions_made += 1;
+        self.predictions_made += pages.len() as u32;
         let n = pages.len().min(PREDICTION_TRACK_SIZE);
         self.recent_predictions[..n].copy_from_slice(&pages[..n]);
         self.recent_predictions_len = n;
