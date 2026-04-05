@@ -186,18 +186,15 @@ impl Connection {
         self.txn.as_mut().unwrap().mark_read(page_offset);
         self.predictor.record(page_offset);
 
-        // Check write_buffer first: it holds uncommitted writes that are
-        // authoritative for this transaction.  Checking it before page_cache
-        // prevents stale prefetch data from shadowing local writes.
-        if let Some(x) = &self.write_buffer.get(&page_offset) {
-            buf.copy_from_slice(x);
-            tracing::trace!("write buffer hit");
-            return Ok(());
-        }
-
         if let Some(x) = &self.page_cache.get(&page_offset) {
             buf.copy_from_slice(x);
             tracing::trace!("page cache hit");
+            return Ok(());
+        }
+
+        if let Some(x) = &self.write_buffer.get(&page_offset) {
+            buf.copy_from_slice(x);
+            tracing::trace!("write buffer hit");
             return Ok(());
         }
 
@@ -573,15 +570,7 @@ impl Connection {
                 buf[92..96].copy_from_slice(&[0u8; 4]);
             }
 
-            // Check write_buffer first (authoritative for dirty pages), then
-            // fall back to page_cache.  This avoids comparing against stale
-            // prefetch data that could have been injected into page_cache.
-            let cached = self
-                .write_buffer
-                .get(&(page_offset as u32))
-                .cloned()
-                .or_else(|| self.page_cache.get(&(page_offset as u32)));
-            if let Some(x) = cached {
+            if let Some(x) = self.page_cache.get(&(page_offset as u32)) {
                 if &x[..] == buf {
                     tracing::info!(page = page_offset, "identity write ignored");
                     return Ok(());
