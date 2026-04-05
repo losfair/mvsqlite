@@ -99,9 +99,11 @@ On a cache miss (`multi_predict(current_page, max_pages)` is called):
 5. Return the union of all predicted pages (never exceeds `max_pages`)
 
 The caller (in `mvfs/src/vfs.rs`) passes `PREFETCH_DEPTH` as `max_pages`, then:
-- Fills remaining `PREFETCH_DEPTH` slots with sequential pages (fallback)
 - Filters out pages already in the local cache
 - Issues a single batched `read_many` request for the target page + all predictions
+
+If the predictor produces fewer predictions than `PREFETCH_DEPTH`, only those
+predictions are fetched — no sequential fallback padding is applied.
 
 ## Transaction Boundaries
 

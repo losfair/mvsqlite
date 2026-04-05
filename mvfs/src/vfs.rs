@@ -208,16 +208,7 @@ impl Connection {
         );
 
         let prefetch_depth: usize = PREFETCH_DEPTH.load(Ordering::Relaxed);
-        let mut predicted_next = self.predictor.multi_predict(page_offset, prefetch_depth);
-
-        // Fill remaining slots with sequential pages if predictions are insufficient
-        {
-            let mut i: u32 = 1;
-            while predicted_next.len() < prefetch_depth {
-                predicted_next.insert(page_offset + i);
-                i += 1;
-            }
-        }
+        let predicted_next = self.predictor.multi_predict(page_offset, prefetch_depth);
 
         let predicted_next = predicted_next
             .iter()
