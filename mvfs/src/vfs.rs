@@ -520,7 +520,7 @@ impl Connection {
         assert!(buf.len() == self.sector_size);
 
         let mut buf = buf.to_vec();
-        self.predictor.reset();
+        self.predictor.skip_next_delta();
 
         let page_offset = offset as usize / self.sector_size;
 

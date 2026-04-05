@@ -178,6 +178,7 @@ struct RecentHistory {
     pos: usize,
     len: usize,
     prev_page: u32,
+    has_prev_page: bool,
 }
 
 impl Default for RecentHistory {
@@ -187,6 +188,7 @@ impl Default for RecentHistory {
             pos: 0,
             len: 0,
             prev_page: 0,
+            has_prev_page: false,
         }
     }
 }
@@ -249,6 +251,7 @@ impl RecentHistory {
         self.pos = 0;
         self.len = 0;
         self.prev_page = 0;
+        self.has_prev_page = false;
     }
 }
 
@@ -325,6 +328,14 @@ impl PrefetchPredictor {
         // Check if this page was predicted (metrics)
         self.metrics.check_hit(current_page);
 
+        if !self.history.has_prev_page {
+            // First access after init/reset/skip — no meaningful delta yet.
+            // Just record the page so the next access can compute a real delta.
+            self.history.prev_page = current_page;
+            self.history.has_prev_page = true;
+            return;
+        }
+
         let delta = current_page as i64 - self.history.prev_page as i64;
 
         // Update Markov table with bigram (prev_delta -> current_delta)
@@ -344,6 +355,13 @@ impl PrefetchPredictor {
         if self.record_count % DECAY_INTERVAL == 0 && self.record_count > 0 {
             self.markov.decay();
         }
+    }
+
+    /// Mark the previous page reference as invalid without clearing learned state.
+    /// Called on writes to avoid computing a bogus delta from the last-read page
+    /// to the written page offset.
+    pub fn skip_next_delta(&mut self) {
+        self.history.has_prev_page = false;
     }
 
     /// Predict next pages from the current page. Returns (page, confidence) pairs
@@ -724,6 +742,86 @@ mod tests {
         assert!(
             predictions.is_empty(),
             "max_pages=0 should return no predictions"
+        );
+    }
+
+    #[test]
+    fn test_no_synthetic_delta_after_reset() {
+        let mut pred = PrefetchPredictor::new();
+        // Build up some Markov state
+        for i in 1..=10 {
+            pred.record(i);
+        }
+        let entries_before: u32 = pred
+            .markov
+            .entries
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| e.count as u32)
+            .sum();
+
+        pred.reset();
+
+        // First access after reset at an arbitrary page — should NOT record a
+        // synthetic delta from page 0 to page 500.
+        pred.record(500);
+        // Second access records a real delta
+        pred.record(501);
+
+        let entries_after: u32 = pred
+            .markov
+            .entries
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| e.count as u32)
+            .sum();
+
+        // Only one new transition should have been recorded (delta +1 from 500->501),
+        // not two (no synthetic delta from 0->500).
+        // entries_after should be entries_before + 1 (for the +1 delta),
+        // possibly more if (+1 -> +1) already existed and got incremented.
+        // The key check: there should be no entry with a delta of +500.
+        let has_500_delta = pred.markov.entries.iter().any(|e| {
+            e.count > 0 && (e.prev_delta == 500 || e.next_delta == 500)
+        });
+        assert!(
+            !has_500_delta,
+            "reset should not produce synthetic delta of +500 from page 0"
+        );
+        // Sanity: total count should not have jumped by more than 2
+        assert!(
+            entries_after <= entries_before + 2,
+            "only real transitions should be recorded after reset"
+        );
+    }
+
+    #[test]
+    fn test_skip_next_delta_preserves_state() {
+        let mut pred = PrefetchPredictor::new();
+        // Build sequential pattern
+        for i in 1..=10 {
+            pred.record(i);
+        }
+        let history_len_before = pred.history.len;
+        let stride_conf_before = pred.stride.confidence;
+
+        // Simulate a write — should only invalidate prev_page, not clear state
+        pred.skip_next_delta();
+
+        assert_eq!(pred.history.len, history_len_before, "history should be preserved");
+        assert_eq!(pred.stride.confidence, stride_conf_before, "stride should be preserved");
+
+        // Next read after the write: first record sets prev_page only
+        pred.record(50);
+        // Second read after write: computes real delta
+        pred.record(51);
+
+        // History and stride should still be largely functional
+        let predictions = pred.multi_predict(51, 5);
+        // Should still predict sequential (delta +1 is dominant in history)
+        assert!(
+            predictions.contains(&52),
+            "predictions should work after skip_next_delta"
         );
     }
 
