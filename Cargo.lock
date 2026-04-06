@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "mvclient"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "mvfs"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "mvsqlite"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "mvsqlite-fuse"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "mvstore"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "mvstore-stress"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "backtrace",
