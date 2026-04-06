@@ -273,10 +273,44 @@ hashes are read with `snapshot=false` (adds to read conflict). If content is
 deleted between read and commit (e.g., by GC), the transaction conflicts on the
 content index key. This is correct.
 
+## Fix
+
+The multi-phase path already demonstrates the correct pattern: suppress the
+default write conflict from `SetVersionstampedKey` with
+`NextWriteNoWriteConflictRange`, then add an explicit write conflict range that
+covers the right key space.
+
+The fix applies the same pattern to single-phase commits, but scoped per-page
+instead of per-namespace to preserve PLCC's fine-grained semantics:
+
+1. **Always** set `NextWriteNoWriteConflictRange` before the
+   `SetVersionstampedKey` page write (not just for multi-phase). The template
+   key write conflict is useless in all paths.
+
+2. **Multi-phase** (unchanged): Add a single broad write conflict range covering
+   all pages in the namespace.
+
+3. **Single-phase** (new): For each written page P, add a write conflict range
+   `[page_key(P, [0u8;10]), page_key(P, [0xff;10]) || 0x00)` covering all
+   versions of P. This overlaps with the PLCC read conflict range
+   `[page_key(P, V_current), page_key(P, [0xff;10]) || 0x00)` for any existing
+   version V_current.
+
+This is correct because:
+- Two PLCC transactions writing to the **same** page now conflict via the
+  per-page write conflict range overlapping the other's PLCC read conflict
+  range.
+- Two PLCC transactions writing to **different** pages don't conflict — their
+  per-page write conflict ranges don't overlap with each other's read conflict
+  ranges.
+- Non-PLCC transactions still conflict on LWV as before; the per-page write
+  conflict ranges are inert (no non-PLCC transaction has page-level read
+  conflicts).
+
 ## Summary
 
 | Path | Verdict | Mechanism |
 |---|---|---|
 | Non-PLCC single-phase | **Correct** | LWV non-snapshot read + atomic write = mutual conflict detection |
 | Multi-phase | **Correct** | LWV + explicit broad write conflict ranges + commit token for GC |
-| PLCC single-phase | **Bug** | `SetVersionstampedKey` template key falls outside PLCC read conflict range |
+| PLCC single-phase | **Bug (fixed)** | Per-page write conflict ranges replace useless template key conflicts |
