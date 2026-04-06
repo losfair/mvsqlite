@@ -153,6 +153,41 @@ impl Server {
             anyhow::bail!("failed to acquire lock");
         }
 
+        // Write the truncated_before watermark BEFORE any deletions happen.
+        // This ensures that even if we crash mid-truncation, the watermark is
+        // already in place to prevent stale forks and reads.
+        if !dry_run {
+            let before_version_hex = hex::encode(before_version);
+            loop {
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let metadata = match self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, ns_id)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        txn.on_error(*e).await?;
+                        continue;
+                    }
+                };
+                let existing = metadata.truncated_before.as_deref().unwrap_or_default();
+                if before_version_hex.as_str() <= existing {
+                    break;
+                }
+                let mut metadata = (*metadata).clone();
+                metadata.truncated_before = Some(before_version_hex.clone());
+                self.ns_metadata_cache
+                    .set(&txn, &self.key_codec, ns_id, Arc::new(metadata))?;
+                match txn.commit().await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        e.on_error().await?;
+                    }
+                }
+            }
+        }
+
         let mut total_count = 0u64;
 
         // Precompute the overlay_ref conflict range for this namespace.
@@ -297,39 +332,6 @@ impl Server {
                 Ok(_) => break,
                 Err(e) => {
                     e.on_error().await?;
-                }
-            }
-        }
-
-        // Update the truncated_before watermark in namespace metadata.
-        // Take the max of the existing watermark and the new before_version.
-        if !dry_run {
-            let before_version_hex = hex::encode(before_version);
-            loop {
-                let txn = lock.create_txn_and_check_sync(&self.db).await?;
-                let metadata = match self
-                    .ns_metadata_cache
-                    .get(&txn, &self.key_codec, ns_id)
-                    .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        txn.on_error(*e).await?;
-                        continue;
-                    }
-                };
-                let existing = metadata.truncated_before.as_deref().unwrap_or_default();
-                if before_version_hex.as_str() > existing {
-                    let mut metadata = (*metadata).clone();
-                    metadata.truncated_before = Some(before_version_hex.clone());
-                    self.ns_metadata_cache
-                        .set(&txn, &self.key_codec, ns_id, Arc::new(metadata))?;
-                }
-                match txn.commit().await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        e.on_error().await?;
-                    }
                 }
             }
         }

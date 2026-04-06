@@ -461,7 +461,10 @@ impl Server {
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
 
-                    // Reject deletion if other namespaces overlay this one
+                    // Reject deletion if other namespaces overlay this one.
+                    // Non-snapshot read so the range is in the conflict set;
+                    // a concurrent create_namespace writing an overlay_ref
+                    // entry will cause this transaction to conflict.
                     let (ref_start, ref_end) = self.key_codec.construct_overlay_ref_range(ns_id);
                     let children: Vec<_> = txn
                         .get_ranges_keyvalues(
@@ -471,7 +474,7 @@ impl Server {
                                 mode: StreamingMode::WantAll,
                                 ..RangeOption::from(ref_start.as_slice()..=ref_end.as_slice())
                             },
-                            true,
+                            false,
                         )
                         .try_collect()
                         .await?;

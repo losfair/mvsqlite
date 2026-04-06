@@ -201,10 +201,11 @@ below).
 
 ### Truncation watermark (`truncated_before`)
 
-When `truncate_versions` completes (non-dry-run), it writes the effective
-`before_version` into the namespace metadata as `truncated_before`, taking the
-max of the existing watermark and the new value. This watermark is then
-enforced at two points:
+Before any pages are deleted (non-dry-run), `truncate_versions` writes the
+effective `before_version` into the namespace metadata as `truncated_before`,
+taking the max of the existing watermark and the new value. Writing it before
+deletions ensures that even if the process crashes mid-truncation, the
+watermark is already in place. This watermark is then enforced at two points:
 
 **Fork creation.** `create_namespace` with `overlay_base` reads the base
 namespace's metadata inside the creation transaction. If
