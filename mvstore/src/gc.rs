@@ -8,11 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use bloom::{BloomFilter, ASMS};
-use foundationdb::{
-    future::FdbKeyValue,
-    options::{ConflictRangeType, StreamingMode},
-    RangeOption,
-};
+use foundationdb::{future::FdbKeyValue, options::StreamingMode, RangeOption};
 use futures::TryStreamExt;
 
 use crate::{
@@ -165,8 +161,6 @@ impl Server {
         // entry, the deletion transaction conflicts and retries.
         let (overlay_ref_start, overlay_ref_end) =
             self.key_codec.construct_overlay_ref_range(ns_id);
-        let mut overlay_ref_end_exclusive = overlay_ref_end.clone();
-        overlay_ref_end_exclusive.push(0x00);
 
         loop {
             let scan_result = loop {
@@ -229,19 +223,11 @@ impl Server {
                     loop {
                         let txn = lock.create_txn_and_check_sync(&self.db).await?;
 
-                        // Guard against TOCTOU: add the overlay_ref range to
-                        // the read conflict set so a concurrent
-                        // create_namespace that writes an overlay_ref entry
-                        // will cause this transaction to conflict.
-                        txn.add_conflict_range(
-                            &overlay_ref_start,
-                            &overlay_ref_end_exclusive,
-                            ConflictRangeType::Read,
-                        )?;
-
-                        // Re-validate: check that no overlay child appeared
-                        // with snapshot_version < before_version since the
-                        // initial check.
+                        // Guard against TOCTOU: read the overlay_ref range
+                        // with snapshot=false so it is added to the read
+                        // conflict set. A concurrent create_namespace that
+                        // writes an overlay_ref entry will cause this
+                        // transaction to conflict.
                         let overlay_refs: Vec<_> = match txn
                             .get_ranges_keyvalues(
                                 RangeOption {
@@ -252,7 +238,7 @@ impl Server {
                                         overlay_ref_start.as_slice()..=overlay_ref_end.as_slice(),
                                     )
                                 },
-                                true,
+                                false,
                             )
                             .try_collect()
                             .await
