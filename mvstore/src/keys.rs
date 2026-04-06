@@ -15,6 +15,12 @@ impl KeyCodec {
         key
     }
 
+    pub fn construct_nsmd_range(&self) -> (Vec<u8>, Vec<u8>) {
+        let start = self.construct_nsmd_key([0u8; 10]);
+        let end = self.construct_nsmd_key([0xffu8; 10]);
+        (start, end)
+    }
+
     pub fn construct_nsrollbackcursor_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nsrollbackcursor"));
         key.push(0x32);

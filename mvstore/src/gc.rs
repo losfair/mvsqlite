@@ -14,6 +14,7 @@ use futures::TryStreamExt;
 use crate::{
     fixed::FixedKeyVec,
     lock::DistributedLock,
+    metadata::NamespaceMetadata,
     server::Server,
     util::{
         add_single_key_read_conflict_range, decode_version, extract_10_byte_suffix,
@@ -25,6 +26,63 @@ pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
 impl Server {
+    /// Scan all namespace metadata entries to find the minimum overlay
+    /// snapshot_version among namespaces that use `target_ns_id` as their
+    /// overlay base.
+    ///
+    /// Returns `None` if no namespace overlays the target.
+    async fn min_overlay_snapshot_version(
+        &self,
+        target_ns_id: [u8; 10],
+    ) -> Result<Option<[u8; 10]>> {
+        let target_ns_id_hex = hex::encode(target_ns_id);
+        let (scan_start, scan_end) = self.key_codec.construct_nsmd_range();
+        let mut cursor = scan_start.clone();
+        let mut min_version: Option<[u8; 10]> = None;
+
+        loop {
+            let txn = self.db.create_trx()?;
+            let range: Vec<_> = txn
+                .get_ranges_keyvalues(
+                    RangeOption {
+                        limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                        reverse: false,
+                        mode: StreamingMode::WantAll,
+                        ..RangeOption::from(cursor.as_slice()..=scan_end.as_slice())
+                    },
+                    true,
+                )
+                .try_collect()
+                .await?;
+
+            if range.is_empty() {
+                break;
+            }
+
+            cursor = range.last().unwrap().key().to_vec();
+            cursor.push(0x00);
+
+            for kv in &range {
+                let md: NamespaceMetadata = match serde_json::from_slice(kv.value()) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if let Some(base) = &md.overlay_base {
+                    if base.ns_id == target_ns_id_hex {
+                        if let Ok(v) = decode_version(&base.snapshot_version) {
+                            min_version = Some(match min_version {
+                                Some(cur) => cur.min(v),
+                                None => v,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(min_version)
+    }
+
     pub async fn truncate_versions(
         self: Arc<Self>,
         dry_run: bool,
@@ -32,10 +90,12 @@ impl Server {
         mut before_version: [u8; 10],
         mut progress_callback: impl FnMut(Option<u64>),
     ) -> Result<()> {
-        // Fix up `before_version` to be the minimum of the three:
+        // Fix up `before_version` to be the minimum of:
         // - The supplied value
         // - The cluster's current read version as seen by this snapshot
         // - The NS lock version in the same snapshot
+        // - The minimum overlay snapshot_version from any namespace that
+        //   uses this namespace as its overlay base (fork safety)
         {
             let txn = self.db.create_trx()?;
 
@@ -48,6 +108,16 @@ impl Server {
             if let Some(lock) = &metadata.lock {
                 before_version = before_version.min(decode_version(&lock.snapshot_version)?);
             }
+        }
+
+        // Ensure we don't truncate page versions that overlay children depend on
+        if let Some(overlay_min) = self.min_overlay_snapshot_version(ns_id).await? {
+            before_version = before_version.min(overlay_min);
+            tracing::info!(
+                ns = hex::encode(&ns_id),
+                overlay_min_version = hex::encode(&overlay_min),
+                "clamped truncation to protect overlay children"
+            );
         }
 
         tracing::info!(
