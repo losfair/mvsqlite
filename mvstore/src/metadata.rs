@@ -14,6 +14,9 @@ pub struct NamespaceMetadata {
 
     #[serde(default)]
     pub overlay_base: Option<NamespaceOverlayBase>,
+
+    #[serde(default)]
+    pub truncated_before: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

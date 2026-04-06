@@ -62,6 +62,7 @@ enum GetError {
 #[derive(Debug)]
 enum CreateNamespaceError {
     AlreadyExist,
+    BaseTruncated,
 }
 
 impl std::fmt::Display for CreateNamespaceError {
@@ -282,18 +283,39 @@ impl Server {
         let nsmd = NamespaceMetadata {
             lock: None,
             overlay_base,
+            ..Default::default()
         };
-        if let Some(base) = &nsmd.overlay_base {
-            decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
-            decode_version(&base.snapshot_version)
-                .with_context(|| "overlay_base: invalid snapshot_version")?;
-        }
+        let overlay_base_decoded = match &nsmd.overlay_base {
+            Some(base) => {
+                let base_ns_id =
+                    decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
+                let snapshot_version = decode_version(&base.snapshot_version)
+                    .with_context(|| "overlay_base: invalid snapshot_version")?;
+                Some((base_ns_id, snapshot_version))
+            }
+            None => None,
+        };
         let nsmd = serde_json::to_string(&nsmd)?;
         let mut txn = self.db.create_trx()?;
 
         loop {
             if txn.get(&nskey_key, false).await?.is_some() {
                 return Err(anyhow::Error::new(CreateNamespaceError::AlreadyExist));
+            }
+
+            // Reject fork creation if the base has been truncated past the
+            // requested snapshot_version.
+            if let Some((base_ns_id, snapshot_version)) = &overlay_base_decoded {
+                let base_metadata = self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, *base_ns_id)
+                    .await?;
+                if let Some(truncated_before) = &base_metadata.truncated_before {
+                    let truncated = decode_version(truncated_before)?;
+                    if *snapshot_version < truncated {
+                        return Err(anyhow::Error::new(CreateNamespaceError::BaseTruncated));
+                    }
+                }
             }
 
             let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
@@ -310,6 +332,22 @@ impl Server {
                 &nskey_atomic_op_value,
                 MutationType::SetVersionstampedValue,
             );
+
+            // Write overlay reverse index: base_ns_id -> child_ns_id = snapshot_version.
+            // The child_ns_id suffix is filled in by FDB's versionstamp.
+            if let Some((base_ns_id, snapshot_version)) = &overlay_base_decoded {
+                let overlay_ref_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                    &self
+                        .key_codec
+                        .construct_overlay_ref_key(*base_ns_id, [0u8; 10]),
+                );
+                txn.atomic_op(
+                    &overlay_ref_atomic_op_key,
+                    snapshot_version,
+                    MutationType::SetVersionstampedKey,
+                );
+            }
+
             match txn.commit().await {
                 Ok(_) => {
                     return Ok(());
@@ -344,6 +382,11 @@ impl Server {
                             return Ok(Response::builder()
                                 .status(422)
                                 .body(Body::from("this key already exists\n"))?);
+                        }
+                        Some(CreateNamespaceError::BaseTruncated) => {
+                            return Ok(Response::builder().status(409).body(Body::from(
+                                "base namespace has been truncated past the requested snapshot_version\n",
+                            ))?);
                         }
                         _ => {
                             return Ok(Response::builder()
@@ -417,6 +460,44 @@ impl Server {
                     };
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+
+                    // Reject deletion if other namespaces overlay this one.
+                    // Non-snapshot read so the range is in the conflict set;
+                    // a concurrent create_namespace writing an overlay_ref
+                    // entry will cause this transaction to conflict.
+                    let (ref_start, ref_end) = self.key_codec.construct_overlay_ref_range(ns_id);
+                    let children: Vec<_> = txn
+                        .get_ranges_keyvalues(
+                            RangeOption {
+                                limit: Some(1),
+                                reverse: false,
+                                mode: StreamingMode::WantAll,
+                                ..RangeOption::from(ref_start.as_slice()..=ref_end.as_slice())
+                            },
+                            false,
+                        )
+                        .try_collect()
+                        .await?;
+                    if !children.is_empty() {
+                        return Ok(Response::builder().status(409).body(Body::from(
+                            "namespace has overlay children and cannot be deleted\n",
+                        ))?);
+                    }
+
+                    // Read metadata to clean up overlay reverse index
+                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
+                    if let Some(nsmd_raw) = txn.get(&nsmd_key, false).await? {
+                        let md: NamespaceMetadata =
+                            serde_json::from_slice(&nsmd_raw).unwrap_or_default();
+                        if let Some(base) = &md.overlay_base {
+                            if let Ok(base_ns_id) = decode_version(&base.ns_id) {
+                                let overlay_ref_key =
+                                    self.key_codec.construct_overlay_ref_key(base_ns_id, ns_id);
+                                txn.clear(&overlay_ref_key);
+                            }
+                        }
+                    }
+
                     let ns_data_start = self.key_codec.construct_ns_data_prefix(ns_id);
                     let mut ns_data_end = ns_data_start.clone();
                     ns_data_end.push(0xff).unwrap();
@@ -424,7 +505,6 @@ impl Server {
                     txn.clear_range(&ns_data_start, &ns_data_end);
                     txn.clear(&nskey_key);
 
-                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
                     txn.update_metadata_version();
                     match txn.commit().await {
@@ -1583,6 +1663,24 @@ impl Server {
                 .create_versioned_read_txn(read_req.version)
                 .await
                 .with_context(|| "failed to create versioned read txn")?;
+
+            // Reject reads at versions that have been truncated.
+            let metadata = self
+                .ns_metadata_cache
+                .get(&txn, &self.key_codec, ns_id)
+                .await?;
+            if let Some(truncated_before) = &metadata.truncated_before {
+                let truncated = decode_version(truncated_before)?;
+                let req_version = decode_version(read_req.version)?;
+                if req_version < truncated {
+                    anyhow::bail!(
+                        "requested version {} is before truncation watermark {}",
+                        read_req.version,
+                        truncated_before
+                    );
+                }
+            }
+
             let mut page = self
                 .read_page_decoded_snapshot_compressed(
                     &txn,
@@ -1595,12 +1693,26 @@ impl Server {
 
             if page.is_none() {
                 // Overlay
-                let metadata = self
-                    .ns_metadata_cache
-                    .get(&txn, &self.key_codec, ns_id)
-                    .await?;
                 if let Some(base) = &metadata.overlay_base {
                     let base_ns_id = decode_version(&base.ns_id)?;
+
+                    // Also check the base namespace's truncation watermark.
+                    let base_metadata = self
+                        .ns_metadata_cache
+                        .get(&txn, &self.key_codec, base_ns_id)
+                        .await?;
+                    if let Some(truncated_before) = &base_metadata.truncated_before {
+                        let truncated = decode_version(truncated_before)?;
+                        let snap = decode_version(&base.snapshot_version)?;
+                        if snap < truncated {
+                            anyhow::bail!(
+                                "overlay snapshot_version {} is before base truncation watermark {}",
+                                base.snapshot_version,
+                                truncated_before
+                            );
+                        }
+                    }
+
                     let base_page = self
                         .read_page_decoded_snapshot_compressed(
                             &txn,

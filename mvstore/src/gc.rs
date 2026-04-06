@@ -25,6 +25,63 @@ pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
 impl Server {
+    /// Look up the minimum overlay snapshot_version among namespaces that use
+    /// `target_ns_id` as their overlay base, using the `overlay_ref` reverse
+    /// index.
+    ///
+    /// Returns `None` if no namespace overlays the target.
+    async fn min_overlay_snapshot_version(
+        self: &Arc<Self>,
+        target_ns_id: [u8; 10],
+    ) -> Result<Option<[u8; 10]>> {
+        let (scan_start, scan_end) = self.key_codec.construct_overlay_ref_range(target_ns_id);
+        let mut cursor = scan_start.clone();
+        let mut min_version: Option<[u8; 10]> = None;
+
+        loop {
+            let range: Vec<_> = loop {
+                let txn = self.db.create_trx()?;
+                match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                            reverse: false,
+                            mode: StreamingMode::WantAll,
+                            ..RangeOption::from(cursor.as_slice()..=scan_end.as_slice())
+                        },
+                        true,
+                    )
+                    .try_collect()
+                    .await
+                {
+                    Ok(x) => break x,
+                    Err(e) => {
+                        txn.on_error(e).await?;
+                        continue;
+                    }
+                }
+            };
+
+            if range.is_empty() {
+                break;
+            }
+
+            cursor = range.last().unwrap().key().to_vec();
+            cursor.push(0x00);
+
+            for kv in &range {
+                if let Ok(v) = <[u8; 10]>::try_from(kv.value()) {
+                    min_version = Some(match min_version {
+                        Some(cur) => cur.min(v),
+                        None => v,
+                    });
+                }
+            }
+        }
+
+        Ok(min_version)
+    }
+
     pub async fn truncate_versions(
         self: Arc<Self>,
         dry_run: bool,
@@ -32,10 +89,12 @@ impl Server {
         mut before_version: [u8; 10],
         mut progress_callback: impl FnMut(Option<u64>),
     ) -> Result<()> {
-        // Fix up `before_version` to be the minimum of the three:
+        // Fix up `before_version` to be the minimum of:
         // - The supplied value
         // - The cluster's current read version as seen by this snapshot
         // - The NS lock version in the same snapshot
+        // - The minimum overlay snapshot_version from any namespace that
+        //   uses this namespace as its overlay base (fork safety)
         {
             let txn = self.db.create_trx()?;
 
@@ -47,6 +106,19 @@ impl Server {
                 .await?;
             if let Some(lock) = &metadata.lock {
                 before_version = before_version.min(decode_version(&lock.snapshot_version)?);
+            }
+        }
+
+        // Ensure we don't truncate page versions that overlay children depend on
+        if let Some(overlay_min) = self.min_overlay_snapshot_version(ns_id).await? {
+            if overlay_min < before_version {
+                tracing::info!(
+                    ns = hex::encode(&ns_id),
+                    overlay_min_version = hex::encode(&overlay_min),
+                    before_version = hex::encode(&before_version),
+                    "clamped truncation to protect overlay children"
+                );
+                before_version = overlay_min;
             }
         }
 
@@ -81,7 +153,49 @@ impl Server {
             anyhow::bail!("failed to acquire lock");
         }
 
+        // Write the truncated_before watermark BEFORE any deletions happen.
+        // This ensures that even if we crash mid-truncation, the watermark is
+        // already in place to prevent stale forks and reads.
+        if !dry_run {
+            let before_version_hex = hex::encode(before_version);
+            loop {
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let metadata = match self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, ns_id)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        txn.on_error(*e).await?;
+                        continue;
+                    }
+                };
+                let existing = metadata.truncated_before.as_deref().unwrap_or_default();
+                if before_version_hex.as_str() <= existing {
+                    break;
+                }
+                let mut metadata = (*metadata).clone();
+                metadata.truncated_before = Some(before_version_hex.clone());
+                self.ns_metadata_cache
+                    .set(&txn, &self.key_codec, ns_id, Arc::new(metadata))?;
+                match txn.commit().await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        e.on_error().await?;
+                    }
+                }
+            }
+        }
+
         let mut total_count = 0u64;
+
+        // Precompute the overlay_ref conflict range for this namespace.
+        // Adding this to each deletion transaction's read conflict set
+        // ensures that if a concurrent create_namespace writes an overlay_ref
+        // entry, the deletion transaction conflicts and retries.
+        let (overlay_ref_start, overlay_ref_end) =
+            self.key_codec.construct_overlay_ref_range(ns_id);
 
         loop {
             let scan_result = loop {
@@ -143,6 +257,46 @@ impl Server {
                 if !dry_run {
                     loop {
                         let txn = lock.create_txn_and_check_sync(&self.db).await?;
+
+                        // Guard against TOCTOU: read the overlay_ref range
+                        // with snapshot=false so it is added to the read
+                        // conflict set. A concurrent create_namespace that
+                        // writes an overlay_ref entry will cause this
+                        // transaction to conflict.
+                        let overlay_refs: Vec<_> = match txn
+                            .get_ranges_keyvalues(
+                                RangeOption {
+                                    limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                                    reverse: false,
+                                    mode: StreamingMode::WantAll,
+                                    ..RangeOption::from(
+                                        overlay_ref_start.as_slice()..=overlay_ref_end.as_slice(),
+                                    )
+                                },
+                                false,
+                            )
+                            .try_collect()
+                            .await
+                        {
+                            Ok(x) => x,
+                            Err(e) => {
+                                txn.on_error(e).await?;
+                                continue;
+                            }
+                        };
+                        for kv in &overlay_refs {
+                            if let Ok(v) = <[u8; 10]>::try_from(kv.value()) {
+                                if v < before_version {
+                                    anyhow::bail!(
+                                        "aborting truncation: overlay child appeared with \
+                                         snapshot_version {} < before_version {}",
+                                        hex::encode(v),
+                                        hex::encode(before_version)
+                                    );
+                                }
+                            }
+                        }
+
                         for item in &deletion_set {
                             txn.clear(item);
                         }

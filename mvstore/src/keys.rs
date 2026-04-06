@@ -15,6 +15,26 @@ impl KeyCodec {
         key
     }
 
+    /// Reverse index key: base_ns_id -> child_ns_id.
+    /// Value is the snapshot_version (10 bytes).
+    pub fn construct_overlay_ref_key(
+        &self,
+        base_ns_id: [u8; 10],
+        child_ns_id: [u8; 10],
+    ) -> Vec<u8> {
+        let mut key = pack(&(self.metadata_prefix.as_str(), "overlay_ref"));
+        key.push(0x32);
+        key.extend_from_slice(&base_ns_id);
+        key.extend_from_slice(&child_ns_id);
+        key
+    }
+
+    pub fn construct_overlay_ref_range(&self, base_ns_id: [u8; 10]) -> (Vec<u8>, Vec<u8>) {
+        let start = self.construct_overlay_ref_key(base_ns_id, [0u8; 10]);
+        let end = self.construct_overlay_ref_key(base_ns_id, [0xffu8; 10]);
+        (start, end)
+    }
+
     pub fn construct_nsrollbackcursor_key(&self, ns_id: [u8; 10]) -> Vec<u8> {
         let mut key = pack(&(self.metadata_prefix.as_str(), "nsrollbackcursor"));
         key.push(0x32);
