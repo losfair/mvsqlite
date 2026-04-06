@@ -62,6 +62,7 @@ enum GetError {
 #[derive(Debug)]
 enum CreateNamespaceError {
     AlreadyExist,
+    BaseTruncated,
 }
 
 impl std::fmt::Display for CreateNamespaceError {
@@ -282,6 +283,7 @@ impl Server {
         let nsmd = NamespaceMetadata {
             lock: None,
             overlay_base,
+            ..Default::default()
         };
         let overlay_base_decoded = match &nsmd.overlay_base {
             Some(base) => {
@@ -299,6 +301,21 @@ impl Server {
         loop {
             if txn.get(&nskey_key, false).await?.is_some() {
                 return Err(anyhow::Error::new(CreateNamespaceError::AlreadyExist));
+            }
+
+            // Reject fork creation if the base has been truncated past the
+            // requested snapshot_version.
+            if let Some((base_ns_id, snapshot_version)) = &overlay_base_decoded {
+                let base_metadata = self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, *base_ns_id)
+                    .await?;
+                if let Some(truncated_before) = &base_metadata.truncated_before {
+                    let truncated = decode_version(truncated_before)?;
+                    if *snapshot_version < truncated {
+                        return Err(anyhow::Error::new(CreateNamespaceError::BaseTruncated));
+                    }
+                }
             }
 
             let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
@@ -365,6 +382,11 @@ impl Server {
                             return Ok(Response::builder()
                                 .status(422)
                                 .body(Body::from("this key already exists\n"))?);
+                        }
+                        Some(CreateNamespaceError::BaseTruncated) => {
+                            return Ok(Response::builder().status(409).body(Body::from(
+                                "base namespace has been truncated past the requested snapshot_version\n",
+                            ))?);
                         }
                         _ => {
                             return Ok(Response::builder()
@@ -1638,6 +1660,24 @@ impl Server {
                 .create_versioned_read_txn(read_req.version)
                 .await
                 .with_context(|| "failed to create versioned read txn")?;
+
+            // Reject reads at versions that have been truncated.
+            let metadata = self
+                .ns_metadata_cache
+                .get(&txn, &self.key_codec, ns_id)
+                .await?;
+            if let Some(truncated_before) = &metadata.truncated_before {
+                let truncated = decode_version(truncated_before)?;
+                let req_version = decode_version(read_req.version)?;
+                if req_version < truncated {
+                    anyhow::bail!(
+                        "requested version {} is before truncation watermark {}",
+                        read_req.version,
+                        truncated_before
+                    );
+                }
+            }
+
             let mut page = self
                 .read_page_decoded_snapshot_compressed(
                     &txn,
@@ -1650,12 +1690,26 @@ impl Server {
 
             if page.is_none() {
                 // Overlay
-                let metadata = self
-                    .ns_metadata_cache
-                    .get(&txn, &self.key_codec, ns_id)
-                    .await?;
                 if let Some(base) = &metadata.overlay_base {
                     let base_ns_id = decode_version(&base.ns_id)?;
+
+                    // Also check the base namespace's truncation watermark.
+                    let base_metadata = self
+                        .ns_metadata_cache
+                        .get(&txn, &self.key_codec, base_ns_id)
+                        .await?;
+                    if let Some(truncated_before) = &base_metadata.truncated_before {
+                        let truncated = decode_version(truncated_before)?;
+                        let snap = decode_version(&base.snapshot_version)?;
+                        if snap < truncated {
+                            anyhow::bail!(
+                                "overlay snapshot_version {} is before base truncation watermark {}",
+                                base.snapshot_version,
+                                truncated_before
+                            );
+                        }
+                    }
+
                     let base_page = self
                         .read_page_decoded_snapshot_compressed(
                             &txn,

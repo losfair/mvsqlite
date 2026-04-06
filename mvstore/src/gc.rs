@@ -301,6 +301,39 @@ impl Server {
             }
         }
 
+        // Update the truncated_before watermark in namespace metadata.
+        // Take the max of the existing watermark and the new before_version.
+        if !dry_run {
+            let before_version_hex = hex::encode(before_version);
+            loop {
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let metadata = match self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, ns_id)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        txn.on_error(*e).await?;
+                        continue;
+                    }
+                };
+                let existing = metadata.truncated_before.as_deref().unwrap_or_default();
+                if before_version_hex.as_str() > existing {
+                    let mut metadata = (*metadata).clone();
+                    metadata.truncated_before = Some(before_version_hex.clone());
+                    self.ns_metadata_cache
+                        .set(&txn, &self.key_codec, ns_id, Arc::new(metadata))?;
+                }
+                match txn.commit().await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        e.on_error().await?;
+                    }
+                }
+            }
+        }
+
         progress_callback(None);
         Ok(())
     }

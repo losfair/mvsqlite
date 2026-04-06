@@ -56,8 +56,7 @@ is cleaned up atomically in the same transaction.
 
 ### Namespace metadata (`nsmd`)
 
-Each namespace stores a JSON metadata blob. Forked namespaces have an
-`overlay_base` field:
+Each namespace stores a JSON metadata blob:
 
 ```json
 {
@@ -65,9 +64,17 @@ Each namespace stores a JSON metadata blob. Forked namespaces have an
   "overlay_base": {
     "ns_id": "0a1b2c3d4e5f6a7b8c9d",
     "snapshot_version": "00000190a5b3c7d2e1f0"
-  }
+  },
+  "truncated_before": "00000190a5b3c7d2e1f0"
 }
 ```
+
+- `overlay_base` — present on forked namespaces; identifies the base namespace
+  and the pinned snapshot version.
+- `truncated_before` — hex-encoded version watermark. Set by
+  `truncate_versions` after a non-dry-run truncation. Reads at versions below
+  this watermark are rejected. Fork creation with a `snapshot_version` below
+  this watermark is rejected.
 
 ### Reverse index (`overlay_ref`)
 
@@ -189,25 +196,24 @@ the batch fails. The retry creates a new transaction, reads `overlay_ref`
 again, and reduces to Case A.
 
 **Case C: T_B > T_D.** The deletion batch committed before B existed. No
-conflict is detected. This is a residual race window: if B's
-`snapshot_version` falls within the already-truncated range, pages it depends
-on may be gone.
+conflict is detected. The `truncated_before` watermark closes this gap (see
+below).
 
-### Residual race (Case C) and mitigation
+### Truncation watermark (`truncated_before`)
 
-Case C requires a client to create a fork with a `snapshot_version` older than
-the GC's effective `before_version`, AND to commit strictly after the deletion
-batch. In practice:
+When `truncate_versions` completes (non-dry-run), it writes the effective
+`before_version` into the namespace metadata as `truncated_before`, taking the
+max of the existing watermark and the new value. This watermark is then
+enforced at two points:
 
-- `before_version` is clamped to the cluster's current read version, so it is
-  roughly "now". A fork's `snapshot_version` that is older than this cutoff
-  would reference data the operator has explicitly chosen to garbage-collect.
-- The race window is a single FDB transaction lifetime (typically milliseconds).
-  A fork creation that starts before GC and commits after would need to overlap
-  the exact batch window.
+**Fork creation.** `create_namespace` with `overlay_base` reads the base
+namespace's metadata inside the creation transaction. If
+`snapshot_version < truncated_before`, the request is rejected with 409. This
+closes Case C: even if the deletion batch committed before the fork creation
+transaction started, the watermark is visible to the creation transaction and
+the fork is rejected.
 
-A complete solution would require either a global serialization mechanism
-between truncation and fork creation (e.g. a distributed lock or epoch counter),
-or post-hoc validation in `create_namespace` that rejects fork creation when
-the base has been truncated past the requested `snapshot_version`. The current
-design accepts the residual risk as an acceptable trade-off for simplicity.
+**Reads.** `handle_read_req` checks the namespace's `truncated_before` before
+serving a page read. If the requested version is below the watermark, the read
+fails with an error instead of returning silently wrong data. The same check
+applies to overlay fallback reads against the base namespace.
