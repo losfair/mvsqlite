@@ -50,7 +50,7 @@ const MAX_PAGES_PER_BATCH_READ: usize = 200;
 const MAX_READ_CONCURRENCY: usize = 50;
 const MAX_PAGES_PER_COMMIT: usize = 50000; // ~390MiB with 8KiB pages
 const MAX_NUM_NAMESPACES_PER_COMMIT: usize = 16;
-const MAX_PAGES_PER_BATCH_WRITE: usize = 20;
+const MAX_PAGES_PER_BATCH_WRITE: usize = 100;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 
