@@ -14,7 +14,6 @@ use futures::TryStreamExt;
 use crate::{
     fixed::FixedKeyVec,
     lock::DistributedLock,
-    metadata::NamespaceMetadata,
     server::Server,
     util::{
         add_single_key_read_conflict_range, decode_version, extract_10_byte_suffix,
@@ -26,17 +25,16 @@ pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
 impl Server {
-    /// Scan all namespace metadata entries to find the minimum overlay
-    /// snapshot_version among namespaces that use `target_ns_id` as their
-    /// overlay base.
+    /// Look up the minimum overlay snapshot_version among namespaces that use
+    /// `target_ns_id` as their overlay base, using the `overlay_ref` reverse
+    /// index.
     ///
     /// Returns `None` if no namespace overlays the target.
     async fn min_overlay_snapshot_version(
         &self,
         target_ns_id: [u8; 10],
     ) -> Result<Option<[u8; 10]>> {
-        let target_ns_id_hex = hex::encode(target_ns_id);
-        let (scan_start, scan_end) = self.key_codec.construct_nsmd_range();
+        let (scan_start, scan_end) = self.key_codec.construct_overlay_ref_range(target_ns_id);
         let mut cursor = scan_start.clone();
         let mut min_version: Option<[u8; 10]> = None;
 
@@ -63,19 +61,11 @@ impl Server {
             cursor.push(0x00);
 
             for kv in &range {
-                let md: NamespaceMetadata = match serde_json::from_slice(kv.value()) {
-                    Ok(x) => x,
-                    Err(_) => continue,
-                };
-                if let Some(base) = &md.overlay_base {
-                    if base.ns_id == target_ns_id_hex {
-                        if let Ok(v) = decode_version(&base.snapshot_version) {
-                            min_version = Some(match min_version {
-                                Some(cur) => cur.min(v),
-                                None => v,
-                            });
-                        }
-                    }
+                if let Ok(v) = <[u8; 10]>::try_from(kv.value()) {
+                    min_version = Some(match min_version {
+                        Some(cur) => cur.min(v),
+                        None => v,
+                    });
                 }
             }
         }

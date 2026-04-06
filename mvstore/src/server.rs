@@ -283,11 +283,16 @@ impl Server {
             lock: None,
             overlay_base,
         };
-        if let Some(base) = &nsmd.overlay_base {
-            decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
-            decode_version(&base.snapshot_version)
-                .with_context(|| "overlay_base: invalid snapshot_version")?;
-        }
+        let overlay_base_decoded = match &nsmd.overlay_base {
+            Some(base) => {
+                let base_ns_id =
+                    decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
+                let snapshot_version = decode_version(&base.snapshot_version)
+                    .with_context(|| "overlay_base: invalid snapshot_version")?;
+                Some((base_ns_id, snapshot_version))
+            }
+            None => None,
+        };
         let nsmd = serde_json::to_string(&nsmd)?;
         let mut txn = self.db.create_trx()?;
 
@@ -310,6 +315,22 @@ impl Server {
                 &nskey_atomic_op_value,
                 MutationType::SetVersionstampedValue,
             );
+
+            // Write overlay reverse index: base_ns_id -> child_ns_id = snapshot_version.
+            // The child_ns_id suffix is filled in by FDB's versionstamp.
+            if let Some((base_ns_id, snapshot_version)) = &overlay_base_decoded {
+                let overlay_ref_atomic_op_key = generate_suffix_versionstamp_atomic_op(
+                    &self
+                        .key_codec
+                        .construct_overlay_ref_key(*base_ns_id, [0u8; 10]),
+                );
+                txn.atomic_op(
+                    &overlay_ref_atomic_op_key,
+                    snapshot_version,
+                    MutationType::SetVersionstampedKey,
+                );
+            }
+
             match txn.commit().await {
                 Ok(_) => {
                     return Ok(());
@@ -417,6 +438,21 @@ impl Server {
                     };
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+
+                    // Read metadata to clean up overlay reverse index
+                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
+                    if let Some(nsmd_raw) = txn.get(&nsmd_key, false).await? {
+                        let md: NamespaceMetadata =
+                            serde_json::from_slice(&nsmd_raw).unwrap_or_default();
+                        if let Some(base) = &md.overlay_base {
+                            if let Ok(base_ns_id) = decode_version(&base.ns_id) {
+                                let overlay_ref_key =
+                                    self.key_codec.construct_overlay_ref_key(base_ns_id, ns_id);
+                                txn.clear(&overlay_ref_key);
+                            }
+                        }
+                    }
+
                     let ns_data_start = self.key_codec.construct_ns_data_prefix(ns_id);
                     let mut ns_data_end = ns_data_start.clone();
                     ns_data_end.push(0xff).unwrap();
@@ -424,7 +460,6 @@ impl Server {
                     txn.clear_range(&ns_data_start, &ns_data_end);
                     txn.clear(&nskey_key);
 
-                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
                     txn.update_metadata_version();
                     match txn.commit().await {
