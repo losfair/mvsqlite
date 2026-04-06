@@ -24,6 +24,39 @@ This yields three distinct paths:
 2. **Multi-phase** (`multi_phase=true`, implies `plcc_enable=false`)
 3. **PLCC single-phase** (`multi_phase=false`, `plcc_enable_ns=true`)
 
+## Key FDB Behavior: SetVersionstampedKey Write Conflict Ranges
+
+A critical detail for understanding the PLCC path is how FDB handles write
+conflict ranges for `SetVersionstampedKey` atomic operations.
+
+FDB does **not** add the raw template key to the write conflict set. Instead,
+the ReadYourWrites layer (`ReadYourWrites.actor.cpp:2189-2203`) intercepts
+`SetVersionstampedKey`, disables the default conflict range, and computes a
+**bounding range** via `getVersionstampKeyRange()` (`Atomic.h:268-290`):
+
+- **Lower bound:** The template key with the versionstamp bytes filled with
+  `(readVersion + 1, batch=0)` — the minimum possible commit version.
+- **Upper bound:** The template key with the versionstamp bytes filled with
+  `\xFF` repeated 10 times — the maximum possible value.
+
+For a page write to page P in a transaction with read version RV, this produces:
+
+```
+Write conflict range: [page_key(P, RV+1), page_key(P, [0xff;10]) || 0x00)
+```
+
+This range is conservative: it covers every possible committed versionstamp,
+which is always >= RV+1.
+
+### Why multi-phase uses NextWriteNoWriteConflictRange
+
+Multi-phase commits (`commit.rs:297-309`) suppress the FDB-computed per-page
+write conflict ranges with `NextWriteNoWriteConflictRange` and replace them with
+a single broad write conflict range per namespace (`commit.rs:311-329`). This is
+an **efficiency optimization**: instead of N individual per-page ranges for a
+large transaction, one namespace-wide range is more compact. It is not a
+correctness fix — the per-page ranges would also be correct.
+
 ## Path 1: Non-PLCC Single-Phase — Correct
 
 ### Mechanism
@@ -72,7 +105,7 @@ Phase 2 (second FDB transaction, `set_read_version(V_phase1)`):
 - Reads LWV non-snapshot (`commit.rs:222`, since `plcc_enable_ns=false`).
 - Checks `client_assumed_version < actual_last_write_version` → `Conflict`.
 - Writes page index entries with `NextWriteNoWriteConflictRange` (suppresses
-  per-key write conflict).
+  per-key write conflict for efficiency).
 - Adds explicit **broad write conflict ranges** covering the entire page key
   space and entire content index key space for the namespace
   (`commit.rs:311-329`).
@@ -105,13 +138,13 @@ If T1 Phase 1 commits between T2's Phase 2 read version and Phase 2 commit:
 content index write conflict ranges ensure mutual exclusion between GC and
 Phase 2. ✓
 
-## Path 3: PLCC Single-Phase — Bug
+## Path 3: PLCC Single-Phase — Correct
 
 ### Mechanism
 
-PLCC (Page-Level Conflict Check) is designed to allow concurrent writes to
-*different* pages within the same namespace, using finer-grained conflict
-detection than the namespace-level LWV.
+PLCC (Page-Level Conflict Check) allows concurrent writes to *different* pages
+within the same namespace, using finer-grained conflict detection than the
+namespace-level LWV.
 
 - **LWV read** (`commit.rs:220-244`): When `plcc_enable_ns=true`:
   - If `allow_skip_idempotency_check=true`: the LWV read is skipped entirely
@@ -121,115 +154,48 @@ detection than the namespace-level LWV.
     do **not** add to the read conflict set. Furthermore, even if
     `client_assumed_version < actual_last_write_version`, the code does **not**
     return `Conflict` when `plcc_enable_ns=true` (line 238-240).
-  - In both sub-cases, **LWV is not in the read conflict set**.
-- **LWV write** (`commit.rs:249-253`): Always written with
-  `SetVersionstampedValue`. This adds LWV to the write conflict set, but since
-  no PLCC transaction has LWV in its read conflict set, this is inert.
+  - In both sub-cases, **LWV is not in the read conflict set**. This is
+    intentional — PLCC uses page-level, not namespace-level, conflict detection.
 - **PLCC version check** (`commit.rs:257-286`): For each page P in the client's
   read set, read the latest version of P. If version > `client_assumed_version`,
   return `Conflict`. This catches writes committed before the transaction's read
   version.
 - **PLCC read conflict range** (`delta/reader.rs:85-94`): For each page P in
   the read set where a version exists, adds read conflict range
-  `[page_key(P, V_current), page_key(P, [0xff;10]) || 0x00)`. This is intended
-  to catch writes between the read version and commit time.
+  `[page_key(P, V_current), page_key(P, [0xff;10]) || 0x00)`. This catches
+  writes between the read version and commit time.
 - **Page index write** (`commit.rs:300-304`):
-  `atomic_op(SetVersionstampedKey)` using a template key
-  `page_key(P, [0u8;10]) || offset_bytes`. FDB adds this key to the **write
-  conflict set**.
+  `atomic_op(SetVersionstampedKey)`. FDB's ReadYourWrites layer computes a
+  bounding write conflict range (see above):
+  `[page_key(P, RV+1), page_key(P, [0xff;10]) || 0x00)`.
 
-### The Problem
+### Proof
 
-The write conflict key from `SetVersionstampedKey` is the **template key** —
-`page_key(P, [0u8; 10])` followed by a 4-byte LE offset — not the resolved key
-with the actual committed versionstamp. This template key sorts **below** the
-PLCC read conflict range for any existing page:
+Let T1 and T2 be two PLCC transactions to the same namespace, both with
+`client_assumed_version = V0`, and both with page P in their read sets.
 
-```
-Write conflict key:  prefix | ns_id | 'p' | page_index | 00 00 00 00 00 00 00 00 00 00 | XX XX XX XX
-                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                                          template zeros + 4-byte offset
+**Writes before read version:** If T1 committed at V1 before T2's read version,
+T2's PLCC check reads the latest version of page P, finds V1 > V0, and returns
+`Conflict` at line 282. ✓
 
-PLCC read conflict:  [prefix | ns_id | 'p' | page_index | V_current ... ,
-                      prefix | ns_id | 'p' | page_index | FF FF FF FF FF FF FF FF FF FF | 00)
-                                                           ^^^^^^^^^^
-                                                           V_current > [0u8; 10]
-```
+**Writes between read version and commit time:** If T1 commits at V1 where
+T2.read_version < V1 < T2.commit_time:
+- T2's PLCC read conflict for P: `[page_key(P, V_current), page_key(P, [0xff;10]) || 0x00)`
+  where V_current <= T2.read_version.
+- T1's write conflict for P (FDB-computed): `[page_key(P, T1.RV+1), page_key(P, [0xff;10]) || 0x00)`.
+- Since T1.RV+1 > V_current (T1's read version is at least as recent as the
+  page's current version), T1's write conflict range starts within T2's read
+  conflict range.
+- Both ranges share the same upper bound. The overlap is non-empty.
+- FDB detects: T2.read_conflict ∩ T1.write_conflict ≠ ∅. T2 conflicts. ✓
 
-Since `[0u8; 10] < V_current` for any existing page, the write conflict key is
-strictly less than the start of the PLCC read conflict range. FDB's conflict
-check — `T.read_conflict ∩ C.write_conflict` — finds no overlap.
+**Writes to different pages:** If T1 writes page P and T2 writes page Q (P ≠ Q),
+and T2's read set does not include P:
+- T2 has no read conflict range for P.
+- T1's write conflict for P doesn't overlap with any of T2's read conflicts.
+- No conflict. Both commit. ✓ (This is the intended PLCC benefit.)
 
-No other key in the transaction's write conflict set compensates:
-- LWV: in write conflict, but never in PLCC read conflict (snapshot read or
-  skipped entirely).
-- `ci_key(hash)`: in write conflict (from `SetVersionstampedValue`), but PLCC
-  read conflict covers page keys, not content index keys. And ci_keys are
-  per-hash — two transactions writing different content to the same page have
-  different ci_keys.
-- `content_key`, `delta_referrer_key`: in write conflict (from `txn.set` in
-  `apply_write`), but in a different key space (`'c'` / `'r'` prefix vs `'p'`).
-
-### Counterexample
-
-**Setup:** Namespace N with page P=0 at version V0, content hash H0. Two
-clients A and B both read page 0 at version V0.
-
-**Transaction T_A** (PLCC, `allow_skip_idempotency_check=true`):
-- `client_assumed_version = V0`, `read_set = {0}`, writes page 0 → hash H_A.
-
-**Transaction T_B** (PLCC, `allow_skip_idempotency_check=true`):
-- `client_assumed_version = V0`, `read_set = {0}`, writes page 0 → hash H_B.
-
-**Execution (T_A commits first):**
-
-1. T_A and T_B both begin with read versions RV_A ≈ RV_B ≈ V0 (before either
-   commits). Both skip the LWV read (line 220 is false).
-
-2. T_A's PLCC check: latest version of page 0 = V0. V0 ≤ V0 → no version
-   conflict. Adds read conflict `[page_key(0, V0), page_key(0, [0xff;10]) || 0x00)`.
-
-3. T_A commits at version V_A > V0. Page 0 now has version V_A.
-
-4. T_B's PLCC check: read version < V_A, so T_B sees latest version = V0.
-   V0 ≤ V0 → no version conflict. Adds read conflict
-   `[page_key(0, V0), page_key(0, [0xff;10]) || 0x00)`.
-
-5. T_B commits. FDB checks T_B.read_conflict ∩ T_A.write_conflict:
-   - T_A.write_conflict includes `page_key(0, [0u8;10]) || offset` (from
-     `SetVersionstampedKey`), `ci_key(H_A)`, and `LWV`.
-   - `page_key(0, [0u8;10]) || offset` < `page_key(0, V0)` → not in T_B's read
-     range.
-   - `ci_key(H_A)` is in content index key space → not in T_B's read range.
-   - `LWV` is not in T_B's read conflict (PLCC skipped LWV read).
-   - **No conflict detected.**
-
-6. T_B commits at V_B. Page 0 now has versions V0, V_A, V_B. **T_B's write
-   overwrites T_A's without detecting the conflict. Lost update.**
-
-### Caveat: FDB Versionstamp Conflict Resolution
-
-This analysis assumes FDB uses the **template key** (pre-substitution, with
-zero bytes and offset suffix) for write conflict ranges. If FDB's commit proxy
-resolves the versionstamp *before* computing write conflict ranges (using the
-resolved key `page_key(P, V_committed)`), the bug would not exist — the
-resolved key would fall within the PLCC read conflict range.
-
-However, the multi-phase code pattern provides strong circumstantial evidence
-that the template key is used:
-
-1. `NextWriteNoWriteConflictRange` is set before each `SetVersionstampedKey`
-   write in multi-phase (`commit.rs:297-298`). This option is pointless if the
-   write conflict is already using the resolved key (which would be correct).
-2. Explicit broad write conflict ranges are added afterwards
-   (`commit.rs:311-319`). This compensates for the suppressed per-key conflicts,
-   providing a range that covers all page versions.
-
-If the default write conflict used the resolved key, the multi-phase code would
-not need `NextWriteNoWriteConflictRange` + explicit broad ranges — the
-per-key resolved conflicts would already be correct. The fact that this
-compensation exists implies the default is insufficient, confirming the template
-key hypothesis.
+**Correct. ✓**
 
 ## Other Commit Checks
 
@@ -273,44 +239,10 @@ hashes are read with `snapshot=false` (adds to read conflict). If content is
 deleted between read and commit (e.g., by GC), the transaction conflicts on the
 content index key. This is correct.
 
-## Fix
-
-The multi-phase path already demonstrates the correct pattern: suppress the
-default write conflict from `SetVersionstampedKey` with
-`NextWriteNoWriteConflictRange`, then add an explicit write conflict range that
-covers the right key space.
-
-The fix applies the same pattern to single-phase commits, but scoped per-page
-instead of per-namespace to preserve PLCC's fine-grained semantics:
-
-1. **Always** set `NextWriteNoWriteConflictRange` before the
-   `SetVersionstampedKey` page write (not just for multi-phase). The template
-   key write conflict is useless in all paths.
-
-2. **Multi-phase** (unchanged): Add a single broad write conflict range covering
-   all pages in the namespace.
-
-3. **Single-phase** (new): For each written page P, add a write conflict range
-   `[page_key(P, [0u8;10]), page_key(P, [0xff;10]) || 0x00)` covering all
-   versions of P. This overlaps with the PLCC read conflict range
-   `[page_key(P, V_current), page_key(P, [0xff;10]) || 0x00)` for any existing
-   version V_current.
-
-This is correct because:
-- Two PLCC transactions writing to the **same** page now conflict via the
-  per-page write conflict range overlapping the other's PLCC read conflict
-  range.
-- Two PLCC transactions writing to **different** pages don't conflict — their
-  per-page write conflict ranges don't overlap with each other's read conflict
-  ranges.
-- Non-PLCC transactions still conflict on LWV as before; the per-page write
-  conflict ranges are inert (no non-PLCC transaction has page-level read
-  conflicts).
-
 ## Summary
 
 | Path | Verdict | Mechanism |
 |---|---|---|
 | Non-PLCC single-phase | **Correct** | LWV non-snapshot read + atomic write = mutual conflict detection |
 | Multi-phase | **Correct** | LWV + explicit broad write conflict ranges + commit token for GC |
-| PLCC single-phase | **Bug (fixed)** | Per-page write conflict ranges replace useless template key conflicts |
+| PLCC single-phase | **Correct** | FDB-computed bounding range for `SetVersionstampedKey` overlaps PLCC read conflict ranges |

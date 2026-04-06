@@ -294,12 +294,9 @@ impl Server {
                     .key_codec
                     .construct_contentindex_key(ns.ns_id, *page_hash);
                 let ci_atomic_op = ContentIndex::generate_mutation_payload(now);
-                // Always suppress the default write conflict from
-                // SetVersionstampedKey. The template key (with zero version
-                // bytes + 4-byte offset suffix) sorts below the PLCC read
-                // conflict range for existing pages, making it useless for
-                // conflict detection. We add correct ranges below.
-                txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
+                if multi_phase {
+                    txn.set_option(TransactionOption::NextWriteNoWriteConflictRange)?;
+                }
                 txn.atomic_op(
                     &page_key_atomic_op,
                     page_hash,
@@ -312,8 +309,6 @@ impl Server {
                 written_pages.insert(*page_index);
             }
             if multi_phase {
-                // Multi-phase: single broad range covering all pages in the
-                // namespace. Fine-grained PLCC is not used with multi-phase.
                 txn.add_conflict_range(
                     &self
                         .key_codec
@@ -332,28 +327,6 @@ impl Server {
                         .construct_contentindex_key(ns.ns_id, [0xffu8; 32]),
                     ConflictRangeType::Write,
                 )?;
-            } else {
-                // Single-phase: per-page write conflict ranges so that PLCC
-                // readers of these pages detect our writes. The range covers
-                // all versions of each written page, which overlaps with the
-                // PLCC read conflict range [page_key(P, V_current), ...).
-                for &page_index in &written_pages {
-                    let range_start = self
-                        .key_codec
-                        .construct_page_key(ns.ns_id, page_index, [0u8; 10]);
-                    let range_end = self
-                        .key_codec
-                        .construct_page_key(ns.ns_id, page_index, [0xffu8; 10]);
-                    txn.add_conflict_range(
-                        &range_start,
-                        &range_end
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(0u8))
-                            .collect::<Vec<u8>>(),
-                        ConflictRangeType::Write,
-                    )?;
-                }
             }
 
             let mut changelog: Vec<u8> = vec![];
