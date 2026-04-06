@@ -439,6 +439,26 @@ impl Server {
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
 
+                    // Reject deletion if other namespaces overlay this one
+                    let (ref_start, ref_end) = self.key_codec.construct_overlay_ref_range(ns_id);
+                    let children: Vec<_> = txn
+                        .get_ranges_keyvalues(
+                            RangeOption {
+                                limit: Some(1),
+                                reverse: false,
+                                mode: StreamingMode::WantAll,
+                                ..RangeOption::from(ref_start.as_slice()..=ref_end.as_slice())
+                            },
+                            true,
+                        )
+                        .try_collect()
+                        .await?;
+                    if !children.is_empty() {
+                        return Ok(Response::builder().status(409).body(Body::from(
+                            "namespace has overlay children and cannot be deleted\n",
+                        ))?);
+                    }
+
                     // Read metadata to clean up overlay reverse index
                     let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
                     if let Some(nsmd_raw) = txn.get(&nsmd_key, false).await? {

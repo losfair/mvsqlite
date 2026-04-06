@@ -31,7 +31,7 @@ impl Server {
     ///
     /// Returns `None` if no namespace overlays the target.
     async fn min_overlay_snapshot_version(
-        &self,
+        self: &Arc<Self>,
         target_ns_id: [u8; 10],
     ) -> Result<Option<[u8; 10]>> {
         let (scan_start, scan_end) = self.key_codec.construct_overlay_ref_range(target_ns_id);
@@ -39,19 +39,28 @@ impl Server {
         let mut min_version: Option<[u8; 10]> = None;
 
         loop {
-            let txn = self.db.create_trx()?;
-            let range: Vec<_> = txn
-                .get_ranges_keyvalues(
-                    RangeOption {
-                        limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
-                        reverse: false,
-                        mode: StreamingMode::WantAll,
-                        ..RangeOption::from(cursor.as_slice()..=scan_end.as_slice())
-                    },
-                    true,
-                )
-                .try_collect()
-                .await?;
+            let range: Vec<_> = loop {
+                let txn = self.db.create_trx()?;
+                match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                            reverse: false,
+                            mode: StreamingMode::WantAll,
+                            ..RangeOption::from(cursor.as_slice()..=scan_end.as_slice())
+                        },
+                        true,
+                    )
+                    .try_collect()
+                    .await
+                {
+                    Ok(x) => break x,
+                    Err(e) => {
+                        txn.on_error(e).await?;
+                        continue;
+                    }
+                }
+            };
 
             if range.is_empty() {
                 break;
@@ -102,12 +111,15 @@ impl Server {
 
         // Ensure we don't truncate page versions that overlay children depend on
         if let Some(overlay_min) = self.min_overlay_snapshot_version(ns_id).await? {
-            before_version = before_version.min(overlay_min);
-            tracing::info!(
-                ns = hex::encode(&ns_id),
-                overlay_min_version = hex::encode(&overlay_min),
-                "clamped truncation to protect overlay children"
-            );
+            if overlay_min < before_version {
+                tracing::info!(
+                    ns = hex::encode(&ns_id),
+                    overlay_min_version = hex::encode(&overlay_min),
+                    before_version = hex::encode(&before_version),
+                    "clamped truncation to protect overlay children"
+                );
+                before_version = overlay_min;
+            }
         }
 
         tracing::info!(
