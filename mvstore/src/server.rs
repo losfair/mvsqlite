@@ -184,6 +184,11 @@ pub struct AdminDeleteNamespaceRequest {
 }
 
 #[derive(Deserialize)]
+pub struct AdminStatNamespaceRequest {
+    pub key: String,
+}
+
+#[derive(Deserialize)]
 pub struct AdminRenameNamespaceRequest {
     pub old_key: String,
     pub new_key: String,
@@ -672,6 +677,87 @@ impl Server {
                         }
                     }
                 });
+            }
+
+            "/api/stat_namespace" => {
+                let body = read_full_body_with_limit(req.body_mut()).await?;
+                let body: AdminStatNamespaceRequest = serde_json::from_slice(&body)?;
+                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
+
+                let mut txn = self.db.create_trx()?;
+
+                loop {
+                    let ns_id = match txn.get(&nskey_key, true).await {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Body::from("this key does not exist\n"))?);
+                        }
+                        Err(e) => {
+                            txn = match txn.on_error(e).await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
+                            continue;
+                        }
+                    };
+                    let ns_id =
+                        <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
+                    let metadata = self
+                        .ns_metadata_cache
+                        .get(&txn, &self.key_codec, ns_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                    let result = serde_json::json!({
+                        "nskey": body.key,
+                        "nsid": hex::encode(ns_id),
+                        "metadata": *metadata,
+                    });
+                    res = Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&result)?))?;
+                    break;
+                }
+            }
+
+            "/fdb/status" => {
+                let mut txn = self.db.create_trx()?;
+                txn.set_option(TransactionOption::ReadSystemKeys).unwrap();
+
+                loop {
+                    match txn.get(b"\xff\xff/status/json", true).await {
+                        Ok(Some(v)) => {
+                            res = Response::builder()
+                                .header("content-type", "application/json")
+                                .body(Body::from(v.to_vec()))?;
+                            break;
+                        }
+                        Ok(None) => {
+                            res = Response::builder().status(404).body(Body::empty())?;
+                            break;
+                        }
+                        Err(e) => {
+                            txn = match txn.on_error(e).await {
+                                Ok(x) => {
+                                    x.set_option(TransactionOption::ReadSystemKeys).unwrap();
+                                    x
+                                }
+                                Err(e) => {
+                                    return Ok(Response::builder()
+                                        .status(400)
+                                        .body(Body::from(format!("{}", e)))?)
+                                }
+                            };
+                            continue;
+                        }
+                    }
+                }
             }
 
             _ => {
