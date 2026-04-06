@@ -98,7 +98,7 @@ impl Server {
                 let overlay_refs: Vec<_> = match txn
                     .get_ranges_keyvalues(
                         RangeOption {
-                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                            limit: None,
                             reverse: false,
                             mode: StreamingMode::WantAll,
                             ..RangeOption::from(
