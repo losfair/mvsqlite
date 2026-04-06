@@ -110,22 +110,26 @@ Both must be safe in the presence of overlay children.
 ### How `truncate_versions` is protected
 
 `truncate_versions` clamps `before_version` so that it never exceeds the
-minimum `snapshot_version` of any overlay child. This is enforced in two layers:
+minimum `snapshot_version` of any overlay child, and writes a `truncated_before`
+watermark before any deletions begin. This is enforced in two layers:
 
 **Layer 1 -- initial clamping.** Before any pages are deleted, the server scans
 the `overlay_ref` index for the target namespace and computes the minimum
 `snapshot_version` across all children. `before_version` is reduced to at most
 this value.
 
-**Layer 2 -- per-batch conflict guard.** Each page-deletion batch transaction
-performs a non-snapshot read of the `overlay_ref` range. This has two effects:
+**Layer 2 -- `truncated_before` watermark.** After clamping but before any
+deletions, the effective `before_version` is written to namespace metadata as
+`truncated_before` (taking the max of the existing watermark and the new value).
+This prevents concurrent fork creation at truncated versions: `create_namespace`
+reads the base namespace's metadata inside its transaction and rejects the fork
+with 409 if `snapshot_version < truncated_before`. Because the watermark is
+committed before any pages are deleted, there is no window in which a fork could
+be created against already-truncated data.
 
-1. The read result is validated: if any child has `snapshot_version <
-   before_version`, the truncation aborts.
-2. The non-snapshot read adds the range to FDB's read conflict set. If a
-   concurrent `create_namespace` commits a new `overlay_ref` entry between the
-   transaction's read version and its commit, FDB's SSI (serializable snapshot
-   isolation) causes the deletion transaction to conflict and retry.
+No per-batch conflict detection is needed in the deletion loop — the watermark
+provides a durable guard that is visible to all concurrent transactions via
+FDB's normal read consistency.
 
 ### How `delete_unreferenced_content` is protected
 
@@ -182,37 +186,25 @@ filter. `delete_unreferenced_content` does not delete H.
 
 ### Concurrency: overlay children created during GC
 
-Three timing cases for a child B whose `create_namespace` transaction commits
-at time T_B, relative to a deletion batch transaction with read version R_D and
-commit time T_D:
+Let T_W be the commit time of the `truncated_before` watermark write, and T_B
+be the commit time of B's `create_namespace` transaction.
 
-**Case A: T_B < R_D.** B's `overlay_ref` entry is visible to the batch's
-non-snapshot read. If V_B < before_version, the validation check aborts the
-truncation. Otherwise before_version <= V_B and the static proof applies.
+**Case A: T_B < T_W.** B existed before the watermark was written. The initial
+clamping (Layer 1) already scanned the `overlay_ref` index and accounted for B's
+`snapshot_version` when computing `before_version`. The static proof applies.
 
-**Case B: R_D <= T_B <= T_D.** B writes an `overlay_ref` entry that falls in
-the deletion batch's read conflict range. FDB detects a write-read conflict and
-the batch fails. The retry creates a new transaction, reads `overlay_ref`
-again, and reduces to Case A.
+**Case B: T_B >= T_W.** B's `create_namespace` transaction reads the base
+namespace's metadata, which includes the committed `truncated_before` watermark.
+If `snapshot_version < truncated_before`, the fork is rejected with 409. If
+`snapshot_version >= truncated_before`, then `snapshot_version >= before_version`
+(since `truncated_before >= before_version`), and the static proof applies.
 
-**Case C: T_B > T_D.** The deletion batch committed before B existed. No
-conflict is detected. The `truncated_before` watermark closes this gap (see
-below).
+No per-batch conflict detection is needed — the watermark is a durable,
+linearized guard that divides all fork creations into these two exhaustive cases.
 
-### Truncation watermark (`truncated_before`)
+### Watermark enforcement
 
-Before any pages are deleted (non-dry-run), `truncate_versions` writes the
-effective `before_version` into the namespace metadata as `truncated_before`,
-taking the max of the existing watermark and the new value. Writing it before
-deletions ensures that even if the process crashes mid-truncation, the
-watermark is already in place. This watermark is then enforced at two points:
-
-**Fork creation.** `create_namespace` with `overlay_base` reads the base
-namespace's metadata inside the creation transaction. If
-`snapshot_version < truncated_before`, the request is rejected with 409. This
-closes Case C: even if the deletion batch committed before the fork creation
-transaction started, the watermark is visible to the creation transaction and
-the fork is rejected.
+The `truncated_before` watermark is enforced at two points:
 
 **Reads.** `handle_read_req` checks the namespace's `truncated_before` before
 serving a page read. If the requested version is below the watermark, the read

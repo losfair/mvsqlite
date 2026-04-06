@@ -190,13 +190,6 @@ impl Server {
 
         let mut total_count = 0u64;
 
-        // Precompute the overlay_ref conflict range for this namespace.
-        // Adding this to each deletion transaction's read conflict set
-        // ensures that if a concurrent create_namespace writes an overlay_ref
-        // entry, the deletion transaction conflicts and retries.
-        let (overlay_ref_start, overlay_ref_end) =
-            self.key_codec.construct_overlay_ref_range(ns_id);
-
         loop {
             let scan_result = loop {
                 let txn = lock.create_txn_and_check_sync(&self.db).await?;
@@ -257,46 +250,6 @@ impl Server {
                 if !dry_run {
                     loop {
                         let txn = lock.create_txn_and_check_sync(&self.db).await?;
-
-                        // Guard against TOCTOU: read the overlay_ref range
-                        // with snapshot=false so it is added to the read
-                        // conflict set. A concurrent create_namespace that
-                        // writes an overlay_ref entry will cause this
-                        // transaction to conflict.
-                        let overlay_refs: Vec<_> = match txn
-                            .get_ranges_keyvalues(
-                                RangeOption {
-                                    limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
-                                    reverse: false,
-                                    mode: StreamingMode::WantAll,
-                                    ..RangeOption::from(
-                                        overlay_ref_start.as_slice()..=overlay_ref_end.as_slice(),
-                                    )
-                                },
-                                false,
-                            )
-                            .try_collect()
-                            .await
-                        {
-                            Ok(x) => x,
-                            Err(e) => {
-                                txn.on_error(e).await?;
-                                continue;
-                            }
-                        };
-                        for kv in &overlay_refs {
-                            if let Ok(v) = <[u8; 10]>::try_from(kv.value()) {
-                                if v < before_version {
-                                    anyhow::bail!(
-                                        "aborting truncation: overlay child appeared with \
-                                         snapshot_version {} < before_version {}",
-                                        hex::encode(v),
-                                        hex::encode(before_version)
-                                    );
-                                }
-                            }
-                        }
-
                         for item in &deletion_set {
                             txn.clear(item);
                         }
