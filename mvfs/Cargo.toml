@@ -1,6 +1,6 @@
 [package]
 name = "mvfs"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Heyang Zhou <heyang.zhou@icloud.com>"]
@@ -15,7 +15,7 @@ anyhow = "1"
 thiserror = "2"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
-mvclient = { path = "../mvclient", version = "0.3.13" }
+mvclient = { path = "../mvclient", version = "0.3.14" }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

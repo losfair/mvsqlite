@@ -111,25 +111,22 @@ Both must be safe in the presence of overlay children.
 
 `truncate_versions` clamps `before_version` so that it never exceeds the
 minimum `snapshot_version` of any overlay child, and writes a `truncated_before`
-watermark before any deletions begin. This is enforced in two layers:
+watermark before any deletions begin. Both operations happen in a single FDB
+transaction:
 
-**Layer 1 -- initial clamping.** Before any pages are deleted, the server scans
-the `overlay_ref` index for the target namespace and computes the minimum
-`snapshot_version` across all children. `before_version` is reduced to at most
-this value.
+1. The `overlay_ref` range is read with `snapshot=false` (non-snapshot). This
+   adds the range to FDB's read conflict set and returns all child entries.
+   `before_version` is reduced to the minimum `snapshot_version` found.
+2. The clamped `before_version` is written to namespace metadata as
+   `truncated_before` (taking the max of the existing watermark and the new
+   value).
+3. The transaction commits.
 
-**Layer 2 -- `truncated_before` watermark.** After clamping but before any
-deletions, the effective `before_version` is written to namespace metadata as
-`truncated_before` (taking the max of the existing watermark and the new value).
-This prevents concurrent fork creation at truncated versions: `create_namespace`
-reads the base namespace's metadata inside its transaction and rejects the fork
-with 409 if `snapshot_version < truncated_before`. Because the watermark is
-committed before any pages are deleted, there is no window in which a fork could
-be created against already-truncated data.
-
-No per-batch conflict detection is needed in the deletion loop — the watermark
-provides a durable guard that is visible to all concurrent transactions via
-FDB's normal read consistency.
+If a concurrent `create_namespace` writes an `overlay_ref` entry between this
+transaction's read version and its commit, FDB's SSI detects the conflict and
+the transaction retries — picking up the new child and clamping accordingly.
+After the transaction commits, `create_namespace` will see the watermark and
+reject forks at truncated versions with 409.
 
 ### How `delete_unreferenced_content` is protected
 
@@ -186,21 +183,23 @@ filter. `delete_unreferenced_content` does not delete H.
 
 ### Concurrency: overlay children created during GC
 
-Let T_W be the commit time of the `truncated_before` watermark write, and T_B
+Let T_G be the commit time of the clamping + watermark transaction, and T_B
 be the commit time of B's `create_namespace` transaction.
 
-**Case A: T_B < T_W.** B existed before the watermark was written. The initial
-clamping (Layer 1) already scanned the `overlay_ref` index and accounted for B's
-`snapshot_version` when computing `before_version`. The static proof applies.
+**Case A: T_B < T_G (read version).** B's `overlay_ref` entry is visible to
+the non-snapshot read. The clamping logic accounts for B's `snapshot_version`.
+The static proof applies.
 
-**Case B: T_B >= T_W.** B's `create_namespace` transaction reads the base
-namespace's metadata, which includes the committed `truncated_before` watermark.
-If `snapshot_version < truncated_before`, the fork is rejected with 409. If
-`snapshot_version >= truncated_before`, then `snapshot_version >= before_version`
-(since `truncated_before >= before_version`), and the static proof applies.
+**Case B: T_G (read version) <= T_B <= T_G (commit).** B writes an
+`overlay_ref` entry in the conflict range. FDB detects the conflict, the
+clamping transaction retries, and reduces to Case A.
 
-No per-batch conflict detection is needed — the watermark is a durable,
-linearized guard that divides all fork creations into these two exhaustive cases.
+**Case C: T_B > T_G (commit).** B's `create_namespace` transaction reads the
+base namespace's metadata, which includes the committed `truncated_before`
+watermark. If `snapshot_version < truncated_before`, the fork is rejected with
+409. If `snapshot_version >= truncated_before`, then
+`snapshot_version >= before_version` (since `truncated_before >= before_version`),
+and the static proof applies.
 
 ### Watermark enforcement
 
