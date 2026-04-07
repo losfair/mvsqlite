@@ -9,3 +9,7 @@ target/
 /sqlite-amalgamation-*/
 /sqlite.zip
 /sqlite3
+/_bench_sqlite_repo/
+/_bench_sqlite_src/
+/prefetch_bench_results.*
+/res/ci/prefetch_workloads
