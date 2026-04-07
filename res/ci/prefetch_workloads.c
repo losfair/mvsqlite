@@ -549,6 +549,16 @@ int main(int argc, char **argv) {
                 int n = iterations > 64 ? 64 : iterations;
                 fprintf(stderr, "Running: %s (%d iterations)\n", wl->name, n);
                 for (int j = 0; j < n; j++) {
+                    /* Close and reopen DB between iterations and between
+                     * workloads to get a fresh page cache each time. */
+                    sqlite3_close(db);
+                    rc = sqlite3_open(db_path, &db);
+                    if (rc != SQLITE_OK) {
+                        fprintf(stderr, "Cannot reopen database: %s\n",
+                                sqlite3_errmsg(db));
+                        return 1;
+                    }
+                    exec_or_die(db, "PRAGMA journal_mode=DELETE");
                     times[j] = wl->run(db);
                 }
                 double med = median(times, n);
@@ -566,6 +576,14 @@ int main(int argc, char **argv) {
             int n = iterations > 64 ? 64 : iterations;
             fprintf(stderr, "Running: %s (%d iterations)\n", wl->name, n);
             for (int j = 0; j < n; j++) {
+                sqlite3_close(db);
+                rc = sqlite3_open(db_path, &db);
+                if (rc != SQLITE_OK) {
+                    fprintf(stderr, "Cannot reopen database: %s\n",
+                            sqlite3_errmsg(db));
+                    return 1;
+                }
+                exec_or_die(db, "PRAGMA journal_mode=DELETE");
                 times[j] = wl->run(db);
             }
             double med = median(times, n);

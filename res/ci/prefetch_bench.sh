@@ -39,7 +39,11 @@ else
     CONTENT_CACHE_SIZES=(0 10000)
 fi
 
-NUM_RUNS=3
+if [[ $QUICK_MODE -eq 1 ]]; then
+    NUM_RUNS=1
+else
+    NUM_RUNS=3
+fi
 MVSTORE_PORT=7000
 ADMIN_PORT=7001
 MVSTORE_PID=""
@@ -82,6 +86,13 @@ check_prerequisites() {
 
     if [[ $missing -eq 1 ]]; then
         exit 1
+    fi
+
+    # Ensure ports are free
+    if lsof -ti :$MVSTORE_PORT -ti :$ADMIN_PORT &>/dev/null; then
+        echo "WARNING: Ports $MVSTORE_PORT/$ADMIN_PORT in use, killing existing processes..."
+        lsof -ti :$MVSTORE_PORT -ti :$ADMIN_PORT 2>/dev/null | xargs -r kill 2>/dev/null || true
+        sleep 2
     fi
 }
 
@@ -151,8 +162,8 @@ start_mvstore() {
     RUST_LOG=error "$MVSTORE" \
         --data-plane "127.0.0.1:$MVSTORE_PORT" \
         --admin-api "127.0.0.1:$ADMIN_PORT" \
-        --metadata-prefix mvstore-bench \
-        --raw-data-prefix b \
+        --metadata-prefix "mvbench-$(date +%s)" \
+        --raw-data-prefix "b$(date +%s)" \
         --auto-create-namespace \
         --content-cache-size "$content_cache_size" &
     MVSTORE_PID=$!
@@ -198,9 +209,9 @@ run_speedtest1() {
         RUST_LOG=error \
         "$SPEEDTEST1" "$ns" 2>&1) || true
 
-    # Parse TOTAL line: "     TOTAL                                          1.234s"
+    # Parse TOTAL line: "       TOTAL.......................................................   20.509s"
     local total
-    total=$(echo "$output" | grep -oP 'TOTAL\s+\K[0-9.]+(?=s)' || echo "0")
+    total=$(echo "$output" | grep -oP 'TOTAL[. ]+\K[0-9]+\.[0-9]+(?=s)' || echo "0")
     echo "$total"
 }
 
