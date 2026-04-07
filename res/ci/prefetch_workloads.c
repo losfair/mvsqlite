@@ -89,6 +89,28 @@ static int drain_rows(sqlite3_stmt *stmt) {
     return count;
 }
 
+/* Query mv_prefetch_metrics('main') and print the JSON result.
+ * Output format: METRICS <workload> <json>
+ * The function is a no-op if mv_prefetch_metrics is not available. */
+static void print_prefetch_metrics(sqlite3 *db, const char *workload_name) {
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT mv_prefetch_metrics('main')", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        /* Function not available (e.g., not running under mvsqlite) */
+        return;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *json = (const char *)sqlite3_column_text(stmt, 0);
+        if (json) {
+            printf("METRICS %s %s\n", workload_name, json);
+            fflush(stdout);
+        }
+    }
+    sqlite3_finalize(stmt);
+}
+
 /* ---------- Padding data for realistic row sizes ---------- */
 
 static const char padding_chars[] =
@@ -561,6 +583,8 @@ int main(int argc, char **argv) {
                     exec_or_die(db, "PRAGMA journal_mode=DELETE");
                     times[j] = wl->run(db);
                 }
+                /* Print metrics from the last iteration (db still open) */
+                print_prefetch_metrics(db, wl->name);
                 double med = median(times, n);
                 printf("RESULT %s %.6f %.6f %.6f\n",
                        wl->name, med, times[0], times[n - 1]);
@@ -586,6 +610,7 @@ int main(int argc, char **argv) {
                 exec_or_die(db, "PRAGMA journal_mode=DELETE");
                 times[j] = wl->run(db);
             }
+            print_prefetch_metrics(db, wl->name);
             double med = median(times, n);
             printf("RESULT %s %.6f %.6f %.6f\n",
                    wl->name, med, times[0], times[n - 1]);

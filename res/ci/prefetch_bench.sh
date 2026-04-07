@@ -52,6 +52,7 @@ WORKLOADS=(seq_scan rev_scan idx_range point_lookup btree_probe mixed_rw repeate
 
 # Output files
 RESULTS_CSV="$ROOT_DIR/prefetch_bench_results.csv"
+METRICS_CSV="$ROOT_DIR/prefetch_bench_metrics.csv"
 RESULTS_TXT="$ROOT_DIR/prefetch_bench_results.txt"
 
 # ---------- Paths ----------
@@ -242,12 +243,19 @@ run_custom_workloads() {
 
 # ---------- Result collection ----------
 
-declare -A RESULTS  # key: "cc:pc:depth:workload" -> value: seconds
+declare -A RESULTS   # key: "cc:pc:depth:workload" -> value: seconds
+declare -A METRICS   # key: "cc:pc:depth:workload" -> value: JSON string
 
 collect_result() {
     local cc="$1" pc="$2" depth="$3" workload="$4" secs="$5"
     RESULTS["$cc:$pc:$depth:$workload"]="$secs"
     echo "$cc,$pc,$depth,$workload,$secs" >> "$RESULTS_CSV"
+}
+
+collect_metrics() {
+    local cc="$1" pc="$2" depth="$3" workload="$4" json="$5"
+    METRICS["$cc:$pc:$depth:$workload"]="$json"
+    echo "$cc,$pc,$depth,$workload,$json" >> "$METRICS_CSV"
 }
 
 # ---------- Report generation ----------
@@ -320,6 +328,47 @@ print_table() {
     done
 }
 
+print_metrics_table() {
+    local cc="$1" pc="$2"
+
+    echo ""
+    echo "=== Prefetch Metrics: Content cache: $cc, Page cache: $pc ==="
+    echo ""
+    printf "%-20s %6s %10s %10s %9s | %12s %12s %12s %12s\n" \
+        "Workload" "Depth" "Reads" "Misses" "Hit%" \
+        "Stride" "Markov" "Chain" "Freq"
+    printf '%0.s-' {1..120}; echo ""
+
+    for wl in "${WORKLOADS[@]}"; do
+        for depth in "${PREFETCH_DEPTHS[@]}"; do
+            local json="${METRICS[$cc:$pc:$depth:$wl]:-}"
+            if [[ -z "$json" ]]; then
+                continue
+            fi
+            # Extract fields from JSON using grep/sed (no jq dependency)
+            local reads=$(echo "$json" | grep -oP '"page_reads":\K[0-9]+')
+            local misses=$(echo "$json" | grep -oP '"cache_misses":\K[0-9]+')
+            local preds=$(echo "$json" | grep -oP '"predictions_made":\K[0-9]+')
+            local hits=$(echo "$json" | grep -oP '"predictions_hit":\K[0-9]+')
+            local hit_rate=$(echo "$json" | grep -oP '"hit_rate":\K[0-9.]+')
+            local s_pred=$(echo "$json" | grep -oP '"stride_predictions":\K[0-9]+')
+            local s_hit=$(echo "$json" | grep -oP '"stride_hits":\K[0-9]+')
+            local m_pred=$(echo "$json" | grep -oP '"markov_predictions":\K[0-9]+')
+            local m_hit=$(echo "$json" | grep -oP '"markov_hits":\K[0-9]+')
+            local mc_pred=$(echo "$json" | grep -oP '"markov_chain_predictions":\K[0-9]+')
+            local mc_hit=$(echo "$json" | grep -oP '"markov_chain_hits":\K[0-9]+')
+            local f_pred=$(echo "$json" | grep -oP '"frequency_predictions":\K[0-9]+')
+            local f_hit=$(echo "$json" | grep -oP '"frequency_hits":\K[0-9]+')
+            local hit_pct
+            hit_pct=$(awk "BEGIN { printf \"%.1f\", $hit_rate * 100 }")
+
+            printf "%-20s %6d %10s %10s %8s%% | %5s/%-6s %5s/%-6s %5s/%-6s %5s/%-6s\n" \
+                "$wl" "$depth" "$reads" "$misses" "$hit_pct" \
+                "$s_hit" "$s_pred" "$m_hit" "$m_pred" "$mc_hit" "$mc_pred" "$f_hit" "$f_pred"
+        done
+    done
+}
+
 # ---------- Cleanup ----------
 
 cleanup() {
@@ -350,8 +399,9 @@ build_patched_sqlite
 build_workload_binary
 build_speedtest1
 
-# Initialize CSV
+# Initialize CSV files
 echo "content_cache,page_cache,prefetch_depth,workload,seconds" > "$RESULTS_CSV"
+echo "content_cache,page_cache,prefetch_depth,workload,metrics_json" > "$METRICS_CSV"
 
 # Run benchmark matrix
 for cc in "${CONTENT_CACHE_SIZES[@]}"; do
@@ -384,6 +434,11 @@ for cc in "${CONTENT_CACHE_SIZES[@]}"; do
                     wl_median=$(echo "$line" | awk '{print $3}')
                     echo "  $wl_name: ${wl_median}s"
                     collect_result "$cc" "$pc" "$depth" "$wl_name" "$wl_median"
+                elif [[ "$line" == METRICS* ]]; then
+                    # Parse: METRICS <name> <json>
+                    wl_name=$(echo "$line" | awk '{print $2}')
+                    wl_json=$(echo "$line" | cut -d' ' -f3-)
+                    collect_metrics "$cc" "$pc" "$depth" "$wl_name" "$wl_json"
                 fi
             done < <(run_custom_workloads "$local_ns" "$depth" "$pc")
         done
@@ -402,14 +457,17 @@ done
     for cc in "${CONTENT_CACHE_SIZES[@]}"; do
         for pc in "${PAGE_CACHE_SIZES[@]}"; do
             print_table "$cc" "$pc"
+            print_metrics_table "$cc" "$pc"
         done
     done
 
     echo ""
     echo "Raw CSV: $RESULTS_CSV"
+    echo "Metrics CSV: $METRICS_CSV"
 } | tee "$RESULTS_TXT"
 
 echo ""
 echo "Results saved to:"
 echo "  CSV: $RESULTS_CSV"
+echo "  Metrics: $METRICS_CSV"
 echo "  Text: $RESULTS_TXT"

@@ -12,4 +12,5 @@ target/
 /_bench_sqlite_repo/
 /_bench_sqlite_src/
 /prefetch_bench_results.*
+/prefetch_bench_metrics.*
 /res/ci/prefetch_workloads

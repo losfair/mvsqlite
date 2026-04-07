@@ -1,5 +1,49 @@
 use std::collections::HashSet;
 
+// --- Prediction Source ---
+
+/// Identifies which predictor produced a prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictionSource {
+    /// Stride detector (sequential / constant-delta patterns).
+    Stride,
+    /// Markov chain (one-step bigram lookup).
+    Markov,
+    /// Markov chain (multi-hop chaining past the first prediction).
+    MarkovChain,
+    /// Cold-start frequency fallback from ring buffer.
+    Frequency,
+}
+
+/// Snapshot of predictor metrics, returned by `PrefetchPredictor::metrics()`.
+#[derive(Debug, Clone, Default)]
+pub struct PrefetchMetrics {
+    pub predictions_made: u32,
+    pub predictions_hit: u32,
+    pub stride_predictions: u32,
+    pub stride_hits: u32,
+    pub markov_predictions: u32,
+    pub markov_hits: u32,
+    pub markov_chain_predictions: u32,
+    pub markov_chain_hits: u32,
+    pub frequency_predictions: u32,
+    pub frequency_hits: u32,
+    /// Total page reads recorded (calls to `record()`).
+    pub page_reads: u32,
+    /// Total cache misses that triggered prediction (calls to `multi_predict()` with max > 0).
+    pub cache_misses: u32,
+}
+
+impl PrefetchMetrics {
+    pub fn hit_rate(&self) -> f32 {
+        if self.predictions_made == 0 {
+            0.0
+        } else {
+            self.predictions_hit as f32 / self.predictions_made as f32
+        }
+    }
+}
+
 // --- Constants ---
 
 /// Number of buckets in the Markov hash table. Must be a power of 2.
@@ -268,10 +312,27 @@ impl RecentHistory {
 
 // --- Predictor Metrics ---
 
+/// Per-prediction entry tracking page and its source.
+#[derive(Clone, Copy)]
+struct PredictionEntry {
+    page: u32,
+    source: PredictionSource,
+}
+
 struct PredictorMetrics {
     predictions_made: u32,
     predictions_hit: u32,
-    recent_predictions: [u32; PREDICTION_TRACK_SIZE],
+    stride_predictions: u32,
+    stride_hits: u32,
+    markov_predictions: u32,
+    markov_hits: u32,
+    markov_chain_predictions: u32,
+    markov_chain_hits: u32,
+    frequency_predictions: u32,
+    frequency_hits: u32,
+    page_reads: u32,
+    cache_misses: u32,
+    recent_predictions: [PredictionEntry; PREDICTION_TRACK_SIZE],
     recent_predictions_len: usize,
 }
 
@@ -280,7 +341,20 @@ impl Default for PredictorMetrics {
         Self {
             predictions_made: 0,
             predictions_hit: 0,
-            recent_predictions: [0; PREDICTION_TRACK_SIZE],
+            stride_predictions: 0,
+            stride_hits: 0,
+            markov_predictions: 0,
+            markov_hits: 0,
+            markov_chain_predictions: 0,
+            markov_chain_hits: 0,
+            frequency_predictions: 0,
+            frequency_hits: 0,
+            page_reads: 0,
+            cache_misses: 0,
+            recent_predictions: [PredictionEntry {
+                page: 0,
+                source: PredictionSource::Stride,
+            }; PREDICTION_TRACK_SIZE],
             recent_predictions_len: 0,
         }
     }
@@ -289,26 +363,53 @@ impl Default for PredictorMetrics {
 impl PredictorMetrics {
     fn check_hit(&mut self, page: u32) {
         for i in 0..self.recent_predictions_len {
-            if self.recent_predictions[i] == page {
+            if self.recent_predictions[i].page == page {
                 self.predictions_hit += 1;
+                match self.recent_predictions[i].source {
+                    PredictionSource::Stride => self.stride_hits += 1,
+                    PredictionSource::Markov => self.markov_hits += 1,
+                    PredictionSource::MarkovChain => self.markov_chain_hits += 1,
+                    PredictionSource::Frequency => self.frequency_hits += 1,
+                }
                 return;
             }
         }
     }
 
-    fn record_predictions(&mut self, pages: &[u32]) {
-        self.predictions_made += pages.len() as u32;
-        let n = pages.len().min(PREDICTION_TRACK_SIZE);
-        self.recent_predictions[..n].copy_from_slice(&pages[..n]);
+    fn record_predictions(&mut self, entries: &[(u32, PredictionSource)]) {
+        self.predictions_made += entries.len() as u32;
+        for &(_, source) in entries {
+            match source {
+                PredictionSource::Stride => self.stride_predictions += 1,
+                PredictionSource::Markov => self.markov_predictions += 1,
+                PredictionSource::MarkovChain => self.markov_chain_predictions += 1,
+                PredictionSource::Frequency => self.frequency_predictions += 1,
+            }
+        }
+        let n = entries.len().min(PREDICTION_TRACK_SIZE);
+        for i in 0..n {
+            self.recent_predictions[i] = PredictionEntry {
+                page: entries[i].0,
+                source: entries[i].1,
+            };
+        }
         self.recent_predictions_len = n;
     }
 
-    #[allow(dead_code)]
-    fn hit_rate(&self) -> f32 {
-        if self.predictions_made == 0 {
-            0.0
-        } else {
-            self.predictions_hit as f32 / self.predictions_made as f32
+    fn snapshot(&self) -> PrefetchMetrics {
+        PrefetchMetrics {
+            predictions_made: self.predictions_made,
+            predictions_hit: self.predictions_hit,
+            stride_predictions: self.stride_predictions,
+            stride_hits: self.stride_hits,
+            markov_predictions: self.markov_predictions,
+            markov_hits: self.markov_hits,
+            markov_chain_predictions: self.markov_chain_predictions,
+            markov_chain_hits: self.markov_chain_hits,
+            frequency_predictions: self.frequency_predictions,
+            frequency_hits: self.frequency_hits,
+            page_reads: self.page_reads,
+            cache_misses: self.cache_misses,
         }
     }
 }
@@ -334,8 +435,15 @@ impl PrefetchPredictor {
         }
     }
 
+    /// Return a snapshot of the current predictor metrics.
+    pub fn metrics(&self) -> PrefetchMetrics {
+        self.metrics.snapshot()
+    }
+
     /// Record a page access. Called on every page read.
     pub fn record(&mut self, current_page: u32) {
+        self.metrics.page_reads += 1;
+
         // Check if this page was predicted (metrics)
         self.metrics.check_hit(current_page);
 
@@ -380,26 +488,31 @@ impl PrefetchPredictor {
         self.history.invalidate_last_delta();
     }
 
-    /// Predict next pages from the current page. Returns (page, confidence) pairs
+    /// Predict next pages from the current page. Returns (page, confidence, source) triples
     /// sorted by confidence descending, limited to `max_pages` entries.
-    fn predict(&self, current_page: u32, max_pages: usize) -> Vec<(u32, f32)> {
+    fn predict(&self, current_page: u32, max_pages: usize) -> Vec<(u32, f32, PredictionSource)> {
         if max_pages == 0 {
             return Vec::new();
         }
 
         // Cold-start: fall back to frequency counting
         if self.history.len < 4 {
-            let mut preds = self.history.frequency_predict(current_page);
+            let mut preds: Vec<(u32, f32, PredictionSource)> = self
+                .history
+                .frequency_predict(current_page)
+                .into_iter()
+                .map(|(page, conf)| (page, conf, PredictionSource::Frequency))
+                .collect();
             preds.truncate(max_pages);
             return preds;
         }
 
-        let mut predictions: Vec<(u32, f32)> = Vec::new();
+        let mut predictions: Vec<(u32, f32, PredictionSource)> = Vec::new();
 
         // 1. Stride predictions (capped to max_pages)
         let stride_preds = self.stride.predict(current_page, max_pages);
         for (page, conf) in &stride_preds {
-            predictions.push((*page, *conf));
+            predictions.push((*page, *conf, PredictionSource::Stride));
         }
 
         // 2. Markov predictions
@@ -416,8 +529,10 @@ impl PrefetchPredictor {
                                 predictions.iter_mut().find(|p| p.0 == page)
                             {
                                 existing.1 = existing.1.max(prob);
+                                // If both stride and markov predict the same page,
+                                // keep the stride source (it was first).
                             } else {
-                                predictions.push((page, prob));
+                                predictions.push((page, prob, PredictionSource::Markov));
                             }
                         }
                     }
@@ -440,17 +555,24 @@ impl PrefetchPredictor {
     /// Multi-step prediction chaining. Returns a set of predicted page IDs,
     /// containing at most `max_pages` entries.
     pub fn multi_predict(&mut self, current_page: u32, max_pages: usize) -> HashSet<u32> {
+        if max_pages > 0 {
+            self.metrics.cache_misses += 1;
+        }
+
         let mut result: HashSet<u32> = HashSet::with_capacity(max_pages);
+        let mut tagged: Vec<(u32, PredictionSource)> = Vec::with_capacity(max_pages);
 
         // Get initial one-step predictions (already capped)
         let initial = self.predict(current_page, max_pages);
-        for (page, _) in &initial {
-            result.insert(*page);
+        for &(page, _, source) in &initial {
+            if result.insert(page) {
+                tagged.push((page, source));
+            }
         }
 
         // Chain further predictions via Markov, starting from the best
         // one-step prediction so we advance past the first hop.
-        if let Some(&(first_page, _)) = initial.first() {
+        if let Some(&(first_page, _, _)) = initial.first() {
             let mut last_page = first_page;
             // The delta that led to first_page
             let mut last_delta = first_page as i64 - current_page as i64;
@@ -471,6 +593,7 @@ impl PrefetchPredictor {
                     if next_page == current_page || !result.insert(next_page) {
                         break;
                     }
+                    tagged.push((next_page, PredictionSource::MarkovChain));
                     last_page = next_page;
                     last_delta = *next_delta;
                 } else {
@@ -480,8 +603,7 @@ impl PrefetchPredictor {
         }
 
         // Record predictions for metrics
-        let pred_pages: Vec<u32> = result.iter().copied().collect();
-        self.metrics.record_predictions(&pred_pages);
+        self.metrics.record_predictions(&tagged);
 
         result
     }
