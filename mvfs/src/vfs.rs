@@ -241,7 +241,9 @@ impl Connection {
             if offset == 0 {
                 buf.copy_from_slice(&self.first_page);
             } else {
-                panic!("read on non-existing page: offset={}", offset);
+                tracing::error!(offset, "read on non-existing page");
+                self.io_error = true;
+                return Err(std::io::Error::new(ErrorKind::Other, "read on non-existing page"));
             }
         } else {
             if page.len() != self.sector_size {
