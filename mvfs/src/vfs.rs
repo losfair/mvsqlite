@@ -138,6 +138,7 @@ impl MultiVersionVfs {
             virtual_version_counter: 0,
             last_known_write_version: None,
             pending_commit_group_result: None,
+            io_error: false,
         };
         Ok(conn)
     }
@@ -169,6 +170,10 @@ pub struct Connection {
     /// commit group.  Consumed on the next `lock()` call to apply the
     /// changelog and advance `last_known_write_version`.
     pending_commit_group_result: Option<Arc<commit_group::CommitGroupResultSlot>>,
+
+    /// Set when an unrecoverable I/O error occurs during a transaction,
+    /// preventing the transaction from being committed.
+    io_error: bool,
 }
 
 
@@ -225,10 +230,14 @@ impl Connection {
             read_vec.push(predicted_next_page);
         }
 
-        let pages = txn
-            .read_many_nomark(&read_vec)
-            .await
-            .expect("unrecoverable read failure");
+        let pages = match txn.read_many_nomark(&read_vec).await {
+            Ok(pages) => pages,
+            Err(e) => {
+                tracing::error!(error = %e, "unrecoverable read failure");
+                self.io_error = true;
+                return Err(std::io::Error::new(ErrorKind::Other, e));
+            }
+        };
         assert_eq!(pages.len(), 1 + predicted_next.len());
         let page = &pages[0];
 
@@ -282,29 +291,33 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn force_flush_write_buffer(&mut self) {
+    pub async fn force_flush_write_buffer(&mut self) -> Result<(), std::io::Error> {
         let txn = self.txn.as_mut().unwrap();
 
         if self.write_buffer.is_empty() {
-            return;
+            return Ok(());
         }
 
         let entries: Vec<(u32, &[u8])> =
             self.write_buffer.iter().map(|x| (*x.0, &x.1[..])).collect();
 
         for chunk in entries.chunks(WRITE_CHUNK_SIZE.load(Ordering::Relaxed)) {
-            txn.write_many(chunk)
-                .await
-                .expect("unrecoverable write failure")
+            if let Err(e) = txn.write_many(chunk).await {
+                tracing::error!(error = %e, "unrecoverable write failure");
+                self.io_error = true;
+                return Err(std::io::Error::new(ErrorKind::Other, e));
+            }
         }
 
         self.write_buffer.clear();
+        Ok(())
     }
 
-    pub async fn maybe_flush_write_buffer(&mut self) {
+    pub async fn maybe_flush_write_buffer(&mut self) -> Result<(), std::io::Error> {
         if self.write_buffer.len() >= 1000 {
-            self.force_flush_write_buffer().await;
+            self.force_flush_write_buffer().await?;
         }
+        Ok(())
     }
 
     pub async fn time2version(&mut self, timestamp: u64) -> TimeToVersionResponse {
@@ -336,7 +349,9 @@ impl Connection {
 
     async fn finalize_transaction(&mut self, commit: bool) -> bool {
         if self.write_buffer.len() > WRITE_CHUNK_SIZE.load(Ordering::Relaxed) {
-            self.force_flush_write_buffer().await;
+            if let Err(e) = self.force_flush_write_buffer().await {
+                tracing::error!(error = %e, "flush failed during finalize, discarding transaction");
+            }
         }
 
         let mut txn = self
@@ -362,7 +377,10 @@ impl Connection {
 
         let mut discard_reason: Option<&'static str> = None;
 
-        if !commit {
+        if self.io_error {
+            discard_reason = Some("I/O error occurred during transaction");
+            self.io_error = false;
+        } else if !commit {
             // sqlite didn't confirm to commit
             discard_reason = Some("did not receive confirmation from sqlite");
         } else if self.fixed_version.is_some() {
@@ -570,7 +588,7 @@ impl Connection {
         self.insert_to_page_cache(page_offset as u32, buf.clone());
         self.write_buffer.insert(page_offset as u32, buf);
 
-        self.maybe_flush_write_buffer().await;
+        self.maybe_flush_write_buffer().await?;
 
         Ok(())
     }
