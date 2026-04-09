@@ -176,7 +176,6 @@ pub struct Connection {
     io_error: bool,
 }
 
-
 impl Connection {
     pub fn last_known_version(&self) -> Option<&str> {
         self.last_known_write_version.as_deref()
@@ -217,10 +216,7 @@ impl Connection {
 
         let predicted_next = predicted_next
             .iter()
-            .filter(|x| {
-                !self.page_cache.contains_key(*x)
-                    && !self.write_buffer.contains_key(*x)
-            })
+            .filter(|x| !self.page_cache.contains_key(*x) && !self.write_buffer.contains_key(*x))
             .copied()
             .collect::<Vec<_>>();
         tracing::debug!(index = page_offset, next = ?predicted_next, "prefetch miss");
@@ -608,9 +604,7 @@ impl Connection {
             if let Some((committed_version, changelog)) = self
                 .pending_commit_group_result
                 .as_ref()
-                .and_then(|slot| {
-                    slot.get_for_ns(self.client.config().ns_key.as_str())
-                })
+                .and_then(|slot| slot.get_for_ns(self.client.config().ns_key.as_str()))
             {
                 self.pending_commit_group_result = None;
                 match changelog {
@@ -627,9 +621,7 @@ impl Connection {
                     }
                     None => {
                         self.page_cache.invalidate_all();
-                        tracing::warn!(
-                            "commit group changelog unavailable, invalidating cache"
-                        );
+                        tracing::warn!("commit group changelog unavailable, invalidating cache");
                     }
                 }
                 self.last_known_write_version = Some(committed_version);
@@ -675,7 +667,7 @@ impl Connection {
                     if let Some(sc_err) =
                         e.chain().find_map(|x| x.downcast_ref::<StatusCodeError>())
                     {
-                        if sc_err.0.as_u16() == 410 {
+                        if sc_err.0.as_u16() == 410 || sc_err.0.as_u16() == 404 {
                             tracing::error!(
                                 "this client can no longer start transaction on this database"
                             );
