@@ -234,12 +234,57 @@ impl Server {
                                 });
                             }
 
+                            let effective_last_write_version =
+                                if actual_last_write_version == [0u8; 10] {
+                                    ns.ns_id
+                                } else {
+                                    actual_last_write_version
+                                };
+                            if ns.client_assumed_version > effective_last_write_version {
+                                tracing::warn!(
+                                    client_assumed_version =
+                                        hex::encode(&ns.client_assumed_version),
+                                    actual_last_write_version =
+                                        hex::encode(&actual_last_write_version),
+                                    "client assumed version is ahead of namespace head"
+                                );
+                                return Ok(CommitResult::Conflict);
+                            }
+
                             if ns.client_assumed_version < actual_last_write_version {
                                 if !plcc_enable_ns {
                                     return Ok(CommitResult::Conflict);
                                 }
                             }
                         }
+                    }
+                } else {
+                    // PLCC first attempts normally skip LWV to preserve page-level
+                    // concurrency. Still snapshot-read it to detect clients whose
+                    // assumed version is ahead of the namespace head after rollback.
+                    let actual_lwv_value = txn.get(&last_write_version_key, true).await?;
+                    let actual_last_write_version = actual_lwv_value
+                        .as_ref()
+                        .and_then(|t| {
+                            if t.len() == 16 + 10 {
+                                Some(<[u8; 10]>::try_from(&t[16..26]).unwrap())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let effective_last_write_version = if actual_last_write_version == [0u8; 10] {
+                        ns.ns_id
+                    } else {
+                        actual_last_write_version
+                    };
+                    if ns.client_assumed_version > effective_last_write_version {
+                        tracing::warn!(
+                            client_assumed_version = hex::encode(&ns.client_assumed_version),
+                            actual_last_write_version = hex::encode(&actual_last_write_version),
+                            "client assumed version is ahead of namespace head"
+                        );
+                        return Ok(CommitResult::Conflict);
                     }
                 }
 
