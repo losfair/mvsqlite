@@ -63,6 +63,7 @@ enum GetError {
 enum CreateNamespaceError {
     AlreadyExist,
     BaseTruncated,
+    BaseLocked,
 }
 
 impl std::fmt::Display for CreateNamespaceError {
@@ -316,6 +317,9 @@ impl Server {
                         return Err(anyhow::Error::new(CreateNamespaceError::BaseTruncated));
                     }
                 }
+                if base_metadata.lock.is_some() {
+                    return Err(anyhow::Error::new(CreateNamespaceError::BaseLocked));
+                }
             }
 
             let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
@@ -387,6 +391,11 @@ impl Server {
                             return Ok(Response::builder().status(409).body(Body::from(
                                 "base namespace has been truncated past the requested snapshot_version\n",
                             ))?);
+                        }
+                        Some(CreateNamespaceError::BaseLocked) => {
+                            return Ok(Response::builder()
+                                .status(409)
+                                .body(Body::from("base namespace is locked\n"))?);
                         }
                         _ => {
                             return Ok(Response::builder()

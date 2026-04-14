@@ -108,7 +108,7 @@ pub async fn release_nslock(
 
     let mut txn = db.create_trx()?;
     let nonce: String;
-    let snapshot_version: [u8; 10];
+    let mut snapshot_version: [u8; 10];
 
     loop {
         let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
@@ -149,6 +149,37 @@ pub async fn release_nslock(
             NslockReleaseMode::Rollback => {
                 // Rollback mode: first mark this lock as being rolled back.
                 if !lock.rolling_back {
+                    snapshot_version = decode_version(&lock.snapshot_version)?;
+
+                    // Existing overlay children depend on the base namespace at
+                    // their snapshot versions. Rolling the base below any child
+                    // snapshot would silently change child reads, so reject it.
+                    let (overlay_ref_start, overlay_ref_end) =
+                        key_codec.construct_overlay_ref_range(ns_id);
+                    let overlay_refs: Vec<_> = txn
+                        .get_ranges_keyvalues(
+                            RangeOption {
+                                limit: None,
+                                reverse: false,
+                                mode: StreamingMode::WantAll,
+                                ..RangeOption::from(
+                                    overlay_ref_start.as_slice()..=overlay_ref_end.as_slice(),
+                                )
+                            },
+                            false,
+                        )
+                        .try_collect()
+                        .await?;
+                    for child in &overlay_refs {
+                        if let Ok(child_snapshot) = <[u8; 10]>::try_from(child.value()) {
+                            if snapshot_version < child_snapshot {
+                                return Ok(Response::builder().status(409).body(Body::from(
+                                    "rollback is before an overlay child snapshot\n",
+                                ))?);
+                            }
+                        }
+                    }
+
                     lock.rolling_back = true;
                     let metadata = Arc::new(metadata);
                     ns_metadata_cache.set(&txn, key_codec, ns_id, metadata.clone())?;
@@ -158,9 +189,6 @@ pub async fn release_nslock(
                         Ok(output) => {
                             txn = output.reset();
                             nonce = metadata.lock.as_ref().unwrap().nonce.clone();
-                            snapshot_version = <[u8; 10]>::try_from(
-                                &hex::decode(&metadata.lock.as_ref().unwrap().snapshot_version)?[..],
-                            )?;
                             break;
                         }
                         Err(e) => {
