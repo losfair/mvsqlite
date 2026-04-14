@@ -63,10 +63,33 @@ pub async fn acquire_nslock(
             }
         }
 
-        let snapshot_version = if let Some(version) = version {
-            decode_version(version)?
+        let current_lwv = get_last_write_version(&txn, key_codec, ns_id, false).await?;
+        let effective_head = if current_lwv == [0u8; 10] {
+            ns_id
         } else {
-            get_last_write_version(&txn, key_codec, ns_id, false).await?
+            current_lwv
+        };
+
+        let snapshot_version = if let Some(version) = version {
+            let requested_version = decode_version(version)?;
+            if requested_version > effective_head {
+                return Ok(Response::builder()
+                    .status(409)
+                    .body(Body::from("lock version is newer than namespace head\n"))?);
+            }
+
+            if let Some(truncated_before) = &metadata.truncated_before {
+                let truncated_before = decode_version(truncated_before)?;
+                if requested_version < truncated_before {
+                    return Ok(Response::builder()
+                        .status(409)
+                        .body(Body::from("lock version is before truncation watermark\n"))?);
+                }
+            }
+
+            requested_version
+        } else {
+            effective_head
         };
 
         let mut nonce: [u8; 16] = [0u8; 16];
