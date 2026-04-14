@@ -131,6 +131,12 @@ pub async fn release_nslock(
 
         match mode {
             NslockReleaseMode::Commit => {
+                if lock.rolling_back {
+                    return Ok(Response::builder()
+                        .status(409)
+                        .body(Body::from("rollback already in progress"))?);
+                }
+
                 // Commit mode: delete the lock and we're done.
                 metadata.lock = None;
                 ns_metadata_cache.set(&txn, key_codec, ns_id, Arc::new(metadata))?;
@@ -196,6 +202,10 @@ pub async fn release_nslock(
                             continue;
                         }
                     }
+                } else {
+                    nonce = lock.nonce.clone();
+                    snapshot_version = decode_version(&lock.snapshot_version)?;
+                    break;
                 }
             }
         }
@@ -203,7 +213,7 @@ pub async fn release_nslock(
 
     // We get here when rollback is required
     // Scan and delete
-    let mut total_count = 0u64;
+    let mut _total_count = 0u64;
 
     // Snapshot read is correct here - running through a range twice is fine
     let mut rollback_cursor = u32::from_le_bytes(
@@ -266,7 +276,7 @@ pub async fn release_nslock(
         match txn.commit().await {
             Ok(output) => {
                 txn = output.reset();
-                total_count += delete_count as u64;
+                _total_count += delete_count as u64;
                 rollback_cursor = new_rollback_cursor;
                 scan_cursor = FixedKeyVec::from_slice(&last_key).unwrap();
                 scan_cursor.push(0).unwrap();
