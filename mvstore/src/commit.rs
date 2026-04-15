@@ -262,6 +262,17 @@ impl Server {
                     // PLCC first attempts normally skip LWV to preserve page-level
                     // concurrency. Still snapshot-read it to detect clients whose
                     // assumed version is ahead of the namespace head after rollback.
+                    //
+                    // Snapshot is intentional here. This read is only a head-regression
+                    // sanity check, not PLCC's conflict mechanism. A non-snapshot LWV
+                    // read would make every PLCC first attempt conflict with any
+                    // concurrent writer in the namespace, effectively disabling PLCC.
+                    //
+                    // Rollback races are covered by the namespace metadata read above:
+                    // rollback marks `rolling_back` and later removes the lock by
+                    // writing ns metadata, while ns_metadata_cache.get adds that key to
+                    // this transaction's read conflict set. If rollback already lowered
+                    // LWV before this read version, this snapshot read observes it.
                     let actual_lwv_value = txn.get(&last_write_version_key, true).await?;
                     let actual_last_write_version = actual_lwv_value
                         .as_ref()
