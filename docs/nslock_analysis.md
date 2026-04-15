@@ -87,9 +87,10 @@ validation compose correctly.
 1. reads namespace metadata;
 2. rejects if another owner holds the lock;
 3. reads `last_write_version` with `snapshot=false`;
-4. chooses `snapshot_version`;
-5. writes `metadata.lock = Some(...)`;
-6. commits, retrying on conflict.
+4. for explicit versions, rejects rollback-ineligible snapshots;
+5. chooses `snapshot_version`;
+6. writes `metadata.lock = Some(...)`;
+7. commits, retrying on conflict.
 
 The non-snapshot `last_write_version` read is essential. A concurrent commit
 writes `last_write_version` with `SetVersionstampedValue`. Thus an acquire that
@@ -109,7 +110,17 @@ Thus a successful acquire linearizes at its metadata commit. Its
 before the lock.
 
 For explicit rollback targets, acquire additionally rejects a requested version
-newer than the namespace head or older than `truncated_before`.
+newer than the namespace head, older than `truncated_before`, or older than the
+minimum overlay child snapshot for this namespace.
+
+The overlay-child check is performed during acquire rather than only during
+rollback release. This prevents a client from acquiring a lock that can never
+be rolled back and then discovering the problem only at release time. The
+overlay reference scan is non-snapshot, so a concurrent `create_namespace`
+that writes an overlay reference conflicts with acquire if it races between the
+scan and the metadata commit. If acquire commits first, the child creation
+transaction conflicts on the base namespace metadata read or observes the lock
+and is rejected.
 
 ## Commit While Locked
 
@@ -167,7 +178,7 @@ Rollback has three logical phases.
 
 ### Phase 1: Mark Rolling Back
 
-The first transaction verifies ownership, checks overlay children, sets
+The first transaction verifies ownership, rechecks overlay children, sets
 `lock.rolling_back = true`, clears the rollback cursor, and commits.
 
 After this transaction commits, no transaction can start and successfully commit
@@ -181,9 +192,12 @@ as the owner:
 
 Non-owner commits are already blocked by the lock.
 
-The mark phase also checks overlay reverse references. If any child namespace
-depends on the base at a snapshot newer than the rollback target, rollback is
-rejected. This prevents changing what an existing overlay child reads from its
+The mark phase keeps an overlay reverse-reference check even though acquire
+already rejects rollback-ineligible explicit snapshots. This is a defensive
+guard for locks acquired before the validation existed and for resumed
+rollbacks. If any child namespace depends on the base at a snapshot newer than
+the rollback target, rollback is rejected before any page-index entry is
+deleted. This prevents changing what an existing overlay child reads from its
 base.
 
 ### Phase 2: Delete Newer Page Versions
@@ -277,11 +291,13 @@ content, but it does not publish corrupt page state.
 ## Interaction With Overlay Namespaces
 
 Overlay children pin a base namespace at `overlay_base.snapshot_version`.
-`nslock` preserves that invariant in two places:
+`nslock` preserves that invariant in three places:
 
+- explicit-version acquire rejects a lock snapshot older than any existing
+  overlay child snapshot;
 - `create_namespace` rejects creating an overlay from a locked base namespace;
-- rollback scans existing overlay references and rejects a rollback target older
-  than any child snapshot.
+- rollback release rechecks existing overlay references and rejects a rollback
+  target older than any child snapshot before marking `rolling_back`.
 
 Version truncation also clamps to the minimum overlay child snapshot. Together,
 these rules prevent rollback or GC from changing the base data visible to an
