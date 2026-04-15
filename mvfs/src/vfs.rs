@@ -181,6 +181,10 @@ impl Connection {
         self.last_known_write_version.as_deref()
     }
 
+    pub fn prefetch_metrics(&self) -> crate::prefetch::PrefetchMetrics {
+        self.predictor.metrics()
+    }
+
     pub async fn do_read_raw(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
@@ -736,7 +740,22 @@ impl Connection {
         };
 
         if lock == LockKind::None {
-            // All locks dropped
+            // All locks dropped — log prefetch metrics before resetting.
+            let m = self.predictor.metrics();
+            if m.predictions_made > 0 {
+                tracing::info!(
+                    page_reads = m.page_reads,
+                    cache_misses = m.cache_misses,
+                    predictions = m.predictions_made,
+                    hits = m.predictions_hit,
+                    hit_rate = format_args!("{:.1}%", m.hit_rate() * 100.0),
+                    stride = format_args!("{}/{}", m.stride_hits, m.stride_predictions),
+                    markov = format_args!("{}/{}", m.markov_hits, m.markov_predictions),
+                    markov_chain = format_args!("{}/{}", m.markov_chain_hits, m.markov_chain_predictions),
+                    frequency = format_args!("{}/{}", m.frequency_hits, m.frequency_predictions),
+                    "prefetch metrics"
+                );
+            }
             self.txn = None;
             self.predictor.reset();
         }

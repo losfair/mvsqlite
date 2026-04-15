@@ -235,6 +235,7 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
     let mv_time2version_name = b"mv_time2version\0";
     let mv_pin_version_name = b"mv_pin_version\0";
     let mv_unpin_version_name = b"mv_unpin_version\0";
+    let mv_prefetch_metrics_name = b"mv_prefetch_metrics\0";
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
@@ -282,6 +283,19 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
         Some(mv_unpin_version),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_prefetch_metrics_name.as_ptr() as *const c_char,
+        1,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_prefetch_metrics),
         None,
         None,
         None,
@@ -441,6 +455,60 @@ unsafe extern "C" fn mv_unpin_version(
             sqlite_c::sqlite3_result_error(ctx, error.as_ptr(), error.as_bytes().len() as i32);
         }
     }
+}
+
+unsafe extern "C" fn mv_prefetch_metrics(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert_eq!(argc, 1);
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let selected_db = sqlite_c::sqlite3_value_text(*argv.add(0));
+    let selected_db = std::ffi::CStr::from_ptr(selected_db as *const c_char)
+        .to_str()
+        .unwrap();
+    let conn = get_conn(db, selected_db);
+    let m = conn.inner.prefetch_metrics();
+    let json = format!(
+        concat!(
+            "{{",
+            "\"page_reads\":{},",
+            "\"cache_misses\":{},",
+            "\"predictions_made\":{},",
+            "\"predictions_hit\":{},",
+            "\"hit_rate\":{:.4},",
+            "\"stride_predictions\":{},",
+            "\"stride_hits\":{},",
+            "\"markov_predictions\":{},",
+            "\"markov_hits\":{},",
+            "\"markov_chain_predictions\":{},",
+            "\"markov_chain_hits\":{},",
+            "\"frequency_predictions\":{},",
+            "\"frequency_hits\":{}",
+            "}}"
+        ),
+        m.page_reads,
+        m.cache_misses,
+        m.predictions_made,
+        m.predictions_hit,
+        m.hit_rate(),
+        m.stride_predictions,
+        m.stride_hits,
+        m.markov_predictions,
+        m.markov_hits,
+        m.markov_chain_predictions,
+        m.markov_chain_hits,
+        m.frequency_predictions,
+        m.frequency_hits,
+    );
+    let json = CString::new(json).unwrap();
+    sqlite_c::sqlite3_result_text(
+        ctx,
+        json.as_ptr(),
+        json.as_bytes().len() as i32,
+        crate::sqlite_misc::SQLITE_TRANSIENT(),
+    );
 }
 
 #[no_mangle]
