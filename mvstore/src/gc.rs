@@ -29,28 +29,11 @@ impl Server {
         self: Arc<Self>,
         dry_run: bool,
         ns_id: [u8; 10],
-        mut before_version: [u8; 10],
+        before_version: [u8; 10],
         mut progress_callback: impl FnMut(Option<u64>),
     ) -> Result<()> {
-        // Fix up `before_version` to be the minimum of:
-        // - The supplied value
-        // - The cluster's current read version as seen by this snapshot
-        // - The NS lock version in the same snapshot
-        // - The minimum overlay snapshot_version from any namespace that
-        //   uses this namespace as its overlay base (fork safety)
-        {
-            let txn = self.db.create_trx()?;
-
-            before_version = before_version.min(get_txn_read_version_as_versionstamp(&txn).await?);
-
-            let metadata = self
-                .ns_metadata_cache
-                .get(&txn, &self.key_codec, ns_id)
-                .await?;
-            if let Some(lock) = &metadata.lock {
-                before_version = before_version.min(decode_version(&lock.snapshot_version)?);
-            }
-        }
+        let requested_before_version = before_version;
+        let before_version;
 
         let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
         let scan_end = self
@@ -78,14 +61,16 @@ impl Server {
             anyhow::bail!("failed to acquire lock");
         }
 
-        // Clamp before_version to the minimum overlay child snapshot_version
-        // and write the truncated_before watermark, atomically in a single
-        // transaction.
+        // Clamp before_version to the minimum safe cutoff and write the
+        // truncated_before watermark, atomically in a single transaction.
         //
+        // This must be recomputed on every retry and in the same transaction
+        // that writes the watermark. A namespace lock acquired after this GC
+        // task starts must still clamp the cutoff before any pages are deleted.
         // The overlay_ref range is read with snapshot=false so it is added to
         // the read conflict set. If a concurrent create_namespace writes an
         // overlay_ref entry between our read and commit, this transaction
-        // conflicts and retries — we'll see the new child and clamp
+        // conflicts and retries, then sees the new child and clamps
         // accordingly. After this transaction commits, create_namespace will
         // see the watermark and reject forks at truncated versions.
         {
@@ -93,6 +78,24 @@ impl Server {
                 self.key_codec.construct_overlay_ref_range(ns_id);
             loop {
                 let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let mut effective_before_version =
+                    requested_before_version.min(get_txn_read_version_as_versionstamp(&txn).await?);
+
+                let metadata = match self
+                    .ns_metadata_cache
+                    .get(&txn, &self.key_codec, ns_id)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        txn.on_error(*e).await?;
+                        continue;
+                    }
+                };
+                if let Some(lock) = &metadata.lock {
+                    effective_before_version =
+                        effective_before_version.min(decode_version(&lock.snapshot_version)?);
+                }
 
                 // Non-snapshot read: adds overlay_ref range to conflict set.
                 let overlay_refs: Vec<_> = match txn
@@ -118,23 +121,12 @@ impl Server {
                 };
                 for kv in &overlay_refs {
                     if let Ok(v) = <[u8; 10]>::try_from(kv.value()) {
-                        before_version = before_version.min(v);
+                        effective_before_version = effective_before_version.min(v);
                     }
                 }
 
                 if !dry_run {
-                    let before_version_hex = hex::encode(before_version);
-                    let metadata = match self
-                        .ns_metadata_cache
-                        .get(&txn, &self.key_codec, ns_id)
-                        .await
-                    {
-                        Ok(m) => m,
-                        Err(e) => {
-                            txn.on_error(*e).await?;
-                            continue;
-                        }
-                    };
+                    let before_version_hex = hex::encode(effective_before_version);
                     let existing = metadata.truncated_before.as_deref().unwrap_or_default();
                     if before_version_hex.as_str() > existing {
                         let mut metadata = (*metadata).clone();
@@ -149,7 +141,10 @@ impl Server {
                 }
 
                 match txn.commit().await {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        before_version = effective_before_version;
+                        break;
+                    }
                     Err(e) => {
                         e.on_error().await?;
                     }

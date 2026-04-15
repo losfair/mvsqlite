@@ -63,10 +63,42 @@ pub async fn acquire_nslock(
             }
         }
 
-        let snapshot_version = if let Some(version) = version {
-            decode_version(version)?
+        let current_lwv = get_last_write_version(&txn, key_codec, ns_id, false).await?;
+        let effective_head = if current_lwv == [0u8; 10] {
+            ns_id
         } else {
-            get_last_write_version(&txn, key_codec, ns_id, false).await?
+            current_lwv
+        };
+
+        let snapshot_version = if let Some(version) = version {
+            let requested_version = decode_version(version)?;
+            if requested_version > effective_head {
+                return Ok(Response::builder()
+                    .status(409)
+                    .body(Body::from("lock version is newer than namespace head\n"))?);
+            }
+
+            if let Some(truncated_before) = &metadata.truncated_before {
+                let truncated_before = decode_version(truncated_before)?;
+                if requested_version < truncated_before {
+                    return Ok(Response::builder()
+                        .status(409)
+                        .body(Body::from("lock version is before truncation watermark\n"))?);
+                }
+            }
+
+            if let Some(child_snapshot) = min_overlay_child_snapshot(&txn, key_codec, ns_id).await?
+            {
+                if requested_version < child_snapshot {
+                    return Ok(Response::builder().status(409).body(Body::from(
+                        "lock version is before an overlay child snapshot\n",
+                    ))?);
+                }
+            }
+
+            requested_version
+        } else {
+            effective_head
         };
 
         let mut nonce: [u8; 16] = [0u8; 16];
@@ -108,7 +140,7 @@ pub async fn release_nslock(
 
     let mut txn = db.create_trx()?;
     let nonce: String;
-    let snapshot_version: [u8; 10];
+    let mut snapshot_version: [u8; 10];
 
     loop {
         let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
@@ -131,6 +163,12 @@ pub async fn release_nslock(
 
         match mode {
             NslockReleaseMode::Commit => {
+                if lock.rolling_back {
+                    return Ok(Response::builder()
+                        .status(409)
+                        .body(Body::from("rollback already in progress"))?);
+                }
+
                 // Commit mode: delete the lock and we're done.
                 metadata.lock = None;
                 ns_metadata_cache.set(&txn, key_codec, ns_id, Arc::new(metadata))?;
@@ -149,6 +187,21 @@ pub async fn release_nslock(
             NslockReleaseMode::Rollback => {
                 // Rollback mode: first mark this lock as being rolled back.
                 if !lock.rolling_back {
+                    snapshot_version = decode_version(&lock.snapshot_version)?;
+
+                    // Existing overlay children depend on the base namespace at
+                    // their snapshot versions. Rolling the base below any child
+                    // snapshot would silently change child reads, so reject it.
+                    if let Some(child_snapshot) =
+                        min_overlay_child_snapshot(&txn, key_codec, ns_id).await?
+                    {
+                        if snapshot_version < child_snapshot {
+                            return Ok(Response::builder().status(409).body(Body::from(
+                                "rollback is before an overlay child snapshot\n",
+                            ))?);
+                        }
+                    }
+
                     lock.rolling_back = true;
                     let metadata = Arc::new(metadata);
                     ns_metadata_cache.set(&txn, key_codec, ns_id, metadata.clone())?;
@@ -158,9 +211,6 @@ pub async fn release_nslock(
                         Ok(output) => {
                             txn = output.reset();
                             nonce = metadata.lock.as_ref().unwrap().nonce.clone();
-                            snapshot_version = <[u8; 10]>::try_from(
-                                &hex::decode(&metadata.lock.as_ref().unwrap().snapshot_version)?[..],
-                            )?;
                             break;
                         }
                         Err(e) => {
@@ -168,6 +218,10 @@ pub async fn release_nslock(
                             continue;
                         }
                     }
+                } else {
+                    nonce = lock.nonce.clone();
+                    snapshot_version = decode_version(&lock.snapshot_version)?;
+                    break;
                 }
             }
         }
@@ -175,7 +229,7 @@ pub async fn release_nslock(
 
     // We get here when rollback is required
     // Scan and delete
-    let mut total_count = 0u64;
+    let mut _total_count = 0u64;
 
     // Snapshot read is correct here - running through a range twice is fine
     let mut rollback_cursor = u32::from_le_bytes(
@@ -238,7 +292,7 @@ pub async fn release_nslock(
         match txn.commit().await {
             Ok(output) => {
                 txn = output.reset();
-                total_count += delete_count as u64;
+                _total_count += delete_count as u64;
                 rollback_cursor = new_rollback_cursor;
                 scan_cursor = FixedKeyVec::from_slice(&last_key).unwrap();
                 scan_cursor.push(0).unwrap();
@@ -289,6 +343,31 @@ pub async fn release_nslock(
     }
 
     Ok(Response::builder().status(200).body(Body::empty())?)
+}
+
+async fn min_overlay_child_snapshot(
+    txn: &Transaction,
+    key_codec: &KeyCodec,
+    ns_id: [u8; 10],
+) -> Result<Option<[u8; 10]>> {
+    let (overlay_ref_start, overlay_ref_end) = key_codec.construct_overlay_ref_range(ns_id);
+    let overlay_refs: Vec<_> = txn
+        .get_ranges_keyvalues(
+            RangeOption {
+                limit: None,
+                reverse: false,
+                mode: StreamingMode::WantAll,
+                ..RangeOption::from(overlay_ref_start.as_slice()..=overlay_ref_end.as_slice())
+            },
+            false,
+        )
+        .try_collect()
+        .await?;
+
+    Ok(overlay_refs
+        .iter()
+        .filter_map(|child| <[u8; 10]>::try_from(child.value()).ok())
+        .min())
 }
 
 async fn lock_is_still_valid(
