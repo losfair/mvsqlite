@@ -87,6 +87,15 @@ pub async fn acquire_nslock(
                 }
             }
 
+            if let Some(child_snapshot) = min_overlay_child_snapshot(&txn, key_codec, ns_id).await?
+            {
+                if requested_version < child_snapshot {
+                    return Ok(Response::builder().status(409).body(Body::from(
+                        "lock version is before an overlay child snapshot\n",
+                    ))?);
+                }
+            }
+
             requested_version
         } else {
             effective_head
@@ -183,29 +192,13 @@ pub async fn release_nslock(
                     // Existing overlay children depend on the base namespace at
                     // their snapshot versions. Rolling the base below any child
                     // snapshot would silently change child reads, so reject it.
-                    let (overlay_ref_start, overlay_ref_end) =
-                        key_codec.construct_overlay_ref_range(ns_id);
-                    let overlay_refs: Vec<_> = txn
-                        .get_ranges_keyvalues(
-                            RangeOption {
-                                limit: None,
-                                reverse: false,
-                                mode: StreamingMode::WantAll,
-                                ..RangeOption::from(
-                                    overlay_ref_start.as_slice()..=overlay_ref_end.as_slice(),
-                                )
-                            },
-                            false,
-                        )
-                        .try_collect()
-                        .await?;
-                    for child in &overlay_refs {
-                        if let Ok(child_snapshot) = <[u8; 10]>::try_from(child.value()) {
-                            if snapshot_version < child_snapshot {
-                                return Ok(Response::builder().status(409).body(Body::from(
-                                    "rollback is before an overlay child snapshot\n",
-                                ))?);
-                            }
+                    if let Some(child_snapshot) =
+                        min_overlay_child_snapshot(&txn, key_codec, ns_id).await?
+                    {
+                        if snapshot_version < child_snapshot {
+                            return Ok(Response::builder().status(409).body(Body::from(
+                                "rollback is before an overlay child snapshot\n",
+                            ))?);
                         }
                     }
 
@@ -350,6 +343,31 @@ pub async fn release_nslock(
     }
 
     Ok(Response::builder().status(200).body(Body::empty())?)
+}
+
+async fn min_overlay_child_snapshot(
+    txn: &Transaction,
+    key_codec: &KeyCodec,
+    ns_id: [u8; 10],
+) -> Result<Option<[u8; 10]>> {
+    let (overlay_ref_start, overlay_ref_end) = key_codec.construct_overlay_ref_range(ns_id);
+    let overlay_refs: Vec<_> = txn
+        .get_ranges_keyvalues(
+            RangeOption {
+                limit: None,
+                reverse: false,
+                mode: StreamingMode::WantAll,
+                ..RangeOption::from(overlay_ref_start.as_slice()..=overlay_ref_end.as_slice())
+            },
+            false,
+        )
+        .try_collect()
+        .await?;
+
+    Ok(overlay_refs
+        .iter()
+        .filter_map(|child| <[u8; 10]>::try_from(child.value()).ok())
+        .min())
 }
 
 async fn lock_is_still_valid(
