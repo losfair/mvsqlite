@@ -247,7 +247,10 @@ impl Connection {
             } else {
                 tracing::error!(offset, "read on non-existing page");
                 self.io_error = true;
-                return Err(std::io::Error::new(ErrorKind::Other, "read on non-existing page"));
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "read on non-existing page",
+                ));
             }
         } else {
             if page.len() != self.sector_size {
@@ -511,8 +514,15 @@ impl Connection {
         offset: u64,
     ) -> Result<(), std::io::Error> {
         if self.txn.is_none() {
-            assert!(offset == 0);
             let buf_len = buf.len();
+            if offset != 0 {
+                tracing::warn!(
+                    offset,
+                    len = buf_len,
+                    "read_exact_at called with non-zero offset without a transaction"
+                );
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
 
             if buf_len != 100 {
                 tracing::warn!(
@@ -751,7 +761,8 @@ impl Connection {
                     hit_rate = format_args!("{:.1}%", m.hit_rate() * 100.0),
                     stride = format_args!("{}/{}", m.stride_hits, m.stride_predictions),
                     markov = format_args!("{}/{}", m.markov_hits, m.markov_predictions),
-                    markov_chain = format_args!("{}/{}", m.markov_chain_hits, m.markov_chain_predictions),
+                    markov_chain =
+                        format_args!("{}/{}", m.markov_chain_hits, m.markov_chain_predictions),
                     frequency = format_args!("{}/{}", m.frequency_hits, m.frequency_predictions),
                     "prefetch metrics"
                 );
