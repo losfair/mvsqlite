@@ -15,7 +15,7 @@ anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 stackful = "0.1.5"
 mvclient = { path = "../mvclient", version = "0.3.18" }
 tracing = "0.1"
