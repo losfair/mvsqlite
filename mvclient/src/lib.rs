@@ -361,6 +361,10 @@ pub struct Transaction {
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
     async_ctx: Arc<TxnAsyncCtx>,
+    // Hashes staged or confirmed through this transaction's write path.
+    // Read-path hashes are intentionally excluded because overlay fallback may
+    // return content owned only by the base namespace, which cannot satisfy a
+    // child namespace commit without a fresh /batch/write.
     seen_hashes: Mutex<HashSet<[u8; 32]>>,
     read_only: bool,
     read_set: Option<Mutex<HashSet<u32>>>,
@@ -488,10 +492,6 @@ impl Transaction {
                     data.data.to_vec()
                 };
                 out.push(payload);
-                self.seen_hashes
-                    .lock()
-                    .unwrap()
-                    .insert(*blake3::hash(&data.data).as_bytes());
             }
 
             if out.len() != page_id_list.len() {
