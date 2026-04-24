@@ -361,6 +361,18 @@ pub struct Transaction {
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
     async_ctx: Arc<TxnAsyncCtx>,
+    // Invariant: every hash in `seen_hashes` is a hash whose content this
+    // transaction has uploaded (or has scheduled to upload) to the current
+    // namespace's contentindex via `/batch/write`. `write_many` uses this set
+    // to skip re-uploading a page whose bytes it has already sent in this txn.
+    //
+    // Do NOT populate this set from `/batch/read` responses. On an overlay
+    // child, the read path falls back to the base namespace and returns bytes
+    // from `contentindex(base_ns_id, h)`; no entry for `contentindex(child_ns_id, h)`
+    // exists. If such a hash were added here, a subsequent `write_many` of the
+    // same bytes would be suppressed, `/batch/commit` would reference `h` under
+    // the child ns_id, and the server's Phase 1 lookup in `mvstore/src/commit.rs`
+    // would return `BadPageReference` (HTTP 410 "bad page reference").
     seen_hashes: Mutex<HashSet<[u8; 32]>>,
     read_only: bool,
     read_set: Option<Mutex<HashSet<u32>>>,
@@ -488,10 +500,12 @@ impl Transaction {
                     data.data.to_vec()
                 };
                 out.push(payload);
-                self.seen_hashes
-                    .lock()
-                    .unwrap()
-                    .insert(*blake3::hash(&data.data).as_bytes());
+                // Intentionally do not insert into `seen_hashes` here.
+                // For an overlay child, the server may satisfy this read from
+                // the base namespace's contentindex, so the returned hash is
+                // not owned by the child and would wrongly suppress a later
+                // `write_many` of the same bytes, causing commit to 410 with
+                // `BadPageReference`. See the comment on `Transaction::seen_hashes`.
             }
 
             if out.len() != page_id_list.len() {
