@@ -24,6 +24,10 @@ use crate::{
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
 
+/// Minimum age (in wall-clock seconds) of data that `truncate_versions` is
+/// permitted to delete. `0` disables the check.
+pub static TRUNCATE_MIN_AGE_SECONDS: AtomicU64 = AtomicU64::new(0);
+
 impl Server {
     pub async fn truncate_versions(
         self: Arc<Self>,

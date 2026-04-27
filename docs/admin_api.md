@@ -86,7 +86,18 @@ Truncate versions in a namespace older than a given version. Returns a streaming
 | Status | Description                                                       |
 | ------ | ----------------------------------------------------------------- |
 | 200    | Streaming body with progress numbers, ending in `DONE` or `ERROR` |
+| 403    | Rejected by `MVSTORE_TRUNCATE_MIN_AGE_SECONDS` policy             |
 | 404    | Key does not exist                                                |
+
+**Global policy: `MVSTORE_TRUNCATE_MIN_AGE_SECONDS`**
+
+If the server is started with `MVSTORE_TRUNCATE_MIN_AGE_SECONDS=N` (default
+`0`, disabled), every request — including dry-runs — must satisfy
+`before_version <= V`, where `V` is the FDB version recorded by the
+timekeeper at the most recent wall-clock instant strictly before
+`now - N` seconds. Requests violating the policy are rejected with `403` and
+an error message in the body. The mapping is consulted via the same
+`time2version` index served by `GET /time2version`.
 
 ---
 

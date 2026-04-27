@@ -135,6 +135,12 @@ struct Opt {
     /// ADVANCED. Configure the nslock rollback scan batch size.
     #[structopt(long, env = "MVSTORE_KNOB_NSLOCK_ROLLBACK_SCAN_BATCH_SIZE")]
     knob_nslock_rollback_scan_batch_size: Option<usize>,
+
+    /// Reject truncate_namespace requests whose `before_version` corresponds
+    /// to data younger than this many wall-clock seconds. `0` (default)
+    /// disables the check.
+    #[structopt(long, env = "MVSTORE_TRUNCATE_MIN_AGE_SECONDS")]
+    truncate_min_age_seconds: Option<u64>,
 }
 
 async fn async_main(opt: Opt) -> Result<()> {
@@ -161,6 +167,11 @@ async fn async_main(opt: Opt) -> Result<()> {
     if let Some(x) = opt.knob_nslock_rollback_scan_batch_size {
         nslock::NSLOCK_ROLLBACK_SCAN_BATCH_SIZE.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured nslock rollback scan batch size");
+    }
+
+    if let Some(x) = opt.truncate_min_age_seconds {
+        gc::TRUNCATE_MIN_AGE_SECONDS.store(x, Ordering::Relaxed);
+        tracing::info!(value = x, "configured truncate_namespace min age policy");
     }
 
     if opt.content_cache_size != 0 {
