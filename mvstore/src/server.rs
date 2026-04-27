@@ -34,6 +34,7 @@ use crate::{
     commit::{CommitContext, CommitNamespaceContext, CommitResult},
     delta::reader::{DeltaReader, WIRE_ZSTD},
     fixed::FixedString,
+    gc,
     keys::KeyCodec,
     lock::DistributedLock,
     metadata::{NamespaceMetadata, NamespaceMetadataCache, NamespaceOverlayBase},
@@ -556,6 +557,51 @@ impl Server {
                 let ns_id =
                     <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
                 let before_version = decode_version(&body.before_version)?;
+
+                let min_age = gc::TRUNCATE_MIN_AGE_SECONDS.load(Ordering::Relaxed);
+                if min_age > 0 {
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)?
+                        .as_secs();
+                    if now <= min_age {
+                        return Ok(Response::builder().status(403).body(Body::from(
+                            "truncate_min_age policy: server clock is before \
+                             configured min age window\n",
+                        ))?);
+                    }
+                    let cutoff_time = now - min_age;
+
+                    let txn = self.db.create_trx()?;
+                    txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+                    let ttv = time2version(
+                        &txn,
+                        &self.key_codec,
+                        cutoff_time,
+                        self.replica_manager.as_ref(),
+                    )
+                    .await?;
+                    drop(txn);
+
+                    let max_allowed = match ttv.after {
+                        Some(p) => decode_version(&p.version)?,
+                        None => {
+                            return Ok(Response::builder().status(403).body(Body::from(
+                                "truncate_min_age policy: no time2version history \
+                                 before cutoff (timekeeper has not run long enough)\n",
+                            ))?);
+                        }
+                    };
+                    if before_version > max_allowed {
+                        return Ok(Response::builder().status(403).body(Body::from(format!(
+                            "truncate_min_age policy: before_version {} is younger than \
+                             the configured min age of {}s (max allowed: {})\n",
+                            hex::encode(before_version),
+                            min_age,
+                            hex::encode(max_allowed),
+                        )))?);
+                    }
+                }
+
                 let (mut res_sender, res_body) = Body::channel();
                 let (progress_ch_tx, mut progress_ch_rx) =
                     tokio::sync::mpsc::channel::<Option<u64>>(1000);
