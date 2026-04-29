@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             ns_key_hashproof: None,
             lock_owner: None,
         },
-        reqwest::Client::new(),
+        reqwest::ClientBuilder::new().tcp_nodelay(true).build()?,
     )?;
     let t = Tester::new(
         client.clone(),

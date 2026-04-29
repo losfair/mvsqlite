@@ -206,14 +206,16 @@ async fn async_main(opt: Opt) -> Result<()> {
         tracing::info!(listen = %data_plane, "starting data plane");
         let server = server.clone();
         Some(
-            hyper::Server::bind(&data_plane).serve(make_service_fn(move |_conn| {
-                let server = server.clone();
-                async move {
-                    Ok::<_, anyhow::Error>(service_fn(move |req| {
-                        server.clone().serve_data_plane(req)
-                    }))
-                }
-            })),
+            hyper::Server::bind(&data_plane)
+                .tcp_nodelay(true)
+                .serve(make_service_fn(move |_conn| {
+                    let server = server.clone();
+                    async move {
+                        Ok::<_, anyhow::Error>(service_fn(move |req| {
+                            server.clone().serve_data_plane(req)
+                        }))
+                    }
+                })),
         )
     } else {
         None
@@ -225,14 +227,16 @@ async fn async_main(opt: Opt) -> Result<()> {
         if let Some(admin_api) = opt.admin_api {
             tracing::info!(listen = %admin_api, "starting admin api");
             Some(
-                hyper::Server::bind(&admin_api).serve(make_service_fn(move |_conn| {
-                    let server = server.clone();
-                    async move {
-                        Ok::<_, anyhow::Error>(service_fn(move |req| {
-                            server.clone().serve_admin_api(req)
-                        }))
-                    }
-                })),
+                hyper::Server::bind(&admin_api)
+                    .tcp_nodelay(true)
+                    .serve(make_service_fn(move |_conn| {
+                        let server = server.clone();
+                        async move {
+                            Ok::<_, anyhow::Error>(service_fn(move |req| {
+                                server.clone().serve_admin_api(req)
+                            }))
+                        }
+                    })),
             )
         } else {
             None

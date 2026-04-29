@@ -94,7 +94,12 @@ async fn main() -> Result<()> {
     let vfs = mvfs::MultiVersionVfs {
         data_plane: opt.data_plane.clone(),
         sector_size: opt.sector_size,
-        http_client: AbstractHttpClient::Prebuilt(reqwest::Client::new()),
+        http_client: AbstractHttpClient::Prebuilt(
+            reqwest::ClientBuilder::new()
+                .tcp_nodelay(true)
+                .build()
+                .expect("failed to build http client"),
+        ),
         db_name_map: Arc::new(Default::default()),
         lock_owner: None,
         fork_tolerant: false,

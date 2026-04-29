@@ -54,7 +54,10 @@ impl Tester {
     }
 
     async fn truncate_worker(self: Arc<Self>) {
-        let rc = reqwest::Client::new();
+        let rc = reqwest::ClientBuilder::new()
+            .tcp_nodelay(true)
+            .build()
+            .expect("failed to build http client");
         loop {
             let sleep_dur_ms = rand::rng().random_range(1..1000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
@@ -119,7 +122,10 @@ impl Tester {
     }
 
     async fn delete_unreferenced_content_worker(self: Arc<Self>) {
-        let rc = reqwest::Client::new();
+        let rc = reqwest::ClientBuilder::new()
+            .tcp_nodelay(true)
+            .build()
+            .expect("failed to build http client");
         loop {
             let sleep_dur_ms = rand::rng().random_range(1..5000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);

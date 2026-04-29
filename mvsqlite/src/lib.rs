@@ -121,7 +121,9 @@ fn init_with_options_impl(opts: InitOptions) {
 
     let build_http_client = move || {
         let mut builder = reqwest::ClientBuilder::new();
-        builder = builder.timeout(Duration::from_secs(timeout_secs));
+        builder = builder
+            .timeout(Duration::from_secs(timeout_secs))
+            .tcp_nodelay(true);
         if force_http2 {
             builder = builder.http2_prior_knowledge();
         }
