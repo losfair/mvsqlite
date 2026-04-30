@@ -83,16 +83,51 @@ Implementation: `mvstore/src/nslock.rs` (`release_nslock`).
 
 ## Client-Side Configuration
 
+There are two ways to surface the lock owner to the mvclient.
+
+### 1. Environment variable (process-wide default)
+
 The SQLite VFS layer (`mvsqlite/src/lib.rs`) reads the lock owner from the environment:
 
 ```bash
 export MVSQLITE_LOCK_OWNER="my-unique-client-id"
 ```
 
-When set, the mvclient automatically:
+When set, every `MultiVersionClient` produced by the VFS starts with this
+value as its effective lock owner. The mvclient automatically:
 
 - Appends `lock_owner=...` to `/stat` requests.
 - Includes `lock_owner` in `CommitGlobalInit` during batch commit.
+
+### 2. SQL functions (per-connection)
+
+mvsqlite registers three SQL functions on every connection (see
+`mvsqlite/src/lib.rs`, `init_mvsqlite_connection`):
+
+```sql
+SELECT mv_nslock_acquire('main', 'worker-1');                 -- live LWV
+SELECT mv_nslock_acquire('main', 'worker-1', '<version-hex>'); -- explicit version
+
+SELECT mv_nslock_release_commit('main', 'worker-1');
+SELECT mv_nslock_release_rollback('main', 'worker-1');
+```
+
+The first argument is the attached schema name (`'main'` for the default
+database). All three are `SQLITE_DIRECTONLY` and return `NULL` on success or
+a SQL error on failure.
+
+A successful `mv_nslock_acquire` updates the **calling connection's**
+effective lock owner; subsequent `/stat` and `/batch/commit` requests issued
+by that connection carry the new `lock_owner`. A successful release clears
+it. The change is scoped to the single mvclient instance backing that
+connection and does not affect sibling connections sharing the same VFS.
+
+Both the env-var and SQL paths share the same wire protocol; the SQL path is
+preferred when a process needs to acquire the lock at runtime, scope the
+owner to one connection, or roll back without restarting.
+
+The acquire/release SQL functions error out if a SQLite transaction is
+currently open on the connection.
 
 ## API Reference
 
@@ -138,6 +173,8 @@ Content-Type: application/json
 
 ## Typical Usage Pattern
 
+### Via HTTP
+
 ```
 1. POST /nslock/acquire?ns=XX  {"owner": "worker-1"}
 2. Run SQLite operations with MVSQLITE_LOCK_OWNER=worker-1
@@ -145,4 +182,14 @@ Content-Type: application/json
 3a. On success: POST /nslock/release?ns=XX  {"owner": "worker-1", "mode": "commit"}
 3b. On failure: POST /nslock/release?ns=XX  {"owner": "worker-1", "mode": "rollback"}
    (all writes since acquire are erased)
+```
+
+### Via SQL
+
+```sql
+SELECT mv_nslock_acquire('main', 'worker-1');
+-- ... do work; subsequent commits on this connection carry lock_owner=worker-1
+SELECT mv_nslock_release_commit('main', 'worker-1');
+-- or, to discard everything written since acquire:
+SELECT mv_nslock_release_rollback('main', 'worker-1');
 ```

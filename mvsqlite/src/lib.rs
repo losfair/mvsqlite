@@ -238,6 +238,9 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
     let mv_pin_version_name = b"mv_pin_version\0";
     let mv_unpin_version_name = b"mv_unpin_version\0";
     let mv_prefetch_metrics_name = b"mv_prefetch_metrics\0";
+    let mv_nslock_acquire_name = b"mv_nslock_acquire\0";
+    let mv_nslock_release_commit_name = b"mv_nslock_release_commit\0";
+    let mv_nslock_release_rollback_name = b"mv_nslock_release_rollback\0";
 
     let ret = sqlite_c::sqlite3_create_function_v2(
         db,
@@ -298,6 +301,58 @@ pub unsafe extern "C" fn init_mvsqlite_connection(db: *mut sqlite_c::sqlite3) {
         sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
         std::ptr::null_mut(),
         Some(mv_prefetch_metrics),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_nslock_acquire_name.as_ptr() as *const c_char,
+        2,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_nslock_acquire),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_nslock_acquire_name.as_ptr() as *const c_char,
+        3,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_nslock_acquire),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_nslock_release_commit_name.as_ptr() as *const c_char,
+        2,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_nslock_release_commit),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(ret, sqlite_c::SQLITE_OK);
+
+    let ret = sqlite_c::sqlite3_create_function_v2(
+        db,
+        mv_nslock_release_rollback_name.as_ptr() as *const c_char,
+        2,
+        sqlite_c::SQLITE_UTF8 | sqlite_c::SQLITE_DIRECTONLY,
+        std::ptr::null_mut(),
+        Some(mv_nslock_release_rollback),
         None,
         None,
         None,
@@ -511,6 +566,105 @@ unsafe extern "C" fn mv_prefetch_metrics(
         json.as_bytes().len() as i32,
         crate::sqlite_misc::SQLITE_TRANSIENT(),
     );
+}
+
+unsafe fn read_text_arg(value: *mut sqlite_c::sqlite3_value) -> Option<String> {
+    let p = sqlite_c::sqlite3_value_text(value);
+    if p.is_null() {
+        return None;
+    }
+    Some(
+        std::ffi::CStr::from_ptr(p as *const c_char)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+unsafe fn set_sqlite_error(ctx: *mut sqlite_c::sqlite3_context, msg: &str) {
+    let error = CString::new(msg).unwrap_or_else(|_| CString::new("error").unwrap());
+    sqlite_c::sqlite3_result_error(ctx, error.as_ptr(), error.as_bytes().len() as i32);
+}
+
+unsafe extern "C" fn mv_nslock_acquire(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    assert!(argc == 2 || argc == 3);
+    let selected_db = match read_text_arg(*argv.add(0)) {
+        Some(x) => x,
+        None => {
+            set_sqlite_error(ctx, "mv_nslock_acquire: db argument is required");
+            return;
+        }
+    };
+    let owner = match read_text_arg(*argv.add(1)) {
+        Some(x) => x,
+        None => {
+            set_sqlite_error(ctx, "mv_nslock_acquire: owner argument is required");
+            return;
+        }
+    };
+    let version = if argc == 3 {
+        read_text_arg(*argv.add(2))
+    } else {
+        None
+    };
+
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let mut conn = get_conn(db, &selected_db);
+    let io = conn.io.clone();
+    match io.run(conn.inner.nslock_acquire(owner, version)) {
+        Ok(()) => sqlite_c::sqlite3_result_null(ctx),
+        Err(e) => set_sqlite_error(ctx, &format!("{}", e)),
+    }
+}
+
+unsafe extern "C" fn mv_nslock_release_commit(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    nslock_release_impl(ctx, argc, argv, mvclient::NslockReleaseMode::Commit);
+}
+
+unsafe extern "C" fn mv_nslock_release_rollback(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+) {
+    nslock_release_impl(ctx, argc, argv, mvclient::NslockReleaseMode::Rollback);
+}
+
+unsafe fn nslock_release_impl(
+    ctx: *mut sqlite_c::sqlite3_context,
+    argc: std::os::raw::c_int,
+    argv: *mut *mut sqlite_c::sqlite3_value,
+    mode: mvclient::NslockReleaseMode,
+) {
+    assert_eq!(argc, 2);
+    let selected_db = match read_text_arg(*argv.add(0)) {
+        Some(x) => x,
+        None => {
+            set_sqlite_error(ctx, "mv_nslock_release: db argument is required");
+            return;
+        }
+    };
+    let owner = match read_text_arg(*argv.add(1)) {
+        Some(x) => x,
+        None => {
+            set_sqlite_error(ctx, "mv_nslock_release: owner argument is required");
+            return;
+        }
+    };
+
+    let db = sqlite_c::sqlite3_context_db_handle(ctx);
+    let mut conn = get_conn(db, &selected_db);
+    let io = conn.io.clone();
+    match io.run(conn.inner.nslock_release(owner, mode)) {
+        Ok(()) => sqlite_c::sqlite3_result_null(ctx),
+        Err(e) => set_sqlite_error(ctx, &format!("{}", e)),
+    }
 }
 
 #[no_mangle]
