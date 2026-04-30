@@ -19,7 +19,7 @@ rand = "0.9"
 stackful = "0.1.5"
 mvclient = { path = "../mvclient", version = "0.3.22" }
 tracing = "0.1"
-ctor = "0.2"
+ctor = "0.12"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "fmt", "json"], optional = true }
 libc = "0.2"
 backtrace = "0.3.66"
