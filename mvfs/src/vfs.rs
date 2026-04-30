@@ -406,15 +406,11 @@ impl Connection {
             .await?;
         match outcome {
             NslockReleaseOutcome::Released => {
-                if self
-                    .client
-                    .lock_owner()
-                    .as_deref()
-                    .map(|o| o == owner)
-                    .unwrap_or(false)
-                {
-                    self.client.set_lock_owner(None);
-                }
+                // The server confirmed `owner` held the lock and removed it
+                // (commit-mode) or finished the rollback. Clear the effective
+                // lock owner unconditionally so subsequent commits on this
+                // connection do not carry a stale `lock_owner`.
+                self.client.set_lock_owner(None);
                 Ok(())
             }
             NslockReleaseOutcome::LockGone => {

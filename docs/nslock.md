@@ -129,6 +129,13 @@ owner to one connection, or roll back without restarting.
 The acquire/release SQL functions error out if a SQLite transaction is
 currently open on the connection.
 
+**Idempotent re-acquire.** Calling `mv_nslock_acquire` with the same `owner`
+while the lock is already held returns success without changing
+`snapshot_version`. If you need to roll back to a different point, release
+the existing lock first (or use a fresh `owner`) — passing a `version`
+argument while you already hold the lock is **silently ignored** by the
+server.
+
 ## API Reference
 
 ### Acquire Lock

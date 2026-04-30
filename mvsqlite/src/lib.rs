@@ -568,16 +568,26 @@ unsafe extern "C" fn mv_prefetch_metrics(
     );
 }
 
-unsafe fn read_text_arg(value: *mut sqlite_c::sqlite3_value) -> Option<String> {
+/// Reads a SQL text argument as a UTF-8 owned String.
+///
+/// Returns:
+/// - `Ok(None)` if the SQL value is NULL.
+/// - `Ok(Some(s))` for valid UTF-8 text.
+/// - `Err(())` if the bytes are not valid UTF-8. Owner strings flow into
+///   `nslock` where they act as a capability that gates rollback; silently
+///   replacing invalid bytes with U+FFFD would let a typo gate the wrong
+///   operation, so we reject instead.
+unsafe fn read_text_arg(
+    value: *mut sqlite_c::sqlite3_value,
+) -> std::result::Result<Option<String>, ()> {
     let p = sqlite_c::sqlite3_value_text(value);
     if p.is_null() {
-        return None;
+        return Ok(None);
     }
-    Some(
-        std::ffi::CStr::from_ptr(p as *const c_char)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    std::ffi::CStr::from_ptr(p as *const c_char)
+        .to_str()
+        .map(|s| Some(s.to_string()))
+        .map_err(|_| ())
 }
 
 unsafe fn set_sqlite_error(ctx: *mut sqlite_c::sqlite3_context, msg: &str) {
@@ -592,21 +602,35 @@ unsafe extern "C" fn mv_nslock_acquire(
 ) {
     assert!(argc == 2 || argc == 3);
     let selected_db = match read_text_arg(*argv.add(0)) {
-        Some(x) => x,
-        None => {
+        Ok(Some(x)) => x,
+        Ok(None) => {
             set_sqlite_error(ctx, "mv_nslock_acquire: db argument is required");
+            return;
+        }
+        Err(()) => {
+            set_sqlite_error(ctx, "mv_nslock_acquire: db argument is not valid UTF-8");
             return;
         }
     };
     let owner = match read_text_arg(*argv.add(1)) {
-        Some(x) => x,
-        None => {
+        Ok(Some(x)) => x,
+        Ok(None) => {
             set_sqlite_error(ctx, "mv_nslock_acquire: owner argument is required");
+            return;
+        }
+        Err(()) => {
+            set_sqlite_error(ctx, "mv_nslock_acquire: owner argument is not valid UTF-8");
             return;
         }
     };
     let version = if argc == 3 {
-        read_text_arg(*argv.add(2))
+        match read_text_arg(*argv.add(2)) {
+            Ok(v) => v,
+            Err(()) => {
+                set_sqlite_error(ctx, "mv_nslock_acquire: version argument is not valid UTF-8");
+                return;
+            }
+        }
     } else {
         None
     };
@@ -644,16 +668,24 @@ unsafe fn nslock_release_impl(
 ) {
     assert_eq!(argc, 2);
     let selected_db = match read_text_arg(*argv.add(0)) {
-        Some(x) => x,
-        None => {
+        Ok(Some(x)) => x,
+        Ok(None) => {
             set_sqlite_error(ctx, "mv_nslock_release: db argument is required");
+            return;
+        }
+        Err(()) => {
+            set_sqlite_error(ctx, "mv_nslock_release: db argument is not valid UTF-8");
             return;
         }
     };
     let owner = match read_text_arg(*argv.add(1)) {
-        Some(x) => x,
-        None => {
+        Ok(Some(x)) => x,
+        Ok(None) => {
             set_sqlite_error(ctx, "mv_nslock_release: owner argument is required");
+            return;
+        }
+        Err(()) => {
+            set_sqlite_error(ctx, "mv_nslock_release: owner argument is not valid UTF-8");
             return;
         }
     };

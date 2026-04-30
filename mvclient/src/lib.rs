@@ -234,6 +234,12 @@ impl MultiVersionClient {
 
     /// Override the effective lock owner. Subsequent `/stat` and
     /// `/batch/commit` requests will carry this value. Pass `None` to clear.
+    ///
+    /// Note: mvfs constructs a fresh `MultiVersionClient` per `open()` and
+    /// treats this owner as per-connection state. If a caller shares one
+    /// `MultiVersionClient` across multiple logical connections, mutating
+    /// the owner here affects all of them — that is generally not what
+    /// SQL-driven `mv_nslock_acquire`/`release` expects.
     pub fn set_lock_owner(&self, owner: Option<String>) {
         *self.lock_owner.write().unwrap() = owner;
     }
@@ -431,17 +437,21 @@ impl MultiVersionClient {
                 Err((status, headers, body)) => {
                     return Ok(match status.as_u16() {
                         400 => NslockAcquireOutcome::InvalidOwner,
-                        409 => {
-                            let lock_owner = headers
-                                .get("x-lock-owner")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-                            if lock_owner.is_some() {
-                                NslockAcquireOutcome::HeldByOther(lock_owner)
-                            } else {
-                                NslockAcquireOutcome::Rejected(status, body)
-                            }
-                        }
+                        // The server returns 409 for two distinct cases:
+                        //   (a) namespace already locked by a different owner —
+                        //       includes the `x-lock-owner` response header.
+                        //   (b) requested explicit version is unsuitable
+                        //       (newer than head, before truncation watermark,
+                        //       or before an overlay child snapshot) — no
+                        //       `x-lock-owner` header, body explains why.
+                        // Discriminate by header presence; fall back to a
+                        // generic Rejected so the body reaches the caller.
+                        409 => match headers.get("x-lock-owner") {
+                            Some(v) => NslockAcquireOutcome::HeldByOther(
+                                v.to_str().ok().map(|s| s.to_string()),
+                            ),
+                            None => NslockAcquireOutcome::Rejected(status, body),
+                        },
                         _ => NslockAcquireOutcome::Rejected(status, body),
                     });
                 }
@@ -487,7 +497,19 @@ impl MultiVersionClient {
                 Err((status, headers, body)) => {
                     return Ok(match status.as_u16() {
                         400 => NslockReleaseOutcome::InvalidOwner,
-                        409 => NslockReleaseOutcome::RollbackInProgress,
+                        // 409 only means "rollback already in progress" for
+                        // a Commit-mode release. For Rollback mode the server
+                        // also returns 409 when the rollback target predates
+                        // an overlay child snapshot — that is a distinct
+                        // condition and should surface verbatim.
+                        409 => match mode {
+                            NslockReleaseMode::Commit => {
+                                NslockReleaseOutcome::RollbackInProgress
+                            }
+                            NslockReleaseMode::Rollback => {
+                                NslockReleaseOutcome::Rejected(status, body)
+                            }
+                        },
                         410 => NslockReleaseOutcome::LockGone,
                         422 => {
                             let lock_owner = headers
