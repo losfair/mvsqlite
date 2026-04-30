@@ -12,8 +12,8 @@ use std::{
 };
 
 use mvclient::{
-    CommitOutput, MultiVersionClient, MultiVersionClientConfig, StatusCodeError,
-    TimeToVersionResponse, Transaction,
+    CommitOutput, MultiVersionClient, MultiVersionClientConfig, NslockAcquireOutcome,
+    NslockReleaseMode, NslockReleaseOutcome, StatusCodeError, TimeToVersionResponse, Transaction,
 };
 
 use crate::{
@@ -350,6 +350,91 @@ impl Connection {
 
         self.fixed_version = None;
         Ok(())
+    }
+
+    /// Acquire a namespace lock with `owner`. On success, sets the
+    /// connection's effective lock owner so subsequent stat/commit requests
+    /// carry it.
+    pub async fn nslock_acquire(
+        &mut self,
+        owner: String,
+        version: Option<String>,
+    ) -> Result<()> {
+        if self.txn.is_some() {
+            anyhow::bail!("cannot acquire nslock while a transaction is active");
+        }
+        let outcome = self
+            .client
+            .nslock_acquire(self.dp.as_ref(), &owner, version.as_deref())
+            .await?;
+        match outcome {
+            NslockAcquireOutcome::Acquired => {
+                self.client.set_lock_owner(Some(owner));
+                Ok(())
+            }
+            NslockAcquireOutcome::HeldByOther(other) => {
+                anyhow::bail!(
+                    "nslock: held by other owner{}",
+                    other
+                        .as_deref()
+                        .map(|o| format!(": {}", o))
+                        .unwrap_or_default()
+                );
+            }
+            NslockAcquireOutcome::InvalidOwner => {
+                anyhow::bail!("nslock: invalid owner (empty or > 256 bytes)");
+            }
+            NslockAcquireOutcome::Rejected(status, body) => {
+                anyhow::bail!("nslock: server rejected acquire (status {}): {}", status, body);
+            }
+        }
+    }
+
+    /// Release a namespace lock, optionally rolling back. Clears the
+    /// connection's effective lock owner on success.
+    pub async fn nslock_release(
+        &mut self,
+        owner: String,
+        mode: NslockReleaseMode,
+    ) -> Result<()> {
+        if self.txn.is_some() {
+            anyhow::bail!("cannot release nslock while a transaction is active");
+        }
+        let outcome = self
+            .client
+            .nslock_release(self.dp.as_ref(), &owner, mode)
+            .await?;
+        match outcome {
+            NslockReleaseOutcome::Released => {
+                // The server confirmed `owner` held the lock and removed it
+                // (commit-mode) or finished the rollback. Clear the effective
+                // lock owner unconditionally so subsequent commits on this
+                // connection do not carry a stale `lock_owner`.
+                self.client.set_lock_owner(None);
+                Ok(())
+            }
+            NslockReleaseOutcome::LockGone => {
+                anyhow::bail!("nslock: lock is gone (nonce mismatch during rollback)");
+            }
+            NslockReleaseOutcome::OwnerMismatch(other) => {
+                anyhow::bail!(
+                    "nslock: not locked or owner mismatch{}",
+                    other
+                        .as_deref()
+                        .map(|o| format!(" (current: {})", o))
+                        .unwrap_or_default()
+                );
+            }
+            NslockReleaseOutcome::RollbackInProgress => {
+                anyhow::bail!("nslock: rollback already in progress");
+            }
+            NslockReleaseOutcome::InvalidOwner => {
+                anyhow::bail!("nslock: invalid owner");
+            }
+            NslockReleaseOutcome::Rejected(status, body) => {
+                anyhow::bail!("nslock: server rejected release (status {}): {}", status, body);
+            }
+        }
     }
 
     async fn finalize_transaction(&mut self, commit: bool) -> bool {

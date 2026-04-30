@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -30,6 +30,11 @@ pub enum CommitError {
 pub struct MultiVersionClient {
     client: reqwest::Client,
     config: MultiVersionClientConfig,
+    /// Effective lock owner. Initialized from `config.lock_owner` and can be
+    /// updated at runtime via `set_lock_owner`. Read on every `/stat` and
+    /// `/batch/commit` request so SQL-driven `mv_nslock_acquire`/`release`
+    /// can change which `lock_owner` is sent.
+    lock_owner: RwLock<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +47,8 @@ pub struct MultiVersionClientConfig {
 
     pub ns_key_hashproof: Option<String>,
 
+    /// Initial value for the client's effective lock owner. May be overridden
+    /// at runtime via `MultiVersionClient::set_lock_owner`.
     pub lock_owner: Option<String>,
 }
 
@@ -162,13 +169,79 @@ pub struct TimeToVersionPoint {
     pub time: u64,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum NslockReleaseMode {
+    Commit,
+    Rollback,
+}
+
+impl NslockReleaseMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            NslockReleaseMode::Commit => "commit",
+            NslockReleaseMode::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum NslockAcquireOutcome {
+    /// Lock acquired (or already owned by the same owner).
+    Acquired,
+    /// Held by a different owner. The string is the current owner, if reported.
+    HeldByOther(Option<String>),
+    /// Owner string was rejected (empty or > 256 bytes).
+    InvalidOwner,
+    /// Other client error: e.g., requested version is older than the
+    /// truncation watermark or newer than the namespace head.
+    Rejected(StatusCode, String),
+}
+
+#[derive(Debug)]
+pub enum NslockReleaseOutcome {
+    /// Commit-mode release succeeded, or rollback completed.
+    Released,
+    /// Lock disappeared during a rollback (nonce mismatch).
+    LockGone,
+    /// Namespace was not locked, or was locked by a different owner.
+    OwnerMismatch(Option<String>),
+    /// Rollback was already in progress and a Commit-mode release was issued.
+    RollbackInProgress,
+    /// Owner string was rejected.
+    InvalidOwner,
+    /// Other client error.
+    Rejected(StatusCode, String),
+}
+
 impl MultiVersionClient {
     pub fn new(config: MultiVersionClientConfig, client: reqwest::Client) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { client, config }))
+        let lock_owner = RwLock::new(config.lock_owner.clone());
+        Ok(Arc::new(Self {
+            client,
+            config,
+            lock_owner,
+        }))
     }
 
     pub fn config(&self) -> &MultiVersionClientConfig {
         &self.config
+    }
+
+    /// Returns the currently effective lock owner, if any.
+    pub fn lock_owner(&self) -> Option<String> {
+        self.lock_owner.read().unwrap().clone()
+    }
+
+    /// Override the effective lock owner. Subsequent `/stat` and
+    /// `/batch/commit` requests will carry this value. Pass `None` to clear.
+    ///
+    /// Note: mvfs constructs a fresh `MultiVersionClient` per `open()` and
+    /// treats this owner as per-connection state. If a caller shares one
+    /// `MultiVersionClient` across multiple logical connections, mutating
+    /// the owner here affects all of them — that is generally not what
+    /// SQL-driven `mv_nslock_acquire`/`release` expects.
+    pub fn set_lock_owner(&self, owner: Option<String>) {
+        *self.lock_owner.write().unwrap() = owner;
     }
 
     pub async fn create_transaction(self: &Arc<Self>, dp: Option<&Url>) -> Result<Transaction> {
@@ -192,8 +265,8 @@ impl MultiVersionClient {
                 .append_pair("from_version", from_version);
         }
 
-        if let Some(lock_owner) = &self.config.lock_owner {
-            url.query_pairs_mut().append_pair("lock_owner", lock_owner);
+        if let Some(lock_owner) = self.lock_owner() {
+            url.query_pairs_mut().append_pair("lock_owner", &lock_owner);
         }
 
         let mut boff = RandomizedExponentialBackoff::default();
@@ -268,11 +341,12 @@ impl MultiVersionClient {
         let mut allow_skip_idempotency_check = true; // only for the first attempt
 
         loop {
+            let lock_owner = self.lock_owner();
             let global_init = CommitGlobalInit {
                 idempotency_key: &idempotency_key[..],
                 allow_skip_idempotency_check,
                 num_namespaces: intents.len(),
-                lock_owner: self.config.lock_owner.as_deref(),
+                lock_owner: lock_owner.as_deref(),
             };
             allow_skip_idempotency_check = false;
             let mut raw_request: Vec<u8> = Vec::new();
@@ -324,6 +398,130 @@ impl MultiVersionClient {
                 num_pages: total_num_pages as u64,
                 changelog: body.changelog,
             }));
+        }
+    }
+
+    pub async fn nslock_acquire(
+        &self,
+        dp: Option<&Url>,
+        owner: &str,
+        version: Option<&str>,
+    ) -> Result<NslockAcquireOutcome> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            owner: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            version: Option<&'a str>,
+        }
+
+        let mut url = dp
+            .unwrap_or_else(|| self.config.random_data_plane())
+            .clone();
+        url.set_path("/nslock/acquire");
+        let body = serde_json::to_vec(&Body { owner, version })?;
+
+        let mut boff = RandomizedExponentialBackoff::default();
+        loop {
+            let req = self
+                .client
+                .post(url.clone())
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .decorate(self);
+            match request_and_check_returning_status_with_response(req).await {
+                Ok(Some(_)) => return Ok(NslockAcquireOutcome::Acquired),
+                Ok(None) => {
+                    boff.wait().await;
+                    continue;
+                }
+                Err((status, headers, body)) => {
+                    return Ok(match status.as_u16() {
+                        400 => NslockAcquireOutcome::InvalidOwner,
+                        // The server returns 409 for two distinct cases:
+                        //   (a) namespace already locked by a different owner —
+                        //       includes the `x-lock-owner` response header.
+                        //   (b) requested explicit version is unsuitable
+                        //       (newer than head, before truncation watermark,
+                        //       or before an overlay child snapshot) — no
+                        //       `x-lock-owner` header, body explains why.
+                        // Discriminate by header presence; fall back to a
+                        // generic Rejected so the body reaches the caller.
+                        409 => match headers.get("x-lock-owner") {
+                            Some(v) => NslockAcquireOutcome::HeldByOther(
+                                v.to_str().ok().map(|s| s.to_string()),
+                            ),
+                            None => NslockAcquireOutcome::Rejected(status, body),
+                        },
+                        _ => NslockAcquireOutcome::Rejected(status, body),
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn nslock_release(
+        &self,
+        dp: Option<&Url>,
+        owner: &str,
+        mode: NslockReleaseMode,
+    ) -> Result<NslockReleaseOutcome> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            owner: &'a str,
+            mode: &'a str,
+        }
+
+        let mut url = dp
+            .unwrap_or_else(|| self.config.random_data_plane())
+            .clone();
+        url.set_path("/nslock/release");
+        let body = serde_json::to_vec(&Body {
+            owner,
+            mode: mode.as_str(),
+        })?;
+
+        let mut boff = RandomizedExponentialBackoff::default();
+        loop {
+            let req = self
+                .client
+                .post(url.clone())
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .decorate(self);
+            match request_and_check_returning_status_with_response(req).await {
+                Ok(Some(_)) => return Ok(NslockReleaseOutcome::Released),
+                Ok(None) => {
+                    boff.wait().await;
+                    continue;
+                }
+                Err((status, headers, body)) => {
+                    return Ok(match status.as_u16() {
+                        400 => NslockReleaseOutcome::InvalidOwner,
+                        // 409 only means "rollback already in progress" for
+                        // a Commit-mode release. For Rollback mode the server
+                        // also returns 409 when the rollback target predates
+                        // an overlay child snapshot — that is a distinct
+                        // condition and should surface verbatim.
+                        409 => match mode {
+                            NslockReleaseMode::Commit => {
+                                NslockReleaseOutcome::RollbackInProgress
+                            }
+                            NslockReleaseMode::Rollback => {
+                                NslockReleaseOutcome::Rejected(status, body)
+                            }
+                        },
+                        410 => NslockReleaseOutcome::LockGone,
+                        422 => {
+                            let lock_owner = headers
+                                .get("x-lock-owner")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            NslockReleaseOutcome::OwnerMismatch(lock_owner)
+                        }
+                        _ => NslockReleaseOutcome::Rejected(status, body),
+                    });
+                }
+            }
         }
     }
 
@@ -761,6 +959,42 @@ async fn request_and_check_returning_status(
         let text = res.text().await.unwrap_or_default();
         tracing::warn!(status = %status, text = %text, "client error");
         Err(status)
+    }
+}
+
+/// Variant of `request_and_check_returning_status` that retains response
+/// headers and body on 4xx so callers can inspect things like `x-lock-owner`.
+async fn request_and_check_returning_status_with_response(
+    r: RequestBuilder,
+) -> Result<Option<(HeaderMap, Bytes)>, (StatusCode, HeaderMap, String)> {
+    let res = match r.send().await {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!(error = %e, "network error");
+            return Ok(None);
+        }
+    };
+    if res.status().is_success() {
+        let headers = res.headers().clone();
+        let body = match res.bytes().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to read response body");
+                return Ok(None);
+            }
+        };
+        Ok(Some((headers, body)))
+    } else if res.status().is_server_error() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        tracing::error!(status = %status, text = text, "server error");
+        Ok(None)
+    } else {
+        let status = res.status();
+        let headers = res.headers().clone();
+        let text = res.text().await.unwrap_or_default();
+        tracing::warn!(status = %status, text = %text, "client error");
+        Err((status, headers, text))
     }
 }
 
