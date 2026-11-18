@@ -43,7 +43,7 @@ zstd = "0.13"
 moka = { version = "0.12", features = ["future"] }
 bloom = "0.3.2"
 constant_time_eq = "0.4"
-heapless = { version = "0.8", features = ["serde"] }
+heapless = { version = "0.9", features = ["serde"] }
 lmdb-rkv = "0.14.0"
 bumpalo = "3.11.1"
 itertools = "0.14"
